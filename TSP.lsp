@@ -8221,32 +8221,49 @@
 ;;;; defun tsp-pause-for-measurement : DCL 창을 임시로 숨기고 도면을 제어/측정할 수 있게 해주는 기능
 ;;;;==========================================================================
 (defun tsp-pause-for-measurement (/ dist old-err)
+  ;; ── [진단 강화] 단계별 로그로 ARX c0000027 발생 지점 특정 ──
+  (tsp-log "[PAU] STEP-1: 함수 진입")
   (princ "\n==================================================")
   (princ "\n[도면 확인 모드] 마우스 휠로 줌(Zoom) / 초점이동(Pan)이 가능합니다.")
   (princ "\n거리를 측정하려면 두 점을 클릭하시고, 확인만 하려면 ESC 또는 Enter를 누르세요.")
   (princ "\n==================================================")
 
-  ;; 에러 처리 (사용자가 ESC를 누를 경우 명령이 완전히 종료되지 않고 DCL로 안전하게 복귀하도록 보호)
+  (tsp-log "[PAU] STEP-2: 현재 시스템 변수 덤프")
+  (tsp-log (strcat "  CMDACTIVE=" (itoa (getvar "CMDACTIVE"))))
+  (tsp-log (strcat "  CVPORT=" (itoa (getvar "CVPORT"))))
+  (tsp-log (strcat "  TILEMODE=" (itoa (getvar "TILEMODE"))))
+  (tsp-log (strcat "  ERRNO=" (itoa (getvar "ERRNO"))))
+
+  (tsp-log "[PAU] STEP-3: *error* 재정의 직전")
   (setq old-err *error*)
   (defun *error* (msg)
+    (tsp-log (strcat "[PAU] *error* 핸들러 진입: " (if msg msg "NIL")))
+    (setq *tsp-is-redrawing* nil)
     (princ "\n측정이 취소되었습니다. 설정창으로 복귀합니다...")
     (setq *error* old-err)
     (princ)
   )
 
-  ;; 오토캐드 기본 거리 측정 기능 실행
-  (setq dist (vl-catch-all-apply 'getdist '("\n측정할 첫 번째 점을 클릭하세요 (측정종료 및 복귀: ESC 또는 Enter): ")))
+  (tsp-log "[PAU] STEP-4: CMDECHO 0 설정")
+  (setvar "cmdecho" 0)
 
-  ;; 결과 출력
+  (tsp-log "[PAU] STEP-5: getdist 호출 직전 -- 여기서 ARX 예외 발생 시 이 로그가 마지막")
+  (setq dist (vl-catch-all-apply 'getdist '("\n측정할 첫 번째 점을 클릭하세요 (측정종료 및 복귀: ESC 또는 Enter): ")))
+  (tsp-log "[PAU] STEP-6: getdist 정상 반환됨")
+
   (if (and dist (not (vl-catch-all-error-p dist)))
     (progn
+      (tsp-log (strcat "[PAU] STEP-7: 거리 측정 성공 = " (rtos dist 2 3)))
       (princ (strcat "\n▶ 측정된 거리: " (rtos dist 2 3) " (화면을 충분히 확인하셨으면 DCL창이 다시 뜹니다)"))
     )
-    (princ "\n▶ 도면 확인 종료. 설정창으로 복귀합니다...")
+    (progn
+      (tsp-log "[PAU] STEP-7: getdist 취소 또는 에러 반환 (정상 ESC)")
+      (princ "\n▶ 도면 확인 종료. 설정창으로 복귀합니다...")
+    )
   )
 
- (setq *error* old-err)
-  
+  (tsp-log "[PAU] STEP-8: *error* 복원 및 함수 종료")
+  (setq *error* old-err)
   (setvar "cmdecho" 1)
   (princ)
 )
@@ -10506,6 +10523,14 @@
             )
 
             (princ "\n[DEBUG] 09. ARX 도면제어 함수 호출 직전!")
+            (tsp-log "[ST6] STEP-09 진입: ARX 호출 직전 상태 덤프")
+            (tsp-log (strcat "  *tsp-is-redrawing*=" (vl-princ-to-string *tsp-is-redrawing*)))
+            (tsp-log (strcat "  manual-pts 타입=" (vl-princ-to-string (type manual-pts))))
+            (tsp-log (strcat "  manual-drawn-ents 수=" (itoa (length manual-drawn-ents))))
+            (tsp-log (strcat "  unique-params 수=" (itoa (length unique-params))))
+            (tsp-log (strcat "  CMDACTIVE=" (itoa (getvar "CMDACTIVE"))))
+            (tsp-log (strcat "  CVPORT=" (itoa (getvar "CVPORT"))))
+            (tsp-log (strcat "  *tsp-boundary-ent* 유효=" (if (and (boundp (quote *tsp-boundary-ent*)) *tsp-boundary-ent* (entget *tsp-boundary-ent*)) "유효" "무효")))
             (if tsp-pause-for-measurement
               (progn
                 (tsp-pause-for-measurement)
