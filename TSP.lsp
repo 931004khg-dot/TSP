@@ -10060,6 +10060,7 @@
 ;;;; defun strut-input-dialog : 버팀보 입력창
 ;;;;==========================================================================
 (defun strut-input-dialog (existing-data default-name min-depth / s-result s-data mat-list-h mat-list-pipe sec-list-h sec-list-pipe update-ui-strut current-hpile-str default-h-idx jack-list jack-idx dlg-status manual-pts init-shape shape-idx saved-sec sec-list-to-search sec-idx saved-jack res-name res-shape res-depth res-count m-idx res-mat res-sec res-jack user-forced-strut-sec saved-mat mat-list-to-search def-jack strut-brace-data tmp-strut-data orig-support-list replaced new-list tmp-target-id cur-seg cur-supp-list tmp-replaced tmp-new-supp dlg-result-97 snap-added-posts snap-deleted-posts orig-segment-list unique-params xdata seg-id pt1 pt2 p-pair array-brace-opt new-ents all-pts target-seg-id strut-ang strut-len temp-brace-ents s-brace-opt)
+  (setq *tsp-is-redrawing* nil)  ;; [버그수정] 수정 경로 재진입 시 플래그 강제 초기화
   (setq user-forced-strut-sec nil)
   (setq mat-list-h '("SS275" "SM275" "SM355" "SM420"))
   (setq mat-list-pipe '("STP275S" "STP355S" "STP450S" "STP500S"))
