@@ -746,7 +746,7 @@
 ;;;;==========================================================================
 ;;;; defun tsp-clear-drawing-group : 특정 경계선에 종속된 기존 작도 그룹을 찾아 안전하게 삭제 및 분해하는 함수
 ;;;;==========================================================================
-(defun tsp-clear-drawing-group (boundary-ent / handle group-name dict group pair ent-to-del)
+(defun tsp-clear-drawing-group (boundary-ent / handle group-name dict group pair ent-to-del ent-list debug-grp-del)
   ;; 1. 경계선 핸들을 기반으로 그룹명 생성
   (setq handle (tsp-get-entity-handle boundary-ent))
   (setq group-name (strcat "TSP_GRP_" handle))
@@ -756,26 +756,32 @@
   (if (and dict (dictsearch (cdr (assoc -1 dict)) group-name))
     (progn
       (setq group (dictsearch (cdr (assoc -1 dict)) group-name))
-      (princ (strcat "\n[시스템] 기존 객체 그룹 '" group-name "' 정리 중..."))
-      (setq debug-grp-del 0)
+      (princ (strcat "\n[시스템] 기존 객체 그룹 '" group-name "' 물리적 삭제 준비 중..."))
+      
+      (setq ent-list '())
+      ;; STEP 1: 그룹 내에서 삭제할 엔티티 리스트만 먼저 수집 (루프 중 삭제 절대 금지)
       (foreach pair group
-        ;; DXF 코드 340은 그룹에 포함된 엔티티의 핸들 포인터
         (if (= (car pair) 340)
+          (setq ent-list (cons (cdr pair) ent-list))
+        )
+      )
+      
+      ;; STEP 2: 그룹 정의를 딕셔너리에서 먼저 제거하여 캐드 내부의 메모리 종속성 완전 파괴
+      (dictremove (cdr (assoc -1 dict)) group-name)
+      (princ "\n[시스템] 그룹 종속성 해제 완료. 개별 객체 삭제 시작...")
+      
+      ;; STEP 3: 종속성이 끊어진 상태에서 안전하게 물리적 삭제 (entdel) 진행
+      (setq debug-grp-del 0)
+      (foreach ent-to-del ent-list
+        (if (entget ent-to-del)
           (progn
-             (setq ent-to-del (cdr pair))
-             ;; [안전장치] 도면에 실제로 존재하는 객체인지 확인 후 삭제
-             (if (entget ent-to-del) 
-               (progn 
-                 (entdel ent-to-del)
-                 (setq debug-grp-del (1+ debug-grp-del))
-               )
-             )
+            ;; vl-catch-all-apply로 감싸 만에 하나 발생할 수 있는 에러 스킵
+            (vl-catch-all-apply 'entdel (list ent-to-del))
+            (setq debug-grp-del (1+ debug-grp-del))
           )
         )
       )
-      (princ (strcat "\n[디버그: TSP] 그룹 내에서 물리적으로 삭제된 객체 수: " (itoa debug-grp-del)))
-      ;; 4. 빈 그룹 정의 제거 (명령어 찌꺼기를 발생시키던 불필요한 "" 제거 및 예외처리 적용)
-      (vl-catch-all-apply 'vl-cmdf (list "._-GROUP" "_E" group-name))
+      (princ (strcat "\n[디버그: TSP] 메모리 충돌 없이 안전하게 물리적 삭제된 객체 수: " (itoa debug-grp-del)))
     )
     (princ (strcat "\n[디버그: TSP] 삭제할 그룹 '" group-name "'을 ACAD_GROUP에서 찾을 수 없습니다."))
   )
@@ -785,94 +791,86 @@
 ;;;;==========================================================================
 ;;;; defun tsp-group-last-entities : 생성된 객체고유 그룹화
 ;;;;==========================================================================
-(defun tsp-group-last-entities (start-ent boundary-ent / sset ent handle group-name)
+(defun tsp-group-last-entities (start-ent boundary-ent / sset ent handle group-name debug-ss-cnt dict)
   (setq handle (tsp-get-entity-handle boundary-ent))
   (setq group-name (strcat "TSP_GRP_" handle))
-  ;; 1. 선택 세트(Selection Set) 생성
+  
+  (princ "\n[DEBUG-GROUP] 01. 선택 세트 생성 직전")
   (setq sset (ssadd))
-  ;; 2. start-ent 이후에 생성된 모든 객체를 수집
+  
   (if start-ent
     (progn
+      (princ (strcat "\n[DEBUG-GROUP] 02. start-ent 확인. 타입: " (vl-princ-to-string (type start-ent))))
+      
+      ;; 크래시 유발 원인 확인: 객체가 지워졌는지 체크
+      (if (entget start-ent)
+        (princ "\n[DEBUG-GROUP] 03. start-ent가 도면에 유효하게 살아있음.")
+        (princ "\n[DEBUG-GROUP] 03. 경고!!! start-ent가 방금 전 삭제 로직에 의해 파괴됨! (크래시 주원인)")
+      )
+      
       (princ "\n[디버그: TSP] 그룹화 시작점 (start-ent) 유효. 추적 시작...")
-      (setq ent (entnext start-ent))
+      
+      (princ "\n[DEBUG-GROUP] 04. entnext 실행 직전 (여기서 죽으면 오토캐드 엔진 버그)")
+      ;; 안전하게 다음 객체 탐색 시도
+      (setq ent (vl-catch-all-apply 'entnext (list start-ent)))
+      (if (vl-catch-all-error-p ent)
+        (progn 
+          (princ "\n[DEBUG-GROUP] 05-에러. entnext에서 메모리 참조 오류 발생 차단됨!") 
+          (setq ent nil)
+        )
+        (princ "\n[DEBUG-GROUP] 05. entnext 통과 완료")
+      )
     )
     (progn
       (princ "\n[디버그: TSP] 경고! 그룹화 시작점 (start-ent)이 nil입니다. 도면 처음부터 추적합니다.")
-      (setq ent (entnext)) ;; 도면이 비어있었을 경우
+      (setq ent (entnext))
     )
   )
+  
+  (princ "\n[DEBUG-GROUP] 06. 객체 수집 While 루프 진입")
   (setq debug-ss-cnt 0)
+  
   (while ent
-    (ssadd ent sset)
-    (setq ent (entnext ent))
+    (if (= (rem debug-ss-cnt 1000) 0) 
+      (princ (strcat "\n[DEBUG-GROUP] 루프 진행 중... 현재 추가된 객체 수: " (itoa debug-ss-cnt)))
+    )
+    
+    (if (not (entget ent))
+      (princ (strcat "\n[DEBUG-GROUP] 경고! 삭제된 불량 객체 감지됨. 인덱스: " (itoa debug-ss-cnt)))
+      (vl-catch-all-apply 'ssadd (list ent sset))
+    )
+    
+    (setq ent (vl-catch-all-apply 'entnext (list ent)))
+    (if (vl-catch-all-error-p ent)
+      (progn 
+        (princ "\n[DEBUG-GROUP] 루프 탐색 중 다음 객체 포인터 에러 발생!") 
+        (setq ent nil)
+      )
+    )
     (setq debug-ss-cnt (1+ debug-ss-cnt))
   )
+  
   (princ (strcat "\n[디버그: TSP] 새로운 그룹화를 위해 수집된 엔티티 수: " (itoa debug-ss-cnt)))
-  ;; 3. 수집된 객체가 있다면 그룹 생성
+  
   (if (> (sslength sset) 0)
     (progn
-      ;; (혹시 모를 잔여 그룹명 중복 방지)
-      (if (dictsearch (cdr (assoc -1 (dictsearch (namedobjdict) "ACAD_GROUP"))) group-name)
-        (command "._-GROUP" "_E" group-name "")
+      (princ "\n[DEBUG-GROUP] 07. 그룹 딕셔너리 정리 시작")
+      (setq dict (dictsearch (namedobjdict) "ACAD_GROUP"))
+      (if (and dict (dictsearch (cdr (assoc -1 dict)) group-name))
+        (dictremove (cdr (assoc -1 dict)) group-name)
       )
-      ;; 그룹 생성 명령 실행
-      (command "._-GROUP" "_C" group-name "TSP Auto-Gen" sset "")
+      
+      (princ "\n[DEBUG-GROUP] 08. 새 그룹 생성 명령어(_-GROUP) 호출 직전")
+      (setvar "CMDECHO" 0)
+      (vl-catch-all-apply 'vl-cmdf (list "._-GROUP" "_C" group-name "TSP Auto-Gen" sset ""))
+      (setvar "CMDECHO" 1)
+      (princ "\n[DEBUG-GROUP] 09. 새 그룹 생성 명령어 완료")
+      
       (princ (strcat "\n[시스템] " (itoa (sslength sset)) "개의 객체가 '" group-name "' 그룹으로 생성되었습니다."))
     )
     (princ "\n[경고] 생성된 객체가 없습니다.")
   )
-)
-
-
-;;;;==========================================================================
-;;;; defun tsp-apply-custom-hatch : 커스텀 해치 패턴 PAT 생성 및 원점(Origin)/스케일 강제 지정
-;;;;==========================================================================
-(defun tsp-apply-custom-hatch (ent pat-name scale angle layer color origin-pt / support-dir pat-file f data old-echo old-hporiginmode old-hporigin old-hpannotative old-meas last-ent new-hatch)
-  (setq old-echo (getvar "CMDECHO"))
-  (setvar "CMDECHO" 0)
-  ;; 도면마다 스케일이 달라지는 현상 방지용 환경 변수 강제 통일
-  (setq old-hpannotative (getvar "HPANNOTATIVE"))
-  (setq old-meas (getvar "MEASUREMENT"))
-  (if old-hpannotative (setvar "HPANNOTATIVE" 0)) ; 주석 축척 해제
-  (setvar "MEASUREMENT" 1) ; 미터법 환경 강제 고정
-  ;; 해치 원점 강제 지정 모드 설정
-  (setq old-hporiginmode (getvar "HPORIGINMODE"))
-  (setq old-hporigin (getvar "HPORIGIN"))
-  (if origin-pt
-    (progn
-      (setvar "HPORIGINMODE" 0)
-      (setvar "HPORIGIN" (list (car origin-pt) (cadr origin-pt)))
-    )
-  )
-  (setq data (cdr (assoc pat-name *tsp-custom-pat-data*)))
-  ;; Custom 패턴인 경우 .pat 파일 생성
-  (if data
-    (progn
-      (setq support-dir (strcat (getvar "ROAMABLEROOTPREFIX") "Support"))
-      (setq pat-file (strcat support-dir "\\" pat-name ".pat"))
-      (setq f (open pat-file "w"))
-      (foreach line data
-        (write-line line f)
-      )
-      (write-line "" f)
-      (close f)
-    )
-  )
-  ;; 기본패턴(매립토 등)과 커스텀 구분 없이 모두 Command 방식으로 일괄 생성
-  (setq last-ent (entlast))
-  (command "_.-HATCH" "_P" pat-name scale angle "_S" ent "" "")
-  ;; 방금 생성된 해치 객체의 레이어 및 색상 변경
-  (setq new-hatch (entnext last-ent))
-  (if new-hatch
-    (command "_.CHPROP" new-hatch "" "_LA" layer "_C" color "")
-  )
-  ;; 시스템 변수 원상 복구 (기존 사용자 환경 보호)
-  (if old-hporiginmode (setvar "HPORIGINMODE" old-hporiginmode))
-  (if old-hporigin (setvar "HPORIGIN" old-hporigin))
-  (if old-hpannotative (setvar "HPANNOTATIVE" old-hpannotative))
-  (setvar "MEASUREMENT" old-meas)
-  (setvar "CMDECHO" old-echo)
-  (princ)
+  (princ "\n[DEBUG-GROUP] 10. 함수 종료 및 복귀")
 )
 
 
@@ -6202,26 +6200,41 @@
 (defun tsp-delete-manual-post-by-segment (target-id / new-list added-list del-list new-del-list post-record ins_pt ss i ent ent-data pt process-and-delete process-deleted-pts ss-struts valid-triangles j e-data xdata x-vals t-p1 t-p2 t-p3 tri)
   (setq new-list '() new-del-list '())
   
-  ;; 1. 현재 타겟 세그먼트(target-id)에 속한 사보강재의 '삼각형 영역' 데이터 모두 수집 (구버전 추가 말뚝 및 모든 삭제 말뚝 판별용)
+  ;; 1. 현재 타겟 세그먼트(target-id)에 속한 사보강재(TRI) 및 버팀보(RECT) 영역 데이터 수집
   (setq valid-triangles '())
-  (setq ss-struts (ssget "X" '((0 . "LWPOLYLINE") (8 . "_사보강재(Corner_Strut)"))))
+  ;; [버그수정] 사보강재만 검색하던 것을 사보강재+버팀보 모두 검색하도록 수정
+  (setq ss-struts (ssget "X" '((0 . "LWPOLYLINE") (8 . "_사보강재(Corner_Strut),_버팀보(Strut)"))))
   (if ss-struts
     (progn
       (setq j 0)
       (while (< j (sslength ss-struts))
         (setq e-data (entget (ssname ss-struts j) '("TSP_STRUT_SPEC")))
+        (setq cur-layer (cdr (assoc 8 e-data)))
         (setq xdata (assoc -3 e-data))
         (if xdata
           (progn
             (setq x-vals (cdr (car (cdr xdata))))
-            (if (= (length x-vals) 8)
+            ;; [버그수정] (= length 8)을 (>= length 8)로 변경하여 버팀보(길이 10)도 포함
+            (if (>= (length x-vals) 8)
               (progn
                 (if (= (cdr (nth 0 x-vals)) target-id)
                   (progn
-                    (setq t-p1 (cdr (nth 5 x-vals)))
-                    (setq t-p2 (cdr (nth 6 x-vals)))
-                    (setq t-p3 (cdr (nth 7 x-vals)))
-                    (setq valid-triangles (append valid-triangles (list (list t-p1 t-p2 t-p3))))
+                    (if (= cur-layer "_사보강재(Corner_Strut)")
+                      (progn
+                        ;; 사보강재: TRI 영역 수집
+                        (setq t-p1 (cdr (nth 5 x-vals)))
+                        (setq t-p2 (cdr (nth 6 x-vals)))
+                        (setq t-p3 (cdr (nth 7 x-vals)))
+                        (setq valid-triangles (append valid-triangles (list (list "TRI" t-p1 t-p2 t-p3))))
+                      )
+                      (progn
+                        ;; 버팀보: RECT 영역 수집
+                        (setq s-p1 (cdr (nth 2 x-vals)))
+                        (setq s-p2 (cdr (nth 3 x-vals)))
+                        (setq s-width (cdr (nth 1 x-vals)))
+                        (setq valid-triangles (append valid-triangles (list (list "RECT" s-p1 s-p2 s-width))))
+                      )
+                    )
                   )
                 )
               )
@@ -6237,17 +6250,32 @@
   (setq ss (ssget "X" '((0 . "INSERT") (8 . "_중간말뚝(Post pile)"))))
   
   ;; 3. 내부 함수: 수동 추가(ADDED_POSTS) 대상 판별 및 화면 객체 동기화 삭제
-  (defun process-and-delete (record target / should-del)
+  (defun process-and-delete (record target / should-del s-ang d-proj d-perp)
     (setq ins_pt (nth 0 record))
     (setq should-del nil)
     
-    ;; 판별 로직: 신버전(길이 8)은 ID로, 구버전(길이 7)은 수집된 삼각형 공간 내부 여부로 판별
+    ;; 판별 로직: 신버전(길이 8)은 ID로, 구버전(길이 7)은 수집된 TRI/RECT 공간 내부 여부로 판별
     (if (>= (length record) 8)
       (if (= (nth 7 record) target) (setq should-del T))
       (progn
-        (foreach tri valid-triangles
-          (if (tsp-is-point-in-triangle ins_pt (nth 0 tri) (nth 1 tri) (nth 2 tri))
-            (setq should-del T)
+        ;; [버그수정] TRI(사보강재)와 RECT(버팀보) 모두 지원
+        (foreach zone valid-triangles
+          (if (= (car zone) "TRI")
+            (if (tsp-is-point-in-triangle ins_pt (nth 1 zone) (nth 2 zone) (nth 3 zone))
+              (setq should-del T)
+            )
+            (progn
+              ;; RECT 영역 판별
+              (setq s-ang (angle (nth 1 zone) (nth 2 zone)))
+              (setq d-proj (tsp-project-dist (nth 1 zone) s-ang ins_pt))
+              (setq d-perp (abs (- (* (- (car ins_pt) (car (nth 1 zone))) (sin s-ang))
+                                   (* (- (cadr ins_pt) (cadr (nth 1 zone))) (cos s-ang)))))
+              (if (and (>= d-proj -10.0)
+                       (<= d-proj (+ (distance (nth 1 zone) (nth 2 zone)) 10.0))
+                       (<= d-perp (+ (nth 3 zone) 100.0)))
+                (setq should-del T)
+              )
+            )
           )
         )
       )
@@ -6280,11 +6308,26 @@
   )
 
   ;; 3-1. 내부 함수: 수동 삭제(DELETED_POSTS) 판별용 (삭제 기록을 없애서 말뚝을 복원)
-  (defun process-deleted-pts (pt-record / should-restore)
+  (defun process-deleted-pts (pt-record / should-restore s-ang d-proj d-perp)
     (setq should-restore nil)
-    (foreach tri valid-triangles
-      (if (tsp-is-point-in-triangle pt-record (nth 0 tri) (nth 1 tri) (nth 2 tri))
-        (setq should-restore T) ;; 타겟 구역 안의 삭제 기록이면 복원 대상으로 지정
+    ;; [버그수정] TRI(사보강재)와 RECT(버팀보) 모두 지원
+    (foreach zone valid-triangles
+      (if (= (car zone) "TRI")
+        (if (tsp-is-point-in-triangle pt-record (nth 1 zone) (nth 2 zone) (nth 3 zone))
+          (setq should-restore T)
+        )
+        (progn
+          ;; RECT 영역 판별
+          (setq s-ang (angle (nth 1 zone) (nth 2 zone)))
+          (setq d-proj (tsp-project-dist (nth 1 zone) s-ang pt-record))
+          (setq d-perp (abs (- (* (- (car pt-record) (car (nth 1 zone))) (sin s-ang))
+                               (* (- (cadr pt-record) (cadr (nth 1 zone))) (cos s-ang)))))
+          (if (and (>= d-proj -10.0)
+                   (<= d-proj (+ (distance (nth 1 zone) (nth 2 zone)) 10.0))
+                   (<= d-perp (+ (nth 3 zone) 100.0)))
+            (setq should-restore T)
+          )
+        )
       )
     )
     (if should-restore nil T) ;; 복원 대상이면 기록 리스트에서 제거(nil), 아니면 유지(T)
@@ -9913,6 +9956,11 @@
                     (progn
                       (tsp-delete-manual-post-by-segment tmp-id)
                       (princ (strcat "\n[초기화] Seg-" (itoa tmp-id) " 구역의 수동 중간말뚝이 초기화되었습니다."))
+                      ;; [버그A-2 수정] 초기화 직후 도면 즉시 갱신
+                      (if (and (boundp '*tsp-boundary-ent*) *tsp-boundary-ent*
+                               (boundp '*tsp-boundary-orient*) *tsp-boundary-orient*)
+                        (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*)
+                      )
                     )
                   )
                  )
@@ -9996,44 +10044,60 @@
   (setq restore-action nil)
   (setq manual-drawn-ents '()) ;; 현재 창에서 임시로 작도된 객체 추적
 
+;;==========================================================================
+;; defun tsp-safe-hide-ent : 물리적 삭제(entdel) 대신 객체를 안전하게 숨기는 함수
+;;==========================================================================
+(defun tsp-safe-hide-ent (ent / edata)
+  (if (and ent (setq edata (entget ent)))
+    (if (not (assoc 60 edata))
+      (vl-catch-all-apply 'entmod (list (append edata (list (cons 60 1)))))
+      (vl-catch-all-apply 'entmod (list (subst (cons 60 1) (assoc 60 edata) edata)))
+    )
+  )
+)
 
 ;;;;==========================================================================
 ;;;; defun strut-input-dialog : 버팀보 입력창
 ;;;;==========================================================================
-(defun strut-input-dialog (existing-data default-name min-depth / s-result s-data mat-list-h mat-list-pipe sec-list-h sec-list-pipe update-ui-strut current-hpile-str default-h-idx jack-list jack-idx dlg-status manual-pts init-shape shape-idx saved-sec sec-list-to-search sec-idx saved-jack res-name res-shape res-depth res-count m-idx res-mat res-sec res-jack user-forced-strut-sec)
+(defun strut-input-dialog (existing-data default-name min-depth / s-result s-data mat-list-h mat-list-pipe sec-list-h sec-list-pipe update-ui-strut current-hpile-str default-h-idx jack-list jack-idx dlg-status manual-pts init-shape shape-idx saved-sec sec-list-to-search sec-idx saved-jack res-name res-shape res-depth res-count m-idx res-mat res-sec res-jack user-forced-strut-sec saved-mat mat-list-to-search def-jack strut-brace-data tmp-strut-data orig-support-list replaced new-list tmp-target-id cur-seg cur-supp-list tmp-replaced tmp-new-supp dlg-result-97 snap-added-posts snap-deleted-posts orig-segment-list unique-params xdata seg-id pt1 pt2 p-pair array-brace-opt new-ents all-pts target-seg-id strut-ang strut-len temp-brace-ents s-brace-opt)
   (setq user-forced-strut-sec nil)
   (setq mat-list-h '("SS275" "SM275" "SM355" "SM420"))
   (setq mat-list-pipe '("STP275S" "STP355S" "STP450S" "STP500S"))
   (setq sec-list-h (append *tsp-std-strut-list* (mapcar '(lambda (x) (vl-string-subst "2H " "H " x)) *tsp-std-strut-list*)))
-  (setq sec-list-pipe '("D406.4×12t" "D508.0×12t" "D609.6×12t"))
-    (setq jack-list '("유압잭" "스크류잭"))
-    (setq current-hpile-str "")
-    (if (and *tsp-hpile-spec* (= *tsp-hpile-spec* "User-defined") *tsp-hpile-custom*)
-       (setq current-hpile-str (strcat "H " (itoa (nth 0 *tsp-hpile-custom*)) "×" (itoa (nth 1 *tsp-hpile-custom*)) "×" (itoa (nth 2 *tsp-hpile-custom*)) "/" (itoa (nth 3 *tsp-hpile-custom*))))
-       (setq current-hpile-str *tsp-hpile-spec*)
-    )
-    (if (and current-hpile-str (/= current-hpile-str "") (not (vl-position current-hpile-str sec-list-h)))
-      (setq sec-list-h (cons current-hpile-str sec-list-h))
-    )
-    (setq default-h-idx (vl-position "H 300×300×10/15" sec-list-h))
-    (if (null default-h-idx) (setq default-h-idx 3))
+  (setq sec-list-pipe '("D406.4x12t" "D508.0x12t" "D609.6x12t"))
+  (setq jack-list '("유압잭" "스크류잭"))
+  (setq current-hpile-str "")
+  
+  (if (and *tsp-hpile-spec* (= *tsp-hpile-spec* "User-defined") *tsp-hpile-custom*)
+    (setq current-hpile-str (strcat "H " (itoa (nth 0 *tsp-hpile-custom*)) "x" (itoa (nth 1 *tsp-hpile-custom*)) "x" (itoa (nth 2 *tsp-hpile-custom*)) "/" (itoa (nth 3 *tsp-hpile-custom*))))
+    (setq current-hpile-str *tsp-hpile-spec*)
+  )
+  (if (and current-hpile-str (/= current-hpile-str "") (not (vl-position current-hpile-str sec-list-h)))
+    (setq sec-list-h (cons current-hpile-str sec-list-h))
+  )
+  (setq default-h-idx (vl-position "H 300x300x10/15" sec-list-h))
+  (if (null default-h-idx) (setq default-h-idx 3))
 
-    (if (new_dialog "tsp_support_strut" dcl-id)
-      (progn
-        (start_list "s_shape") (mapcar 'add_list shape-list-strut) (end_list)
-        (start_list "s_jack") (mapcar 'add_list jack-list) (end_list)
-        (start_list "s_start_mode") (mapcar 'add_list '("사용자 클릭 위치" "세그먼트 중점 시작 (1개 배치)" "간격 중심 시작 (양쪽 배치)")) (end_list)
+  (if (new_dialog "tsp_support_strut" dcl-id)
+    (progn
+      (start_list "s_shape") (mapcar 'add_list shape-list-strut) (end_list)
+      (start_list "s_jack") (mapcar 'add_list jack-list) (end_list)
+      (start_list "s_start_mode") (mapcar 'add_list '("사용자 클릭 위치" "세그먼트 중점 시작 (1개 배치)" "간격 중심 시작 (양쪽 배치)")) (end_list)
 
-        (defun update-ui-strut (shape-idx-str / shape-str cur-mats cur-secs)
-          (setq shape-str (nth (atoi shape-idx-str) shape-list-strut))
-          (if (wcmatch shape-str "H형강") (setq cur-mats mat-list-h cur-secs sec-list-h) (setq cur-mats mat-list-pipe cur-secs sec-list-pipe))
-          (start_list "s_mat") (mapcar 'add_list cur-mats) (end_list) (set_tile "s_mat" "0")
-          (start_list "s_sec") (mapcar 'add_list cur-secs) (end_list)
-          (if (and (wcmatch shape-str "H형강") default-h-idx)
-             (set_tile "s_sec" (itoa default-h-idx))
-             (set_tile "s_sec" "0")
-          )
+      (defun update-ui-strut (shape-idx-str / shape-str cur-mats cur-secs)
+        (setq shape-str (nth (atoi shape-idx-str) shape-list-strut))
+        (if (wcmatch shape-str "H형강") 
+          (setq cur-mats mat-list-h cur-secs sec-list-h) 
+          (setq cur-mats mat-list-pipe cur-secs sec-list-pipe)
         )
+        (start_list "s_mat") (mapcar 'add_list cur-mats) (end_list) (set_tile "s_mat" "0")
+        (start_list "s_sec") (mapcar 'add_list cur-secs) (end_list)
+        (if (and (wcmatch shape-str "H형강") default-h-idx)
+          (set_tile "s_sec" (itoa default-h-idx))
+          (set_tile "s_sec" "0")
+        )
+      )
+
       (if existing-data
         (progn
           (setq user-forced-strut-sec T) ;; 기존 데이터를 불러올 땐 2H 자동 전환을 일시 중단함
@@ -10045,64 +10109,67 @@
             (progn (set_tile "s_shape" "0") (update-ui-strut "0"))
           )
           (set_tile "s_depth" (rtos (cadddr existing-data) 2 2))
+          
           ;; 재질(Material) 복원
-            (setq saved-mat (nth 5 existing-data))
-            (setq mat-list-to-search (if (wcmatch init-shape "H형강") mat-list-h mat-list-pipe))
-            (setq mat-idx (vl-position saved-mat mat-list-to-search))
-            (if mat-idx (set_tile "s_mat" (itoa mat-idx)))
-            
-            ;; 규격(Section) 복원
-            (setq saved-sec (nth 6 existing-data)) 
-            (setq sec-list-to-search (if (wcmatch init-shape "H형강") sec-list-h sec-list-pipe)) 
-            (setq sec-idx (vl-position saved-sec sec-list-to-search))
-            (if sec-idx (set_tile "s_sec" (itoa sec-idx)))
-            
-            ;; 잭(Jack) 복원
-            (setq saved-jack (nth 7 existing-data)) 
-            (setq jack-idx (vl-position saved-jack jack-list))
-            (if jack-idx 
-              (set_tile "s_jack" (itoa jack-idx)) 
-              (progn 
-                (setq def-jack (vl-position "스크류잭" jack-list))
-                (if def-jack (set_tile "s_jack" (itoa def-jack)) (set_tile "s_jack" "0"))
-              )
+          (setq saved-mat (nth 5 existing-data))
+          (setq mat-list-to-search (if (wcmatch init-shape "H형강") mat-list-h mat-list-pipe))
+          (setq mat-idx (vl-position saved-mat mat-list-to-search))
+          (if mat-idx (set_tile "s_mat" (itoa mat-idx)))
+          
+          ;; 규격(Section) 복원
+          (setq saved-sec (nth 6 existing-data)) 
+          (setq sec-list-to-search (if (wcmatch init-shape "H형강") sec-list-h sec-list-pipe)) 
+          (setq sec-idx (vl-position saved-sec sec-list-to-search))
+          (if sec-idx (set_tile "s_sec" (itoa sec-idx)))
+          
+          ;; 잭(Jack) 복원
+          (setq saved-jack (nth 7 existing-data)) 
+          (setq jack-idx (vl-position saved-jack jack-list))
+          (if jack-idx 
+            (set_tile "s_jack" (itoa jack-idx)) 
+            (progn 
+              (setq def-jack (vl-position "스크류잭" jack-list))
+              (if def-jack (set_tile "s_jack" (itoa def-jack)) (set_tile "s_jack" "0"))
             )
-            
-            (setq manual-pts (if (> (length existing-data) 8) (nth 8 existing-data) nil))
+          )
+          
+          (setq manual-pts (if (> (length existing-data) 8) (nth 8 existing-data) nil))
           (set_tile "s_start_mode" (if (> (length existing-data) 9) (nth 9 existing-data) "1"))
           (set_tile "s_ctc" (if (> (length existing-data) 10) (nth 10 existing-data) "5.0"))
-          ;; ;; [안전장치] 버팀보용 보강재 및 중간말뚝 옵션 복원 (데이터가 없으면 기본값)
+          
+          ;; [안전장치] 버팀보용 보강재 및 중간말뚝 옵션 복원 (데이터가 없으면 기본값)
           (setq strut-brace-data (if (> (length existing-data) 11) (nth 11 existing-data) nil))
-      (set_tile "s_chk_stiffener_enable" (if strut-brace-data (nth 0 strut-brace-data) "1"))
-      (set_tile "s_slenderness_limit" (if strut-brace-data (nth 1 strut-brace-data) "0"))
-      (set_tile "s_chk_manual_interval" (if strut-brace-data (nth 2 strut-brace-data) "0"))
-      ;; 작도가 일어난 적이 있을 때만 값을 채우고, 아니면 빈칸 유지
-      (set_tile "s_manual_interval" (if (and strut-brace-data (/= (nth 3 strut-brace-data) "0.0") (/= (nth 3 strut-brace-data) ""))
-                                      (nth 3 strut-brace-data)
-                                      (if (and *tsp-last-strut-len* *tsp-last-calc-interval* (numberp *tsp-last-calc-interval*)) (rtos *tsp-last-calc-interval* 2 3) "")))
-      (set_tile "s_stiffener_margin" (if strut-brace-data (nth 4 strut-brace-data) "50"))
-      (set_tile "s_chk_post_enable" (if strut-brace-data (nth 5 strut-brace-data) "1"))
-      (if (and strut-brace-data (= (nth 8 strut-brace-data) "R")) (set_tile "s_post_side_R" "1") (set_tile "s_post_side_L" "1"))
-    )
-    (progn
-      ;; 신규 생성 시 기본값 세팅
-      (set_tile "s_name" default-name)
-      (set_tile "s_shape" "0")
-      (setq def-jack (vl-position "스크류잭" jack-list))
-      (if def-jack (set_tile "s_jack" (itoa def-jack)) (set_tile "s_jack" "1"))
-      (set_tile "s_start_mode" "1")
-      (set_tile "s_ctc" "5.0")
-      (update-ui-strut "0")
-      (setq manual-pts nil)
+          (set_tile "s_chk_stiffener_enable" (if strut-brace-data (nth 0 strut-brace-data) "1"))
+          (set_tile "s_slenderness_limit" (if strut-brace-data (nth 1 strut-brace-data) "0"))
+          (set_tile "s_chk_manual_interval" (if strut-brace-data (nth 2 strut-brace-data) "0"))
+          
+          ;; 작도가 일어난 적이 있을 때만 값을 채우고, 아니면 빈칸 유지
+          (set_tile "s_manual_interval" (if (and strut-brace-data (/= (nth 3 strut-brace-data) "0.0") (/= (nth 3 strut-brace-data) ""))
+                                          (nth 3 strut-brace-data)
+                                          (if (and *tsp-last-strut-len* *tsp-last-calc-interval* (numberp *tsp-last-calc-interval*)) (rtos *tsp-last-calc-interval* 2 3) "")))
+          (set_tile "s_stiffener_margin" (if strut-brace-data (nth 4 strut-brace-data) "50"))
+          (set_tile "s_chk_post_enable" (if strut-brace-data (nth 5 strut-brace-data) "1"))
+          (if (and strut-brace-data (= (nth 8 strut-brace-data) "R")) (set_tile "s_post_side_R" "1") (set_tile "s_post_side_L" "1"))
+        )
+        (progn
+          ;; 신규 생성 시 기본값 세팅
+          (set_tile "s_name" default-name)
+          (set_tile "s_shape" "0")
+          (setq def-jack (vl-position "스크류잭" jack-list))
+          (if def-jack (set_tile "s_jack" (itoa def-jack)) (set_tile "s_jack" "1"))
+          (set_tile "s_start_mode" "1")
+          (set_tile "s_ctc" "5.0")
+          (update-ui-strut "0")
+          (setq manual-pts nil)
 
-      ;; [초기화] 보강재 및 중간말뚝 옵션
-      (set_tile "s_chk_stiffener_enable" "1")
-      (set_tile "s_slenderness_limit" "0")
-      (set_tile "s_chk_manual_interval" "0")
-      (set_tile "s_manual_interval" (if (and *tsp-last-strut-len* *tsp-last-calc-interval* (numberp *tsp-last-calc-interval*)) (rtos *tsp-last-calc-interval* 2 3) ""))
-      (set_tile "s_stiffener_margin" "50")
-      (set_tile "s_chk_post_enable" "1")
-      (set_tile "s_post_side_L" "1")
+          ;; [초기화] 보강재 및 중간말뚝 옵션
+          (set_tile "s_chk_stiffener_enable" "1")
+          (set_tile "s_slenderness_limit" "0")
+          (set_tile "s_chk_manual_interval" "0")
+          (set_tile "s_manual_interval" (if (and *tsp-last-strut-len* *tsp-last-calc-interval* (numberp *tsp-last-calc-interval*)) (rtos *tsp-last-calc-interval* 2 3) ""))
+          (set_tile "s_stiffener_margin" "50")
+          (set_tile "s_chk_post_enable" "1")
+          (set_tile "s_post_side_L" "1")
         )
       )
       
@@ -10111,388 +10178,637 @@
       (mapcar 'add_list '("100 (표준 기준)" "120 (최대 예외 한계)"))
       (end_list)
 
-        ;; -----------------------------------------------------------
-        ;; 액션 타일 (버튼 동작 정의)
-        ;; -----------------------------------------------------------
-
-        ;; =================================================================
-        ;; 실시간 N등분 및 간격 계산 갱신 함수
-        ;; 현재 세그먼트의 예상 버팀보 길이를 추정 (작도 후 반환된 실제 길이가 있으면 우선 적용)
-        (setq current-strut-span 
-          (cond
-            ((and (boundp '*tsp-last-strut-len*) (numberp *tsp-last-strut-len*) (> *tsp-last-strut-len* 0.0)) *tsp-last-strut-len*)
-            ((and (boundp '*current-segment-span*) (numberp *current-segment-span*)) *current-segment-span*)
-            (t 20000.0)
-          )
+      ;; 실시간 N등분 및 간격 계산 갱신 함수용 스팬 추정
+      (setq current-strut-span 
+        (cond
+          ((and (boundp '*tsp-last-strut-len*) (numberp *tsp-last-strut-len*) (> *tsp-last-strut-len* 0.0)) *tsp-last-strut-len*)
+          ((and (boundp '*current-segment-span*) (numberp *current-segment-span*)) *current-segment-span*)
+          (t 20000.0)
         )
-
-  (defun update-strut-calc-info ()
-    (vl-catch-all-apply (function (lambda ( / cur-shape cur-sec clean-sec cur-vals limit-type l-max l-max-res span-m num-div auto-interval sec-idx is-1h new-sec-str new-idx )
-      (setq cur-shape (nth (atoi (get_tile "s_shape")) shape-list-strut))
-      (setq sec-idx (atoi (get_tile "s_sec")))
-      (if (wcmatch cur-shape "H형강")
-        (setq cur-sec (nth sec-idx sec-list-h))
-        (setq cur-sec (nth sec-idx sec-list-pipe))
       )
-      
-      ;; 1H, 2H 무관하게 한계길이는 항상 1H 베이스로 계산되도록 치환 (B안 안전측 설계)
-      (setq clean-sec (if cur-sec cur-sec ""))
-      (setq is-1h (if cur-sec (wcmatch cur-sec "H *") nil))
-      (if (and cur-sec (wcmatch cur-sec "2H *")) (setq clean-sec (vl-string-subst "H " "2H " cur-sec)))
-      
-      (setq cur-vals (parse-h-spec clean-sec))
-      (setq limit-type (get_tile "s_slenderness_limit"))
 
-      (if cur-vals
-        (progn
-          (setq l-max-res (vl-catch-all-apply 'tsp-calc-unsupported-length (list cur-vals (if (= limit-type "0") 100.0 120.0))))
-          (if (vl-catch-all-error-p l-max-res)
-            (setq l-max 5.0)
-            (setq l-max l-max-res)
+      (defun update-strut-calc-info ()
+        (vl-catch-all-apply (function (lambda ( / cur-shape cur-sec clean-sec cur-vals limit-type l-max l-max-res span-m num-div auto-interval sec-idx is-1h new-sec-str new-idx )
+          (setq cur-shape (nth (atoi (get_tile "s_shape")) shape-list-strut))
+          (setq sec-idx (atoi (get_tile "s_sec")))
+          (if (wcmatch cur-shape "H형강")
+            (setq cur-sec (nth sec-idx sec-list-h))
+            (setq cur-sec (nth sec-idx sec-list-pipe))
           )
-        )
-        (setq l-max 5.0)
-      )
-      (if (or (null l-max) (<= l-max 0.1)) (setq l-max 5.0))
+          
+          ;; 1H, 2H 무관하게 한계길이는 항상 1H 베이스로 계산되도록 치환
+          (setq clean-sec (if cur-sec cur-sec ""))
+          (setq is-1h (if cur-sec (wcmatch cur-sec "H *") nil))
+          (if (and cur-sec (wcmatch cur-sec "2H *")) (setq clean-sec (vl-string-subst "H " "2H " cur-sec)))
+          
+          (setq cur-vals (parse-h-spec clean-sec))
+          (setq limit-type (get_tile "s_slenderness_limit"))
 
-      (setq span-m (/ current-strut-span 1000.0))
-
-      ;; [2H 자동 상향] 한계길이를 넘었고, 현재 사용자가 1H를 직접 클릭하지 않았다면 2H로 자동 넘김
-      (if (and (not user-forced-strut-sec) is-1h (> span-m l-max) (wcmatch cur-shape "H형강"))
-        (progn
-          (setq new-sec-str (vl-string-subst "2H " "H " cur-sec))
-          (setq new-idx (vl-position new-sec-str sec-list-h))
-          (if new-idx
+          (if cur-vals
             (progn
-              (set_tile "s_sec" (itoa new-idx))
-              (setq cur-sec new-sec-str)
+              (setq l-max-res (vl-catch-all-apply 'tsp-calc-unsupported-length (list cur-vals (if (= limit-type "0") 100.0 120.0))))
+              (if (vl-catch-all-error-p l-max-res) (setq l-max 5.0) (setq l-max l-max-res))
+            )
+            (setq l-max 5.0)
+          )
+          (if (or (null l-max) (<= l-max 0.1)) (setq l-max 5.0))
+          (setq span-m (/ current-strut-span 1000.0))
+
+          ;; [2H 자동 상향] 한계길이를 넘었고, 현재 사용자가 1H를 직접 클릭하지 않았다면 2H로 자동 넘김
+          (if (and (not user-forced-strut-sec) is-1h (> span-m l-max) (wcmatch cur-shape "H형강"))
+            (progn
+              (setq new-sec-str (vl-string-subst "2H " "H " cur-sec))
+              (setq new-idx (vl-position new-sec-str sec-list-h))
+              (if new-idx
+                (progn (set_tile "s_sec" (itoa new-idx)) (setq cur-sec new-sec-str))
+              )
             )
           )
+
+          ;; 보강재 간격 축소 로직
+          (setq num-div (fix (+ (/ span-m l-max) 0.9999)))
+          (if (< num-div 1) (setq num-div 1))
+          (setq auto-interval (/ span-m num-div))
+
+          (set_tile "s_stiffener_info" (strcat "최대길이: " (rtos span-m 2 1) "m | 허용(1H): " (rtos l-max 2 2) "m | " (itoa num-div) "등분 | 간격: " (rtos auto-interval 2 3) "m" (if (and (wcmatch cur-shape "H형강") (> span-m 50.0)) "  [! 자중좌굴 50m 초과]" "")))
+          
+          ;; 작도를 통해 실제 길이가 확정된 상태에서만 입력칸 동기화
+          (if (and (/= (get_tile "s_chk_manual_interval") "1") *tsp-last-strut-len*)
+            (set_tile "s_manual_interval" (rtos auto-interval 2 3))
+          )
+        )))
+      )
+
+      (action_tile "s_shape" "(progn (update-ui-strut $value) (setq user-forced-strut-sec nil) (update-strut-calc-info))")
+      (action_tile "s_sec" "(progn (setq user-forced-strut-sec T) (update-strut-calc-info))")
+      (action_tile "s_slenderness_limit" "(progn (setq user-forced-strut-sec nil) (update-strut-calc-info))")
+      (action_tile "s_manual_interval" "(set_tile \"s_chk_manual_interval\" \"1\")")
+      (action_tile "s_chk_manual_interval" "(if (= $value \"0\") (update-strut-calc-info))")
+      
+      ;; 다이얼로그 최초 기동 시 즉시 실행
+      (update-strut-calc-info)
+        
+      (defun get-current-brace-opt ()
+        (list (get_tile "s_chk_stiffener_enable")
+              (get_tile "s_slenderness_limit")
+              (get_tile "s_chk_manual_interval")
+              (get_tile "s_manual_interval")
+              (get_tile "s_stiffener_margin")
+              (get_tile "s_chk_post_enable")
+              "0"
+              "0"
+              (if (= (get_tile "s_post_side_R") "1") "R" "L")
         )
       )
 
-      ;; 보강재 간격 축소 로직
-      (setq num-div (fix (+ (/ span-m l-max) 0.9999)))
-      (if (< num-div 1) (setq num-div 1))
-      (setq auto-interval (/ span-m num-div))
+      ;; [수정 복원] 중간말뚝 추가/삭제 수동 제어 액션 연결
+      ;; 더미 리스트 대신 실시간 UI 값을 온전히 s-data에 수집하여 넘겨줌으로써 잘못된 리스트 오류 원천 방어
+      (action_tile "s_btn_post_add" "(progn 
+        (setq res-shape (nth (atoi (get_tile \"s_shape\")) shape-list-strut)) (if (null res-shape) (setq res-shape \"H형강\"))
+        (setq res-depth (atof (get_tile \"s_depth\")))
+        (setq m-idx (atoi (get_tile \"s_mat\"))) (if (wcmatch res-shape \"H형강\") (setq res-mat (nth m-idx mat-list-h)) (setq res-mat (nth m-idx mat-list-pipe)))
+        (setq sec-idx (atoi (get_tile \"s_sec\"))) (if (wcmatch res-shape \"H형강\") (setq res-sec (nth sec-idx sec-list-h)) (setq res-sec (nth sec-idx sec-list-pipe)))
+        (if (null res-sec) (setq res-sec \"H 300x300x10/15\"))
+        (setq res-count (if (wcmatch res-sec \"2H *\") 2 1))
+        (setq s-brace-opt (get-current-brace-opt))
+        (setq s-data (list \"ADD_POST\" (get_tile \"s_name\") res-shape res-depth res-count res-mat res-sec (nth (atoi (get_tile \"s_jack\")) jack-list) manual-pts (get_tile \"s_start_mode\") (get_tile \"s_ctc\") s-brace-opt))
+        (done_dialog 97)
+      )")
+      (action_tile "s_btn_post_del" "(progn 
+        (setq res-shape (nth (atoi (get_tile \"s_shape\")) shape-list-strut)) (if (null res-shape) (setq res-shape \"H형강\"))
+        (setq res-depth (atof (get_tile \"s_depth\")))
+        (setq m-idx (atoi (get_tile \"s_mat\"))) (if (wcmatch res-shape \"H형강\") (setq res-mat (nth m-idx mat-list-h)) (setq res-mat (nth m-idx mat-list-pipe)))
+        (setq sec-idx (atoi (get_tile \"s_sec\"))) (if (wcmatch res-shape \"H형강\") (setq res-sec (nth sec-idx sec-list-h)) (setq res-sec (nth sec-idx sec-list-pipe)))
+        (if (null res-sec) (setq res-sec \"H 300x300x10/15\"))
+        (setq res-count (if (wcmatch res-sec \"2H *\") 2 1))
+        (setq s-brace-opt (get-current-brace-opt))
+        (setq s-data (list \"DEL_POST\" (get_tile \"s_name\") res-shape res-depth res-count res-mat res-sec (nth (atoi (get_tile \"s_jack\")) jack-list) manual-pts (get_tile \"s_start_mode\") (get_tile \"s_ctc\") s-brace-opt))
+        (done_dialog 98)
+      )")
+      (action_tile "s_btn_post_reset" "(progn 
+        (setq res-shape (nth (atoi (get_tile \"s_shape\")) shape-list-strut)) (if (null res-shape) (setq res-shape \"H형강\"))
+        (setq res-depth (atof (get_tile \"s_depth\")))
+        (setq m-idx (atoi (get_tile \"s_mat\"))) (if (wcmatch res-shape \"H형강\") (setq res-mat (nth m-idx mat-list-h)) (setq res-mat (nth m-idx mat-list-pipe)))
+        (setq sec-idx (atoi (get_tile \"s_sec\"))) (if (wcmatch res-shape \"H형강\") (setq res-sec (nth sec-idx sec-list-h)) (setq res-sec (nth sec-idx sec-list-pipe)))
+        (if (null res-sec) (setq res-sec \"H 300x300x10/15\"))
+        (setq res-count (if (wcmatch res-sec \"2H *\") 2 1))
+        (setq s-brace-opt (get-current-brace-opt))
+        (setq s-data (list \"RESET_POST\" (get_tile \"s_name\") res-shape res-depth res-count res-mat res-sec (nth (atoi (get_tile \"s_jack\")) jack-list) manual-pts (get_tile \"s_start_mode\") (get_tile \"s_ctc\") s-brace-opt))
+        (done_dialog 99)
+      )")
 
-      (set_tile "s_stiffener_info" (strcat "최대길이: " (rtos span-m 2 1) "m | 허용(1H): " (rtos l-max 2 2) "m | " (itoa num-div) "등분 | 간격: " (rtos auto-interval 2 3) "m" (if (and (wcmatch cur-shape "H형강") (> span-m 50.0)) "  [! 자중좌굴 50m 초과]" "")))
-      ;; 작도를 통해 실제 길이가 한 번이라도 확정된 상태(*tsp-last-strut-len* 존재)에서만 입력칸 동기화 수행
-      (if (and (/= (get_tile "s_chk_manual_interval") "1") *tsp-last-strut-len*)
-        (set_tile "s_manual_interval" (rtos auto-interval 2 3))
-      )
-    )))
-  )
+      (action_tile "btn_redraw_strut" "(progn 
+        (setq res-shape (nth (atoi (get_tile \"s_shape\")) shape-list-strut)) (if (null res-shape) (setq res-shape \"H형강\"))
+        (setq res-depth (atof (get_tile \"s_depth\")))
+        (setq m-idx (atoi (get_tile \"s_mat\"))) (if (wcmatch res-shape \"H형강\") (setq res-mat (nth m-idx mat-list-h)) (setq res-mat (nth m-idx mat-list-pipe)))
+        (setq sec-idx (atoi (get_tile \"s_sec\"))) (if (wcmatch res-shape \"H형강\") (setq res-sec (nth sec-idx sec-list-h)) (setq res-sec (nth sec-idx sec-list-pipe)))
+        (if (null res-sec) (setq res-sec \"H 300x300x10/15\"))
+        (setq res-count (if (wcmatch res-sec \"2H *\") 2 1))
+        (setq s-brace-opt (get-current-brace-opt))
+        (setq s-data (list \"MEASURE_SIGNAL\" (get_tile \"s_name\") res-shape res-depth res-count res-mat res-sec (nth (atoi (get_tile \"s_jack\")) jack-list) manual-pts (get_tile \"s_start_mode\") (get_tile \"s_ctc\") s-brace-opt))
+        (done_dialog 6)
+      )")
 
-  (action_tile "s_shape" "(progn (update-ui-strut $value) (setq user-forced-strut-sec nil) (update-strut-calc-info))")
-  (action_tile "s_sec" "(progn (setq user-forced-strut-sec T) (update-strut-calc-info))")
-  (action_tile "s_slenderness_limit" "(progn (setq user-forced-strut-sec nil) (update-strut-calc-info))")
-  (action_tile "s_manual_interval" "(set_tile \"s_chk_manual_interval\" \"1\")")
-  (action_tile "s_chk_manual_interval" "(if (= $value \"0\") (update-strut-calc-info))")
-        
-        ;; 다이얼로그 켤 때 최초 1회 화면에 표시되도록 즉시 실행
-        (update-strut-calc-info)
-        ;; =================================================================
-        
-  ;; 보강재 및 중간말뚝 옵션 추출 (문자열 결합 버그 및 ARX 예외 원천 차단을 위해 함수형태로 독립)
-  (defun get-current-brace-opt ()
-    (list (get_tile "s_chk_stiffener_enable")
-          (get_tile "s_slenderness_limit")
-          (get_tile "s_chk_manual_interval")
-          (get_tile "s_manual_interval")
-          (get_tile "s_stiffener_margin")
-          (get_tile "s_chk_post_enable")
-          "0"
-          "0"
-          (if (= (get_tile "s_post_side_R") "1") "R" "L")
-    )
-  )
-
-  ;; ARX 예외 방지를 위해 DCL 내부 함수에서 외부 실행으로 분리 완료
-  
-  ;; 3중 검증 수동 제어 버튼 액션 연결 (임시 DCL ID 97, 98, 99 반환)
-  (action_tile "s_btn_post_add" "(progn (setq s-brace-opt (get-current-brace-opt)) (setq s-data (list \"ADD_POST\" (get_tile \"s_name\") \"\" 0.0 0 \"\" \"\" \"\" manual-pts \"\" \"\" s-brace-opt)) (done_dialog 97))")
-  (action_tile "s_btn_post_del" "(progn (setq s-brace-opt (get-current-brace-opt)) (setq s-data (list \"DEL_POST\" (get_tile \"s_name\") \"\" 0.0 0 \"\" \"\" \"\" manual-pts \"\" \"\" s-brace-opt)) (done_dialog 98))")
-  (action_tile "s_btn_post_reset" "(progn (setq s-brace-opt (get-current-brace-opt)) (setq s-data (list \"RESET_POST\" (get_tile \"s_name\") \"\" 0.0 0 \"\" \"\" \"\" manual-pts \"\" \"\" s-brace-opt)) (done_dialog 99))")
-
-  ;; 도면에서 확인/측정 버튼 액션 (기존 btn_redraw_strut 키 유지, 상태 코드 6 탈출)
-  (action_tile "btn_redraw_strut" "(progn 
-    (setq res-shape (nth (atoi (get_tile \"s_shape\")) shape-list-strut))
-    (if (null res-shape) (setq res-shape \"H형강\"))
-    (setq res-depth (atof (get_tile \"s_depth\")))
-    (setq m-idx (atoi (get_tile \"s_mat\")))
-    (if (wcmatch res-shape \"H형강\") (setq res-mat (nth m-idx mat-list-h)) (setq res-mat (nth m-idx mat-list-pipe)))
-    (setq sec-idx (atoi (get_tile \"s_sec\")))
-    (if (wcmatch res-shape \"H형강\") (setq res-sec (nth sec-idx sec-list-h)) (setq res-sec (nth sec-idx sec-list-pipe)))
-    (if (null res-sec) (setq res-sec \"H 300x300x10/15\"))
-    (setq res-count (if (wcmatch res-sec \"2H *\") 2 1))
-    (setq s-brace-opt (get-current-brace-opt))
-    (setq s-data (list \"MEASURE_SIGNAL\" (get_tile \"s_name\") res-shape res-depth res-count res-mat res-sec (nth (atoi (get_tile \"s_jack\")) jack-list) manual-pts (get_tile \"s_start_mode\") (get_tile \"s_ctc\") s-brace-opt))
-    (done_dialog 6)
-  )")
-
-  (action_tile "btn_draw_strut" "(progn 
-    (setq res-shape (nth (atoi (get_tile \"s_shape\")) shape-list-strut))
-    (if (null res-shape) (setq res-shape \"H형강\"))
-    (setq res-depth (atof (get_tile \"s_depth\")))
-    (setq m-idx (atoi (get_tile \"s_mat\")))
-    (if (wcmatch res-shape \"H형강\") (setq res-mat (nth m-idx mat-list-h)) (setq res-mat (nth m-idx mat-list-pipe)))
-    (setq sec-idx (atoi (get_tile \"s_sec\")))
-    (if (wcmatch res-shape \"H형강\") (setq res-sec (nth sec-idx sec-list-h)) (setq res-sec (nth sec-idx sec-list-pipe)))
-    ;; [수정] res-sec이 nil일 때 발생하는 stringp nil 오류 방어막 추가
-    (if (null res-sec) (setq res-sec \"H 300x300x10/15\"))
-    (setq res-count (if (wcmatch res-sec \"2H *\") 2 1))
-    (setq s-brace-opt (get-current-brace-opt))
-    (if (and (wcmatch res-shape \"H형강\") (> current-strut-span 50000.0))
-      (alert \"경고: 버팀보 예상 길이가 자중 좌굴 한계(50m)를 초과합니다.\\n안전성에 유의하여 작도를 진행합니다.\")
-    )
-    (setq s-data (list \"DRAW_SIGNAL\" (get_tile \"s_name\") res-shape res-depth res-count res-mat res-sec (nth (atoi (get_tile \"s_jack\")) jack-list) manual-pts (get_tile \"s_start_mode\") (get_tile \"s_ctc\") s-brace-opt))
-    (done_dialog 4)
-  )")
-
-  ;; 도면에서 확인/측정 버튼 액션 연결 (임시 백업 후 상태코드 6으로 탈출)
-  (action_tile "btn_measure" "(progn 
-    (setq res-shape (nth (atoi (get_tile \"s_shape\")) shape-list-strut))
-    (if (null res-shape) (setq res-shape \"H형강\"))
-    (setq res-depth (atof (get_tile \"s_depth\")))
-    (setq m-idx (atoi (get_tile \"s_mat\")))
-    (if (wcmatch res-shape \"H형강\") (setq res-mat (nth m-idx mat-list-h)) (setq res-mat (nth m-idx mat-list-pipe)))
-    (setq sec-idx (atoi (get_tile \"s_sec\")))
-    (if (wcmatch res-shape \"H형강\") (setq res-sec (nth sec-idx sec-list-h)) (setq res-sec (nth sec-idx sec-list-pipe)))
-    (if (null res-sec) (setq res-sec \"H 300x300x10/15\"))
-    (setq res-count (if (wcmatch res-sec \"2H *\") 2 1))
-    (setq s-brace-opt (get-current-brace-opt))
-    (setq s-data (list \"MEASURE_SIGNAL\" (get_tile \"s_name\") res-shape res-depth res-count res-mat res-sec (nth (atoi (get_tile \"s_jack\")) jack-list) manual-pts (get_tile \"s_start_mode\") (get_tile \"s_ctc\") s-brace-opt))
-    (done_dialog 6)
-  )")
-
-  (action_tile "accept" "(progn (setq res-name (get_tile \"s_name\"))
-    (setq res-shape (nth (atoi (get_tile \"s_shape\")) shape-list-strut))
-    (if (null res-shape) (setq res-shape \"H형강\"))
-    (setq res-depth (atof (get_tile \"s_depth\")))
-    (setq m-idx (atoi (get_tile \"s_mat\")))
-    (if (wcmatch res-shape \"H형강\") (setq res-mat (nth m-idx mat-list-h)) (setq res-mat (nth m-idx mat-list-pipe)))
-    (setq sec-idx (atoi (get_tile \"s_sec\")))
-    (if (wcmatch res-shape \"H형강\") (setq res-sec (nth sec-idx sec-list-h)) (setq res-sec (nth sec-idx sec-list-pipe)))
-    ;; [수정] res-sec이 nil일 때 발생하는 stringp nil 오류 방어막 추가
-    (if (null res-sec) (setq res-sec \"H 300x300x10/15\"))
-    (setq res-count (if (wcmatch res-sec \"2H *\") 2 1))
-    (setq res-jack (nth (atoi (get_tile \"s_jack\")) jack-list))
-    (setq res-start-mode (get_tile \"s_start_mode\"))
-    (setq res-ctc (get_tile \"s_ctc\"))
-    (setq s-brace-opt (get-current-brace-opt))
-    (cond
-      ((or (= res-name \"\") (<= res-depth 0.0)) (alert \"이름과 설치깊이를 확인하세요.\"))
-      ((<= res-depth min-depth) (alert \"설치 깊이는 이전 단계보다 깊어야 합니다!\"))
-      ((<= (atof res-ctc) 0.0)
-         (alert \"배열 간격(C.T.C)은 0보다 커야 합니다.\"))
-        (t
-         (setq s-data (list \"버팀보(Strut)\" res-name res-shape res-depth res-count res-mat res-sec res-jack manual-pts res-start-mode res-ctc s-brace-opt))
-         (done_dialog 1)
+      (action_tile "btn_draw_strut" "(progn 
+        (setq res-shape (nth (atoi (get_tile \"s_shape\")) shape-list-strut)) (if (null res-shape) (setq res-shape \"H형강\"))
+        (setq res-depth (atof (get_tile \"s_depth\")))
+        (setq m-idx (atoi (get_tile \"s_mat\"))) (if (wcmatch res-shape \"H형강\") (setq res-mat (nth m-idx mat-list-h)) (setq res-mat (nth m-idx mat-list-pipe)))
+        (setq sec-idx (atoi (get_tile \"s_sec\"))) (if (wcmatch res-shape \"H형강\") (setq res-sec (nth sec-idx sec-list-h)) (setq res-sec (nth sec-idx sec-list-pipe)))
+        (if (null res-sec) (setq res-sec \"H 300x300x10/15\"))
+        (setq res-count (if (wcmatch res-sec \"2H *\") 2 1))
+        (setq s-brace-opt (get-current-brace-opt))
+        (if (and (wcmatch res-shape \"H형강\") (> current-strut-span 50000.0))
+          (alert \"경고: 버팀보 예상 길이가 자중 좌굴 한계(50m)를 초과합니다.\\n안전성에 유의하여 작도를 진행합니다.\")
         )
+        (setq s-data (list \"DRAW_SIGNAL\" (get_tile \"s_name\") res-shape res-depth res-count res-mat res-sec (nth (atoi (get_tile \"s_jack\")) jack-list) manual-pts (get_tile \"s_start_mode\") (get_tile \"s_ctc\") s-brace-opt))
+        (done_dialog 4)
+      )")
+
+      (action_tile "btn_measure" "(progn 
+        (setq res-shape (nth (atoi (get_tile \"s_shape\")) shape-list-strut)) (if (null res-shape) (setq res-shape \"H형강\"))
+        (setq res-depth (atof (get_tile \"s_depth\")))
+        (setq m-idx (atoi (get_tile \"s_mat\"))) (if (wcmatch res-shape \"H형강\") (setq res-mat (nth m-idx mat-list-h)) (setq res-mat (nth m-idx mat-list-pipe)))
+        (setq sec-idx (atoi (get_tile \"s_sec\"))) (if (wcmatch res-shape \"H형강\") (setq res-sec (nth sec-idx sec-list-h)) (setq res-sec (nth sec-idx sec-list-pipe)))
+        (if (null res-sec) (setq res-sec \"H 300x300x10/15\"))
+        (setq res-count (if (wcmatch res-sec \"2H *\") 2 1))
+        (setq s-brace-opt (get-current-brace-opt))
+        (setq s-data (list \"MEASURE_SIGNAL\" (get_tile \"s_name\") res-shape res-depth res-count res-mat res-sec (nth (atoi (get_tile \"s_jack\")) jack-list) manual-pts (get_tile \"s_start_mode\") (get_tile \"s_ctc\") s-brace-opt))
+        (done_dialog 6)
+      )")
+
+      (action_tile "accept" "(progn 
+        (setq res-name (get_tile \"s_name\"))
+        (setq res-shape (nth (atoi (get_tile \"s_shape\")) shape-list-strut)) (if (null res-shape) (setq res-shape \"H형강\"))
+        (setq res-depth (atof (get_tile \"s_depth\")))
+        (setq m-idx (atoi (get_tile \"s_mat\"))) (if (wcmatch res-shape \"H형강\") (setq res-mat (nth m-idx mat-list-h)) (setq res-mat (nth m-idx mat-list-pipe)))
+        (setq sec-idx (atoi (get_tile \"s_sec\"))) (if (wcmatch res-shape \"H형강\") (setq res-sec (nth sec-idx sec-list-h)) (setq res-sec (nth sec-idx sec-list-pipe)))
+        (if (null res-sec) (setq res-sec \"H 300x300x10/15\"))
+        (setq res-count (if (wcmatch res-sec \"2H *\") 2 1))
+        (setq res-jack (nth (atoi (get_tile \"s_jack\")) jack-list))
+        (setq res-start-mode (get_tile \"s_start_mode\"))
+        (setq res-ctc (get_tile \"s_ctc\"))
+        (setq s-brace-opt (get-current-brace-opt))
+        (cond
+          ((or (= res-name \"\") (<= res-depth 0.0)) (alert \"이름과 설치깊이를 확인하세요.\"))
+          ((<= res-depth min-depth) (alert \"설치 깊이는 이전 단계보다 깊어야 합니다!\"))
+          ((<= (atof res-ctc) 0.0) (alert \"배열 간격(C.T.C)은 0보다 커야 합니다.\"))
+          (t
+           (setq s-data (list \"버팀보(Strut)\" res-name res-shape res-depth res-count res-mat res-sec res-jack manual-pts res-start-mode res-ctc s-brace-opt))
+           (done_dialog 1)
+          )
+        )
+      )")
+      (action_tile "cancel" "(done_dialog 0)")
+      (setq dlg-status (start_dialog))
     )
-  )")
-        (action_tile "cancel" "(done_dialog 0)")
-        
-        (setq dlg-status (start_dialog))
+  )
+    
+  (cond
+    ;; 상태 코드 6 반환 시: 자동 및 수동 버팀보 실시간 도면 측정/갱신 처리
+    ((= dlg-status 6)
+      (progn
+        (if *tsp-is-redrawing* (progn 
+            (princ "\n[알림] 이미 갱신 작업 중입니다. 잠시만 기다려주세요.") 
+            (strut-input-dialog s-data (nth 1 s-data) min-depth)
+          )
+          (progn
+            (setq *tsp-is-redrawing* T)
+            
+            ;; [에러 트랩 추가] 에러 발생 시 *tsp-is-redrawing* 플래그를 강제 해제하여 무한 대기 방지
+            (setq old-err *error*)
+            (defun *error* (msg)
+              (setq *tsp-is-redrawing* nil)
+              (princ (strcat "\n[TSP 시스템 에러 복구] 갱신 중 문제가 발생했습니다: " msg))
+              (if old-err (setq *error* old-err))
+              (princ)
+            )
+
+            (princ "\n[DEBUG] 01. 상태코드 6 진입")
+            (tsp-log ">>> [DCL] 상태코드 6 진입 시작")
+            
+            (setq s-brace-opt (nth 11 s-data))
+            (if (= (type s-brace-opt) 'STR)
+              (progn
+                (tsp-log ">>> [DCL] s-brace-opt 문자열 감지됨. 강제 리스트 복원 수행")
+                (setq s-brace-opt (read s-brace-opt))
+                (setq s-data (list (nth 0 s-data) (nth 1 s-data) (nth 2 s-data) (nth 3 s-data) (nth 4 s-data) (nth 5 s-data) (nth 6 s-data) (nth 7 s-data) (nth 8 s-data) (nth 9 s-data) (nth 10 s-data) s-brace-opt))
+              )
+            )
+            
+            (princ "\n[DEBUG] 02. 전역 리스트 교체 준비")
+            (setq tmp-strut-data (cons "버팀보(Strut)" (cdr s-data)))
+            (setq orig-support-list *tsp-support-list*)
+            (setq replaced nil new-list '())
+            (foreach item *tsp-support-list*
+              (if (and (= (car item) "버팀보(Strut)") (= (nth 1 item) (nth 1 tmp-strut-data)))
+                (progn (setq new-list (append new-list (list tmp-strut-data))) (setq replaced T))
+                (setq new-list (append new-list (list item)))
+              )
+            )
+            (if (not replaced) (setq new-list (append new-list (list tmp-strut-data))))
+            (setq *tsp-support-list* new-list)
+            
+            (if (and (boundp '*tsp-current-seg-idx*) *tsp-current-seg-idx*)
+              (progn
+                (setq cur-seg (nth *tsp-current-seg-idx* *segment-list*))
+                (setq cur-supp-list (cdr (assoc 'SUPPORT-LIST cur-seg)))
+                (setq tmp-replaced nil tmp-new-supp '())
+                (foreach item cur-supp-list
+                  (if (and (wcmatch (car item) "버팀보*") (= (nth 1 item) (nth 1 tmp-strut-data)))
+                    (progn (setq tmp-new-supp (append tmp-new-supp (list tmp-strut-data))) (setq tmp-replaced T))
+                    (setq tmp-new-supp (append tmp-new-supp (list item)))
+                  )
+                )
+                (if (not tmp-replaced) (setq tmp-new-supp (append tmp-new-supp (list tmp-strut-data))))
+                (setq *segment-list*
+                  (subst (subst (cons 'SUPPORT-LIST tmp-new-supp) (assoc 'SUPPORT-LIST cur-seg) cur-seg) cur-seg *segment-list*))
+              )
+            )
+
+            (princ "\n[DEBUG] 03. 실시간 평면 갱신 (자동 작도분)")
+            (tsp-log ">>> [Main] tsp-redraw-realtime-plan 호출 검토")
+            (if (and (boundp '*tsp-boundary-ent*) *tsp-boundary-ent* (boundp '*tsp-boundary-orient*) *tsp-boundary-orient*)
+              (progn
+                (tsp-log (strcat ">>> [Main] 경계선 데이터 유효 확인 완료. 핸들: " (if (entget *tsp-boundary-ent*) (cdr (assoc 5 (entget *tsp-boundary-ent*))) "엔티티사망")))
+                (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*)
+                (tsp-log ">>> [Main] tsp-redraw-realtime-plan 실행 무사 완료")
+              )
+              (tsp-log ">>> [경고] *tsp-boundary-ent* 전역 변수가 비어있어 재작도를 건너뜁니다!")
+            )
+
+            (princ "\n[DEBUG] 04. 수동 작도 객체 검색 시작")
+            (setq unique-params '())
+            (foreach e manual-drawn-ents
+              (if (and e (entget e '("TSP_STRUT_SPEC")))
+                (progn
+                  (setq xdata (cdadr (assoc -3 (entget e '("TSP_STRUT_SPEC")))))
+                  (if xdata
+                    (if (and (> (length xdata) 7) (= (cdr (nth 7 xdata)) "MANUAL_STRUT"))
+                      (progn
+                        (setq seg-id (cdr (nth 0 xdata)))
+                        (setq pt1 (cdr (nth 2 xdata)))
+                        (setq pt2 (cdr (nth 3 xdata)))
+                        (setq p-pair (list pt1 pt2 seg-id))
+                        (if (not (vl-member-if '(lambda (x) (and (equal pt1 (car x) 1e-4) (equal pt2 (cadr x) 1e-4))) unique-params))
+                          (setq unique-params (append unique-params (list p-pair)))
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+
+            (princ "\n[DEBUG] 05. 기존 수동 작도 객체 삭제 시작")
+            (if unique-params
+              (progn
+                (foreach e manual-drawn-ents 
+                  (if (entget e) 
+                    (progn
+                      (vl-catch-all-apply 'entmod (list (list (cons -1 e) (list -3 (list "TSP_STRUT_SPEC")))))
+                      (vl-catch-all-apply 'entmod (list (list (cons -1 e) (list -3 (list "TSP_LISP_BRACE")))))
+                      (tsp-safe-hide-ent e)  ;; 물리 삭제 대신 ARX가 지우도록 안전 숨김 처리
+                    )
+                  )
+                )
+                (setq manual-drawn-ents '())
+                (setq res-sec (nth 6 s-data) jack-type (nth 7 s-data) is-double (if (>= (nth 4 s-data) 2) T nil) s-brace-opt (nth 11 s-data))
+                
+                (princ "\n[DEBUG] 06. 새로운 수동 작도(버팀보) 시작")
+                (foreach param unique-params
+                  (setq pt1 (car param) pt2 (cadr param) seg-id (caddr param))
+                  (setq array-brace-opt s-brace-opt)
+                  (if array-brace-opt (setq array-brace-opt (cons "0" (cdr array-brace-opt))))
+                  (setq new-ents (tsp-draw-manual-strut pt1 pt2 res-sec jack-type is-double array-brace-opt seg-id))
+                  (setq manual-drawn-ents (append manual-drawn-ents new-ents))
+                )
+                
+                (princ "\n[DEBUG] 07. 새로운 수동 작도(보강재) 시작")
+                (setq all-pts (mapcar 'car unique-params))
+                (if (and s-brace-opt (= (nth 0 s-brace-opt) "1") (> (length all-pts) 0))
+                  (progn
+                    (setq pt1 (car (car unique-params)) pt2 (cadr (car unique-params)) target-seg-id (caddr (car unique-params)))
+                    (setq strut-ang (angle pt1 pt2) strut-len (distance pt1 pt2))
+                    (if (boundp 'tsp-draw-realtime-continuous-braces)
+                      (progn
+                        (setq temp-brace-ents (tsp-draw-realtime-continuous-braces all-pts s-brace-opt res-sec is-double strut-ang strut-len target-seg-id))
+                        (setq manual-drawn-ents (append manual-drawn-ents temp-brace-ents))
+                      )
+                    )
+                  )
+                )
+                
+                (princ "\n[DEBUG] 08. 재생성(REGEN) 실행")
+                (vl-catch-all-apply 'vla-regen (list (vla-get-activedocument (vlax-get-acad-object)) 1))
+                (command "_.DELAY" 200)
+              )
+            )
+
+            (princ "\n[DEBUG] 09. ARX 도면제어 함수 호출 직전!")
+            (if tsp-pause-for-measurement
+              (progn
+                (tsp-pause-for-measurement)
+                (princ "\n[DEBUG] 10. ARX 도면제어 함수 종료됨 (정상 복귀)")
+                (tsp-log ">>> [Main] ARX 도면제어 무사 종료됨")
+              )
+              (alert "TSP - 도면 제어 모듈이 로드되지 않았습니다.")
+            )
+            
+            (princ "\n[DEBUG] 11. DCL 다이얼로그 재호출 직전")
+            (setq *tsp-support-list* orig-support-list)
+            
+            ;; [복원] 정상 작동 시 에러 트랩 복구 및 플래그 해제
+            (setq *error* old-err) 
+            (setq *tsp-is-redrawing* nil)
+            
+            (strut-input-dialog s-data (nth 1 s-data) min-depth)
+          )
+        )
       )
     )
     
-    (cond
-      ;; 상태 코드 6 반환 시: 자동 및 수동 버팀보(보강재 포함) 실시간 갱신 후 도면 측정 기능 실행
-      ((= dlg-status 6)
-        (progn
-          (tsp-log ">>> [DCL] 상태코드 6 진입 시작")
-          (setq s-brace-opt (nth 11 s-data))
-          (if (= (type s-brace-opt) 'STR)
+    ((= dlg-status 5)
+      (progn
+        (setq unique-params '())
+        (foreach e manual-drawn-ents
+          (if (and e (entget e '("TSP_STRUT_SPEC")))
             (progn
-              (tsp-log ">>> [DCL] s-brace-opt 문자열 감지됨. 강제 리스트 복원 수행")
-              (setq s-brace-opt (read s-brace-opt))
-              (setq s-data (list (nth 0 s-data) (nth 1 s-data) (nth 2 s-data) (nth 3 s-data) (nth 4 s-data) (nth 5 s-data) (nth 6 s-data) (nth 7 s-data) (nth 8 s-data) (nth 9 s-data) (nth 10 s-data) s-brace-opt))
+              (setq xdata (cdadr (assoc -3 (entget e '("TSP_STRUT_SPEC")))))
+              (if xdata
+                (if (and (> (length xdata) 7) (= (cdr (nth 7 xdata)) "MANUAL_STRUT"))
+                  (progn
+                    (setq seg-id (cdr (nth 0 xdata)))
+                    (setq pt1 (cdr (nth 2 xdata)))
+                    (setq pt2 (cdr (nth 3 xdata)))
+                    (setq p-pair (list pt1 pt2 seg-id))
+                    (if (not (vl-member-if '(lambda (x) (and (equal pt1 (car x) 1e-4) (equal pt2 (cadr x) 1e-4))) unique-params))
+                      (setq unique-params (append unique-params (list p-pair)))
+                    )
+                  )
+                )
+              )
             )
           )
-          
-          ;; 1. 전역 리스트 임시 교체용 데이터 구성 (자동 작도 갱신용)
-          (setq tmp-strut-data (cons "버팀보(Strut)" (cdr s-data)))
-          (setq orig-support-list *tsp-support-list*)
-          (setq replaced nil new-list '())
-          (foreach item *tsp-support-list*
-            (if (and (= (car item) "버팀보(Strut)") (= (nth 1 item) (nth 1 tmp-strut-data)))
-              (progn (setq new-list (append new-list (list tmp-strut-data))) (setq replaced T))
-              (setq new-list (append new-list (list item)))
-            )
-          )
-          (if (not replaced)
-            (setq new-list (append new-list (list tmp-strut-data)))
-          )
-          (setq *tsp-support-list* new-list)
-          ;; 2. 자동 작도 버팀보 실시간 갱신
-          (tsp-log ">>> [Main] tsp-redraw-realtime-plan 호출 검토")
-          (if (and (boundp '*tsp-boundary-ent*) *tsp-boundary-ent* (boundp '*tsp-boundary-orient*) *tsp-boundary-orient*)
-            (progn
-              (tsp-log (strcat ">>> [Main] 경계선 데이터 유효 확인 완료. 핸들: " (if (entget *tsp-boundary-ent*) (cdr (assoc 5 (entget *tsp-boundary-ent*))) "엔티티사망")))
-              (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*)
-              (tsp-log ">>> [Main] tsp-redraw-realtime-plan 실행 무사 완료")
-            )
-            (tsp-log ">>> [경고] *tsp-boundary-ent* 전역 변수가 비어있어 재작도를 건너뜁니다!")
-          )
-
-          ;; 3. 수동 작도 버팀보 및 보강재 갱신 (dlg-status 5 로직 병합)
-          (setq unique-params '())
-          (foreach e manual-drawn-ents
-            (if (and e (entget e '("TSP_STRUT_SPEC")))
+        )
+        (if unique-params
+          (progn
+            (foreach e manual-drawn-ents (if (entget e) (tsp-safe-hide-ent e)))
+            (setq manual-drawn-ents '())
+            
+            ;; [안전장치 추가] s-brace-opt 문자열 리스트 변환 방어코드 추가 (잘못된 리스트 오류 차단)
+            (setq s-brace-opt (nth 11 s-data))
+            (if (= (type s-brace-opt) 'STR)
               (progn
-                (setq xdata (cdadr (assoc -3 (entget e '("TSP_STRUT_SPEC")))))
-                (if xdata
-                  (if (and (> (length xdata) 7) (= (cdr (nth 7 xdata)) "MANUAL_STRUT"))
-                    (progn
-                      (setq seg-id (cdr (nth 0 xdata)))
-                      (setq pt1 (cdr (nth 2 xdata)))
-                      (setq pt2 (cdr (nth 3 xdata)))
-                      (setq p-pair (list pt1 pt2 seg-id))
-                      (if (not (vl-member-if '(lambda (x) (and (equal pt1 (car x) 1e-4) (equal pt2 (cadr x) 1e-4))) unique-params))
-                        (setq unique-params (append unique-params (list p-pair)))
-                      )
-                    )
-                  )
-                )
+                (setq s-brace-opt (read s-brace-opt))
+                (setq s-data (list (nth 0 s-data) (nth 1 s-data) (nth 2 s-data) (nth 3 s-data) (nth 4 s-data) (nth 5 s-data) (nth 6 s-data) (nth 7 s-data) (nth 8 s-data) (nth 9 s-data) (nth 10 s-data) s-brace-opt))
               )
             )
-          )
-          (if unique-params
-            (progn
-              (foreach e manual-drawn-ents (if (entget e) (vl-catch-all-apply 'entdel (list e))))
-              (setq manual-drawn-ents '())
-              (setq res-sec (nth 6 s-data) jack-type (nth 7 s-data) is-double (if (>= (nth 4 s-data) 2) T nil) s-brace-opt (nth 11 s-data))
-              (foreach param unique-params
-                (setq pt1 (car param) pt2 (cadr param) seg-id (caddr param))
-                (setq array-brace-opt s-brace-opt)
-                (if array-brace-opt (setq array-brace-opt (cons "0" (cdr array-brace-opt))))
-                (setq new-ents (tsp-draw-manual-strut pt1 pt2 res-sec jack-type is-double array-brace-opt seg-id))
-                (setq manual-drawn-ents (append manual-drawn-ents new-ents))
-              )
-              (setq all-pts (mapcar 'car unique-params))
-              (if (and s-brace-opt (= (nth 0 s-brace-opt) "1") (> (length all-pts) 0))
-                (progn
-                  (setq pt1 (car (car unique-params)) pt2 (cadr (car unique-params)) target-seg-id (caddr (car unique-params)))
-                  (setq strut-ang (angle pt1 pt2) strut-len (distance pt1 pt2))
-                  (if (boundp 'tsp-draw-realtime-continuous-braces)
-                    (progn
-                      (setq temp-brace-ents (tsp-draw-realtime-continuous-braces all-pts s-brace-opt res-sec is-double strut-ang strut-len target-seg-id))
-                      (setq manual-drawn-ents (append manual-drawn-ents temp-brace-ents))
-                    )
-                  )
-                )
-              )
-              (command "_.REGEN")
+            
+            (setq res-sec (nth 6 s-data) jack-type (nth 7 s-data) is-double (if (>= (nth 4 s-data) 2) T nil) s-brace-opt (nth 11 s-data))
+            (foreach param unique-params
+              (setq pt1 (car param) pt2 (cadr param) seg-id (caddr param))
+              (setq array-brace-opt s-brace-opt)
+              (if array-brace-opt (setq array-brace-opt (cons "0" (cdr array-brace-opt))))
+              (setq new-ents (tsp-draw-manual-strut pt1 pt2 res-sec jack-type is-double array-brace-opt seg-id))
+              (setq manual-drawn-ents (append manual-drawn-ents new-ents))
             )
-          )
-          ;; 4. 사용자가 제공한 도면 제어/측정 함수 실행
-          (tsp-log ">>> [Main] tsp-pause-for-measurement (ARX 도면제어) 호출 직전")
-          (if tsp-pause-for-measurement
-            (progn
-              (tsp-pause-for-measurement)
-              (tsp-log ">>> [Main] ARX 도면제어 무사 종료됨")
-            )
-            (alert "TSP - 도면 제어 모듈이 로드되지 않았습니다.")
-          )
-          
-          ;; 5. 원본 전역 데이터 복구
-          (setq *tsp-support-list* orig-support-list)
-          (strut-input-dialog s-data (nth 1 s-data) min-depth)
-        )
-      )
-      ((= dlg-status 5)
-        (progn
-          (setq unique-params '())
-          (foreach e manual-drawn-ents
-            (if (and e (entget e '("TSP_STRUT_SPEC")))
+            (setq all-pts (mapcar 'car unique-params))
+            (if (and s-brace-opt (= (nth 0 s-brace-opt) "1") (> (length all-pts) 0))
               (progn
-                (setq xdata (cdadr (assoc -3 (entget e '("TSP_STRUT_SPEC")))))
-                (if xdata
-                  (if (and (> (length xdata) 7) (= (cdr (nth 7 xdata)) "MANUAL_STRUT"))
-                    (progn
-                      (setq seg-id (cdr (nth 0 xdata)))
-                      (setq pt1 (cdr (nth 2 xdata)))
-                      (setq pt2 (cdr (nth 3 xdata)))
-                      (setq p-pair (list pt1 pt2 seg-id))
-                      (if (not (vl-member-if '(lambda (x) (and (equal pt1 (car x) 1e-4) (equal pt2 (cadr x) 1e-4))) unique-params))
-                        (setq unique-params (append unique-params (list p-pair)))
-                      )
-                    )
+                (setq pt1 (car (car unique-params)) pt2 (cadr (car unique-params)) target-seg-id (caddr (car unique-params)))
+                (setq strut-ang (angle pt1 pt2) strut-len (distance pt1 pt2))
+                (if (boundp 'tsp-draw-realtime-continuous-braces)
+                  (progn
+                    (setq temp-brace-ents (tsp-draw-realtime-continuous-braces all-pts s-brace-opt res-sec is-double strut-ang strut-len target-seg-id))
+                    (setq manual-drawn-ents (append manual-drawn-ents temp-brace-ents))
                   )
                 )
               )
             )
+            (command "_.REGEN")
+            (princ "\n[성공] 도면의 버팀보 보강재 설정이 갱신되었습니다.")
           )
-          (if unique-params
-            (progn
-              (foreach e manual-drawn-ents (if (entget e) (vl-catch-all-apply 'entdel (list e))))
-              (setq manual-drawn-ents '())
-              (setq res-sec (nth 6 s-data) jack-type (nth 7 s-data) is-double (if (>= (nth 4 s-data) 2) T nil) s-brace-opt (nth 11 s-data))
-              (foreach param unique-params
-                (setq pt1 (car param) pt2 (cadr param) seg-id (caddr param))
-                (setq array-brace-opt s-brace-opt)
-                (if array-brace-opt (setq array-brace-opt (cons "0" (cdr array-brace-opt))))
-                (setq new-ents (tsp-draw-manual-strut pt1 pt2 res-sec jack-type is-double array-brace-opt seg-id))
-                (setq manual-drawn-ents (append manual-drawn-ents new-ents))
-              )
-              (setq all-pts (mapcar 'car unique-params))
-              (if (and s-brace-opt (= (nth 0 s-brace-opt) "1") (> (length all-pts) 0))
-                (progn
-                  (setq pt1 (car (car unique-params)) pt2 (cadr (car unique-params)) target-seg-id (caddr (car unique-params)))
-                  (setq strut-ang (angle pt1 pt2) strut-len (distance pt1 pt2))
-                  (if (boundp 'tsp-draw-realtime-continuous-braces)
-                    (progn
-                      (setq temp-brace-ents (tsp-draw-realtime-continuous-braces all-pts s-brace-opt res-sec is-double strut-ang strut-len target-seg-id))
-                      (setq manual-drawn-ents (append manual-drawn-ents temp-brace-ents))
-                    )
-                  )
-                )
-              )
-              (command "_.REGEN")
-              (princ "\n[성공] 도면의 버팀보 보강재 설정이 갱신되었습니다.")
-            )
-            (alert "갱신할 객체가 없습니다. 먼저 '도면에서 직접 작도'로 버팀보를 배치하세요.")
-          )
-          (strut-input-dialog s-data (nth 1 s-data) min-depth)
+          (alert "갱신할 객체가 없습니다. 먼저 '도면에서 직접 작도'로 버팀보를 배치하세요.")
         )
+        (strut-input-dialog s-data (nth 1 s-data) min-depth)
       )
-      ((= dlg-status 4) s-data)
-      ((= dlg-status 1) s-data)
-      
-      ;; ------------------ [수정부] 제어 명령 ------------------
-      ((= dlg-status 97)
-        (progn
-          (command "_.DELAY" 100)
-          (if (boundp 'tsp-manual-add-post) (tsp-manual-add-post nil))
-          (strut-input-dialog existing-data (nth 1 existing-data) min-depth)
-        )
-      )
-      ((= dlg-status 98)
-        (progn
-          (command "_.DELAY" 100)
-          (if (boundp 'tsp-manual-del-post) (tsp-manual-del-post nil))
-          (strut-input-dialog existing-data (nth 1 existing-data) min-depth)
-        )
-      )
-      ((= dlg-status 99)
-        (progn
-          (command "_.DELAY" 100)
-          (if (boundp 'tsp-manual-reset-post) (tsp-manual-reset-post nil))
-          (strut-input-dialog existing-data (nth 1 existing-data) min-depth)
-        )
-      )
-      (t nil)
     )
+    
+    ((= dlg-status 4) s-data)
+    ((= dlg-status 1) s-data)
+    
+    ;; ------------------ 제어 명령 수동 추가 분기점 ------------------
+    ((= dlg-status 97)
+      (progn
+        (command "_.DELAY" 100)
+        (setq snap-added-posts  (vlax-ldata-get "TSP_DICT" "ADDED_POSTS"))
+        (setq snap-deleted-posts (vlax-ldata-get "TSP_DICT" "DELETED_POSTS"))
+        (setq orig-support-list *tsp-support-list*)
+        (setq orig-segment-list *segment-list*)
+        
+        (setq tmp-target-id
+          (if (and (boundp '*tsp-current-seg-idx*) *tsp-current-seg-idx*
+                   (boundp '*segment-list*) *segment-list*)
+            (progn
+              (setq cur-seg (nth *tsp-current-seg-idx* *segment-list*))
+              (if (assoc 'ID cur-seg) (cdr (assoc 'ID cur-seg)) 0)
+            )
+            0
+          )
+        )
+        (if manual-drawn-ents
+          (progn
+            ;; [안전성 수정] s-brace-opt가 문자열 상태일 때의 강제 복원 장치 적용
+            (setq s-brace-opt (nth 11 s-data))
+            (if (= (type s-brace-opt) 'STR) (setq s-brace-opt (read s-brace-opt)))
+            
+            ;; [치명적 버그 수정] 기존의 비어있는 existing-data 대신 모든 UI 정보가 확보된 s-data를 활용하여 원소 누락 리스트 에러 원천 차단
+            (setq tmp-strut-data (cons "버팀보(Strut)" (cdr s-data)))
+            
+            (setq replaced nil new-list '())
+            (foreach item *tsp-support-list*
+              (if (and (= (car item) "버팀보(Strut)") (= (nth 1 item) (nth 1 tmp-strut-data)))
+                (progn (setq new-list (append new-list (list tmp-strut-data))) (setq replaced T))
+                (setq new-list (append new-list (list item)))
+              )
+            )
+            (if (not replaced) (setq new-list (append new-list (list tmp-strut-data))))
+            (setq *tsp-support-list* new-list)
+            
+            (if (and (boundp '*tsp-current-seg-idx*) *tsp-current-seg-idx*)
+              (progn
+                (setq cur-seg (nth *tsp-current-seg-idx* *segment-list*))
+                (setq cur-supp-list (cdr (assoc 'SUPPORT-LIST cur-seg)))
+                (setq tmp-replaced nil tmp-new-supp '())
+                (foreach item cur-supp-list
+                  (if (and (wcmatch (car item) "버팀보*") (= (nth 1 item) (nth 1 tmp-strut-data)))
+                    (progn (setq tmp-new-supp (append tmp-new-supp (list tmp-strut-data))) (setq tmp-replaced T))
+                    (setq tmp-new-supp (append tmp-new-supp (list item)))
+                  )
+                )
+                (if (not tmp-replaced) (setq tmp-new-supp (append tmp-new-supp (list tmp-strut-data))))
+                (setq *segment-list*
+                  (subst (subst (cons 'SUPPORT-LIST tmp-new-supp) (assoc 'SUPPORT-LIST cur-seg) cur-seg) cur-seg *segment-list*))
+              )
+            )
+          )
+        )
+        (if (boundp 'tsp-manual-add-post) (tsp-manual-add-post tmp-target-id))
+        (if (and (boundp '*tsp-boundary-ent*) *tsp-boundary-ent*
+                 (boundp '*tsp-boundary-orient*) *tsp-boundary-orient*)
+          (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*)
+        )
+        (setq *tsp-support-list* orig-support-list)
+        (setq *segment-list* orig-segment-list)
+        (setq dlg-result-97 (strut-input-dialog existing-data (nth 1 existing-data) min-depth))
+        (if (not dlg-result-97)
+          (progn
+            (vlax-ldata-put "TSP_DICT" "ADDED_POSTS" snap-added-posts)
+            (vlax-ldata-put "TSP_DICT" "DELETED_POSTS" snap-deleted-posts)
+          )
+        )
+        dlg-result-97
+      )
+    )
+    
+    ;; ------------------ 제어 명령 수동 삭제 분기점 ------------------
+    ((= dlg-status 98)
+      (progn
+        (command "_.DELAY" 100)
+        (setq orig-support-list *tsp-support-list*)
+        (setq orig-segment-list *segment-list*)
+        (setq tmp-target-id
+          (if (and (boundp '*tsp-current-seg-idx*) *tsp-current-seg-idx*
+                   (boundp '*segment-list*) *segment-list*)
+            (progn
+              (setq cur-seg (nth *tsp-current-seg-idx* *segment-list*))
+              (if (assoc 'ID cur-seg) (cdr (assoc 'ID cur-seg)) 0)
+            )
+            0
+          )
+        )
+        (if manual-drawn-ents
+          (progn
+            ;; [안전성 수정] 방어코드 및 s-data 기반 리스트 동기화 적용
+            (setq s-brace-opt (nth 11 s-data))
+            (if (= (type s-brace-opt) 'STR) (setq s-brace-opt (read s-brace-opt)))
+            (setq tmp-strut-data (cons "버팀보(Strut)" (cdr s-data)))
+            
+            (setq replaced nil new-list '())
+            (foreach item *tsp-support-list*
+              (if (and (= (car item) "버팀보(Strut)") (= (nth 1 item) (nth 1 tmp-strut-data)))
+                (progn (setq new-list (append new-list (list tmp-strut-data))) (setq replaced T))
+                (setq new-list (append new-list (list item)))
+              )
+            )
+            (if (not replaced) (setq new-list (append new-list (list tmp-strut-data))))
+            (setq *tsp-support-list* new-list)
+            
+            (if (and (boundp '*tsp-current-seg-idx*) *tsp-current-seg-idx*)
+              (progn
+                (setq cur-seg (nth *tsp-current-seg-idx* *segment-list*))
+                (setq cur-supp-list (cdr (assoc 'SUPPORT-LIST cur-seg)))
+                (setq tmp-replaced nil tmp-new-supp '())
+                (foreach item cur-supp-list
+                  (if (and (wcmatch (car item) "버팀보*") (= (nth 1 item) (nth 1 tmp-strut-data)))
+                    (progn (setq tmp-new-supp (append tmp-new-supp (list tmp-strut-data))) (setq tmp-replaced T))
+                    (setq tmp-new-supp (append tmp-new-supp (list item)))
+                  )
+                )
+                (if (not tmp-replaced) (setq tmp-new-supp (append tmp-new-supp (list tmp-strut-data))))
+                (setq *segment-list*
+                  (subst (subst (cons 'SUPPORT-LIST tmp-new-supp) (assoc 'SUPPORT-LIST cur-seg) cur-seg) cur-seg *segment-list*))
+              )
+            )
+          )
+        )
+        (if (boundp 'tsp-manual-delete-post) (tsp-manual-delete-post tmp-target-id))
+        (if (and (boundp '*tsp-boundary-ent*) *tsp-boundary-ent*
+                 (boundp '*tsp-boundary-orient*) *tsp-boundary-orient*)
+          (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*)
+        )
+        (setq *tsp-support-list* orig-support-list)
+        (setq *segment-list* orig-segment-list)
+        (strut-input-dialog existing-data (nth 1 existing-data) min-depth)
+      )
+    )
+    
+    ;; ------------------ 제어 명령 수동 초기화 분기점 ------------------
+    ((= dlg-status 99)
+      (progn
+        (command "_.DELAY" 100)
+        (setq orig-support-list *tsp-support-list*)
+        (setq orig-segment-list *segment-list*)
+        (setq tmp-target-id
+          (if (and (boundp '*tsp-current-seg-idx*) *tsp-current-seg-idx*
+                   (boundp '*segment-list*) *segment-list*)
+            (progn
+              (setq cur-seg (nth *tsp-current-seg-idx* *segment-list*))
+              (if (assoc 'ID cur-seg) (cdr (assoc 'ID cur-seg)) 0)
+            )
+            0
+          )
+        )
+        (if manual-drawn-ents
+          (progn
+            ;; [안전성 수정] 방어코드 및 s-data 기반 리스트 동기화 적용
+            (setq s-brace-opt (nth 11 s-data))
+            (if (= (type s-brace-opt) 'STR) (setq s-brace-opt (read s-brace-opt)))
+            (setq tmp-strut-data (cons "버팀보(Strut)" (cdr s-data)))
+            
+            (setq replaced nil new-list '())
+            (foreach item *tsp-support-list*
+              (if (and (= (car item) "버팀보(Strut)") (= (nth 1 item) (nth 1 tmp-strut-data)))
+                (progn (setq new-list (append new-list (list tmp-strut-data))) (setq replaced T))
+                (setq new-list (append new-list (list item)))
+              )
+            )
+            (if (not replaced) (setq new-list (append new-list (list tmp-strut-data))))
+            (setq *tsp-support-list* new-list)
+            
+            (if (and (boundp '*tsp-current-seg-idx*) *tsp-current-seg-idx*)
+              (progn
+                (setq cur-seg (nth *tsp-current-seg-idx* *segment-list*))
+                (setq cur-supp-list (cdr (assoc 'SUPPORT-LIST cur-seg)))
+                (setq tmp-replaced nil tmp-new-supp '())
+                (foreach item cur-supp-list
+                  (if (and (wcmatch (car item) "버팀보*") (= (nth 1 item) (nth 1 tmp-strut-data)))
+                    (progn (setq tmp-new-supp (append tmp-new-supp (list tmp-strut-data))) (setq tmp-replaced T))
+                    (setq tmp-new-supp (append tmp-new-supp (list item)))
+                  )
+                )
+                (if (not tmp-replaced) (setq tmp-new-supp (append tmp-new-supp (list tmp-strut-data))))
+                (setq *segment-list*
+                  (subst (subst (cons 'SUPPORT-LIST tmp-new-supp) (assoc 'SUPPORT-LIST cur-seg) cur-seg) cur-seg *segment-list*))
+              )
+            )
+          )
+        )
+        (if (boundp 'tsp-delete-manual-post-by-segment)
+          (progn
+            (tsp-delete-manual-post-by-segment tmp-target-id)
+            (princ (strcat "\n[초기화] Seg-" (itoa tmp-target-id) " 구역의 수동 중간말뚝이 초기화되었습니다."))
+          )
+        )
+        (if (and (boundp '*tsp-boundary-ent*) *tsp-boundary-ent*
+                 (boundp '*tsp-boundary-orient*) *tsp-boundary-orient*)
+          (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*)
+        )
+        (setq *tsp-support-list* orig-support-list)
+        (setq *segment-list* orig-segment-list)
+        (strut-input-dialog existing-data (nth 1 existing-data) min-depth)
+      )
+    )
+    (t nil)
   )
+)
 
 ;;;;==========================================================================
 ;;;; defun anchor-input-dialog : 앵커 입력창
 ;;;;==========================================================================
   (defun anchor-input-dialog (existing-data default-name min-depth / a-result a-data mat-list-anchor sec-list-anchor res-name res-shape res-depth res-ang res-free res-bond res-mat res-sec init-shape shape-idx i)
     (setq mat-list-anchor '("SWPC7A" "SWPC7B")) (setq sec-list-anchor '()) (setq i 1)
-    (repeat 15 (setq sec-list-anchor (append sec-list-anchor (list (strcat "Strand12.7×" (itoa i) "EA")))) (setq i (1+ i)))
+    (repeat 15 (setq sec-list-anchor (append sec-list-anchor (list (strcat "Strand12.7x" (itoa i) "EA")))) (setq i (1+ i)))
     (if (new_dialog "tsp_support_anchor" dcl-id)
       (progn
         (start_list "a_shape") (mapcar 'add_list shape-list-anchor) (end_list)
@@ -10599,9 +10915,50 @@
               ;; 수동 중간말뚝 제어 3중 검증 신호 전달
               (setq restore-data new-data)
               (setq tmp-id (if (assoc 'ID (nth restore-idx *segment-list*)) (cdr (assoc 'ID (nth restore-idx *segment-list*))) 0))
+              ;; [버그B-2 수정] manual-drawn-ents의 버팀보를 *tsp-support-list*에 임시 반영
+              (setq orig-support-list *tsp-support-list*)
+              (setq orig-segment-list *segment-list*)
+              (if (and manual-drawn-ents restore-data)
+                (progn
+                  (setq tmp-strut-data (cons "버팀보(Strut)" (cdr restore-data)))
+                  ;; *tsp-support-list* 임시 반영
+                  (setq replaced nil new-list '())
+                  (foreach item *tsp-support-list*
+                    (if (and (= (car item) "버팀보(Strut)") (= (nth 1 item) (nth 1 tmp-strut-data)))
+                      (progn (setq new-list (append new-list (list tmp-strut-data))) (setq replaced T))
+                      (setq new-list (append new-list (list item)))
+                    )
+                  )
+                  (if (not replaced) (setq new-list (append new-list (list tmp-strut-data))))
+                  (setq *tsp-support-list* new-list)
+                  ;; [BugC-4 수정] *segment-list* 현재 세그먼트의 SUPPORT-LIST에도 임시 반영
+                  (if (and (boundp '*tsp-current-seg-idx*) *tsp-current-seg-idx*)
+                    (progn
+                      (setq cur-seg (nth *tsp-current-seg-idx* *segment-list*))
+                      (setq cur-supp-list (cdr (assoc 'SUPPORT-LIST cur-seg)))
+                      (setq tmp-replaced nil tmp-new-supp '())
+                      (foreach item cur-supp-list
+                        (if (and (wcmatch (car item) "버팀보*") (= (nth 1 item) (nth 1 tmp-strut-data)))
+                          (progn (setq tmp-new-supp (append tmp-new-supp (list tmp-strut-data))) (setq tmp-replaced T))
+                          (setq tmp-new-supp (append tmp-new-supp (list item)))
+                        )
+                      )
+                      (if (not tmp-replaced) (setq tmp-new-supp (append tmp-new-supp (list tmp-strut-data))))
+                      (setq *segment-list*
+                        (subst (subst (cons 'SUPPORT-LIST tmp-new-supp)
+                                      (assoc 'SUPPORT-LIST cur-seg)
+                                      cur-seg)
+                               cur-seg *segment-list*))
+                    )
+                  )
+                )
+              )
               (if (= (car new-data) "ADD_POST") (if (boundp 'tsp-manual-add-post) (tsp-manual-add-post tmp-id) (alert "수동 추가 함수 오류")))
               (if (= (car new-data) "DEL_POST") (if (boundp 'tsp-manual-delete-post) (tsp-manual-delete-post tmp-id) (alert "수동 삭제 함수 오류")))
               (if (= (car new-data) "RESET_POST") (if (boundp 'tsp-delete-manual-post-by-segment) (tsp-delete-manual-post-by-segment tmp-id) (alert "수동 초기화 함수 오류")))
+              ;; 임시 반영 해제
+              (setq *tsp-support-list* orig-support-list)
+              (setq *segment-list* orig-segment-list)
               (setq result 4) ;; 창 다시 열기 (DRAW_SIGNAL과 동일한 취급)
             )
             (t
@@ -11390,7 +11747,7 @@
      cur-pt1 cur-pt2 b-width stiff-enable slender-limit is-manual
      manual-interval post-enable post-layout post-invert post-side
      i strut-sys-half-width margin brace-len p-brace-1 p-brace-2
-     post-half-h lateral-dist)
+     post-half-h lateral-dist mid-gap-xdata)
 
   ;; 작도 시작 전 마지막 객체를 기억
   (setq start-ent (entlast))
@@ -11736,54 +12093,30 @@
                 (setq p-brace-1-inner (polar p-center (+ strut-ang (/ pi 2.0)) strut-sys-half-width))
                 (setq p-brace-2-inner (polar p-center (- strut-ang (/ pi 2.0)) strut-sys-half-width))
 
-                ;; 1. 외곽선(Flange)
-                ;; 방향 1 (p-brace-1 측)
+                ;; 1. 외곽선(Flange) 작도 (좌우 마감선 2개 + 상하 플랜지선 2개)
                 (setq f1-1 (polar p-brace-1 strut-ang half-b))
                 (setq f1-2 (polar p-brace-1-inner strut-ang half-b))
                 (setq f1-3 (polar p-brace-1-inner (+ strut-ang pi) half-b))
                 (setq f1-4 (polar p-brace-1 (+ strut-ang pi) half-b))
 
-                (entmake
-                  (append
-                    (list
-                      '(0 . "LWPOLYLINE")
-                      '(100 . "AcDbEntity")
-                      '(100 . "AcDbPolyline")
-                      '(8 . "_보강재(Brace)")
-                      '(62 . 256)
-                      '(90 . 4)
-                      '(70 . 1)
-                      (list 10 (car f1-1) (cadr f1-1))
-                      (list 10 (car f1-2) (cadr f1-2))
-                      (list 10 (car f1-3) (cadr f1-3))
-                      (list 10 (car f1-4) (cadr f1-4)))
-                    (list strut-xdata)
-                  )
-                )
+                ;; [수정] 상/하부 플랜지 선 (내측 마감선 제거)
+                (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 256) '(90 . 2) '(70 . 0) (list 10 (car f1-1) (cadr f1-1)) (list 10 (car f1-4) (cadr f1-4))) (list strut-xdata)))
+                (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 256) '(90 . 2) '(70 . 0) (list 10 (car f1-2) (cadr f1-2)) (list 10 (car f1-3) (cadr f1-3))) (list strut-xdata)))
+                
+                ;; [추가] 양 끝단 마감선만 2개 생성
+                (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 256) '(90 . 2) '(70 . 0) (list 10 (car f1-1) (cadr f1-1)) (list 10 (car f1-2) (cadr f1-2))) (list strut-xdata)))
+                (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 256) '(90 . 2) '(70 . 0) (list 10 (car f1-4) (cadr f1-4)) (list 10 (car f1-3) (cadr f1-3))) (list strut-xdata)))
 
-                ;; 방향 2 (p-brace-2 측)
+                ;; 방향 2도 동일하게 상/하부 플랜지 선 + 양 끝 마감선 2개로 처리
                 (setq f2-1 (polar p-brace-2-inner strut-ang half-b))
                 (setq f2-2 (polar p-brace-2 strut-ang half-b))
                 (setq f2-3 (polar p-brace-2 (+ strut-ang pi) half-b))
                 (setq f2-4 (polar p-brace-2-inner (+ strut-ang pi) half-b))
 
-                (entmake
-                  (append
-                    (list
-                      '(0 . "LWPOLYLINE")
-                      '(100 . "AcDbEntity")
-                      '(100 . "AcDbPolyline")
-                      '(8 . "_보강재(Brace)")
-                      '(62 . 256)
-                      '(90 . 4)
-                      '(70 . 1)
-                      (list 10 (car f2-1) (cadr f2-1))
-                      (list 10 (car f2-2) (cadr f2-2))
-                      (list 10 (car f2-3) (cadr f2-3))
-                      (list 10 (car f2-4) (cadr f2-4)))
-                    (list strut-xdata)
-                  )
-                )
+                (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 256) '(90 . 2) '(70 . 0) (list 10 (car f2-1) (cadr f2-1)) (list 10 (car f2-4) (cadr f2-4))) (list strut-xdata)))
+                (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 256) '(90 . 2) '(70 . 0) (list 10 (car f2-2) (cadr f2-2)) (list 10 (car f2-3) (cadr f2-3))) (list strut-xdata)))
+                (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 256) '(90 . 2) '(70 . 0) (list 10 (car f2-1) (cadr f2-1)) (list 10 (car f2-2) (cadr f2-2))) (list strut-xdata)))
+                (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 256) '(90 . 2) '(70 . 0) (list 10 (car f2-4) (cadr f2-4)) (list 10 (car f2-3) (cadr f2-3))) (list strut-xdata)))
 
                 ;; 2. 웹(Web) 점선
                 ;; 방향 1
@@ -11889,82 +12222,35 @@
                 ;; 3. 맞버팀대(2H)일 경우 중앙 간극(Gap)에 중간 보강재 추가 작도
                 (if is-double
                   (progn
+                    ;; TSP_LISP_BRACE + "MID_GAP" 태그로 작도 → orphan 삭제 루프에서 정상 삭제됨
+                    (if (not (tblsearch "APPID" "TSP_LISP_BRACE")) (regapp "TSP_LISP_BRACE"))
+                    (setq mid-gap-xdata
+                      (list -3
+                        (list "TSP_LISP_BRACE"
+                          (cons 1070 seg-id)
+                          (cons 1040 0.0)
+                          (cons 1010 '(0.0 0.0 0.0))
+                          (cons 1010 '(0.0 0.0 0.0))
+                          (cons 1040 (float h))
+                          (cons 1040 (float tw))
+                          (cons 1040 (float tf))
+                          (cons 1000 "MID_GAP")
+                          (cons 1000 boundary-handle)
+                        )
+                      )
+                    )
+
                     (setq p-mid-1 (polar p-center (+ strut-ang (/ pi 2.0)) half-b))
                     (setq p-mid-2 (polar p-center (- strut-ang (/ pi 2.0)) half-b))
 
-                    ;; 중앙 간극 외곽선(Flange)
+                    ;; 중앙 간극 외곽선(Flange) - 마감선(캡) 아예 없이 평행한 두 선만 작도
                     (setq fm-1 (polar p-mid-1 strut-ang half-b))
                     (setq fm-2 (polar p-mid-2 strut-ang half-b))
                     (setq fm-3 (polar p-mid-2 (+ strut-ang pi) half-b))
                     (setq fm-4 (polar p-mid-1 (+ strut-ang pi) half-b))
 
-                    (entmake
-                      (append
-                        (list
-                          '(0 . "LWPOLYLINE")
-                          '(100 . "AcDbEntity")
-                          '(100 . "AcDbPolyline")
-                          '(8 . "_보강재(Brace)")
-                          '(62 . 256)
-                          '(90 . 4)
-                          '(70 . 1)
-                          (list 10 (car fm-1) (cadr fm-1))
-                          (list 10 (car fm-2) (cadr fm-2))
-                          (list 10 (car fm-3) (cadr fm-3))
-                          (list 10 (car fm-4) (cadr fm-4)))
-                        (list strut-xdata)
-                      )
-                    )
-
-                    ;; 중앙 간극 웹(Web) 점선
-                    (setq wm-1 (polar p-mid-1 strut-ang half-tw))
-                    (setq wm-2 (polar p-mid-2 strut-ang half-tw))
-                    (setq wm-3 (polar p-mid-1 (+ strut-ang pi) half-tw))
-                    (setq wm-4 (polar p-mid-2 (+ strut-ang pi) half-tw))
-
-                    (entmake
-                      (append
-                        (list
-                          '(0 . "LWPOLYLINE")
-                          '(100 . "AcDbEntity")
-                          '(100 . "AcDbPolyline")
-                          '(8 . "_보강재(Brace)")
-                          '(62 . 1)
-                          '(6 . "DASHED")
-                          (cons 48
-                                (* (if (and (boundp '*tsp-scale-plan*) *tsp-scale-plan*)
-                                     *tsp-scale-plan*
-                                     600.0)
-                                   (/ 500.0 600.0)))
-                          '(90 . 2)
-                          '(70 . 0)
-                          (list 10 (car wm-1) (cadr wm-1))
-                          (list 10 (car wm-2) (cadr wm-2)))
-                        (list strut-xdata)
-                      )
-                    )
-
-                    (entmake
-                      (append
-                        (list
-                          '(0 . "LWPOLYLINE")
-                          '(100 . "AcDbEntity")
-                          '(100 . "AcDbPolyline")
-                          '(8 . "_보강재(Brace)")
-                          '(62 . 1)
-                          '(6 . "DASHED")
-                          (cons 48
-                                (* (if (and (boundp '*tsp-scale-plan*) *tsp-scale-plan*)
-                                     *tsp-scale-plan*
-                                     600.0)
-                                   (/ 500.0 600.0)))
-                          '(90 . 2)
-                          '(70 . 0)
-                          (list 10 (car wm-3) (cadr wm-3))
-                          (list 10 (car wm-4) (cadr wm-4)))
-                        (list strut-xdata)
-                      )
-                    )
+                    (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 256) '(90 . 2) '(70 . 0) (list 10 (car fm-1) (cadr fm-1)) (list 10 (car fm-2) (cadr fm-2))) (list mid-gap-xdata)))
+                    (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 256) '(90 . 2) '(70 . 0) (list 10 (car fm-4) (cadr fm-4)) (list 10 (car fm-3) (cadr fm-3))) (list mid-gap-xdata)))
                   )
                 )
               )
@@ -12063,7 +12349,7 @@
 ;;;;==========================================================================
 ;;;; defun tsp-draw-realtime-continuous-braces : 순수 좌표 추적 기반 연속 보강재 실시간 분할 작도 함수
 ;;;;==========================================================================
-(defun tsp-draw-realtime-continuous-braces (pts-list s-brace-opt sec-str is-double strut-ang strut-len seg-id / boundary-handle stiff-enable slender-limit is-manual manual-interval margin strut-vals h b tw tf half-b half-tw strut-sys-half-width brace-xdata brace-ents total-L L-max offsets interval num-div i draw-segs num-pts idx cur-pt p-center p-left p-right p-start p-mid-left p-mid-right next-pt p-next-center p-next-left p-end pA pB f1-1 f1-2 f2-1 f2-2 w1-1 w1-2 w2-1 w2-2)
+(defun tsp-draw-realtime-continuous-braces (pts-list s-brace-opt sec-str is-double strut-ang strut-len seg-id / boundary-handle stiff-enable slender-limit is-manual manual-interval margin strut-vals h b tw tf half-b half-tw strut-sys-half-width brace-xdata mid-gap-xdata brace-ents total-L L-max offsets interval num-div i draw-segs mid-gap-segs num-pts idx cur-pt p-center p-left p-right p-start p-mid-left p-mid-right next-pt p-next-center p-next-left p-end pA pB f1-1 f1-2 f2-1 f2-2 w1-1 w1-2 w2-1 w2-2)
   (setq stiff-enable (nth 0 s-brace-opt) slender-limit (nth 1 s-brace-opt) is-manual (nth 2 s-brace-opt) manual-interval (nth 3 s-brace-opt) margin (atof (nth 4 s-brace-opt)))
   (if (/= stiff-enable "1") (exit))
   (setq boundary-handle (tsp-get-entity-handle *tsp-boundary-ent*))
@@ -12095,8 +12381,25 @@
       )
     )
   )
+  ;; [버그B수정] 맞버팀대 중앙 간극 선분 전용 XDATA: MID_GAP 태그로 수동추가 교차점 검색에서 제외
+  (setq mid-gap-xdata
+    (list -3
+      (list "TSP_LISP_BRACE"
+        (cons 1070 seg-id)
+        (cons 1040 0.0)
+        (cons 1010 '(0.0 0.0 0.0))
+        (cons 1010 '(0.0 0.0 0.0))
+        (cons 1040 (float h))
+        (cons 1040 (float tw))
+        (cons 1040 (float tf))
+        (cons 1000 "MID_GAP")
+        (cons 1000 boundary-handle)
+      )
+    )
+  )
 
   (setq brace-ents '())
+  (setq mid-gap-segs '())
   (if (> (length pts-list) 0)
     (progn
       ;; 2. 실시간 입력된 순수 좌표들을 배열 축 방향으로 기하학적 정렬
@@ -12157,11 +12460,13 @@
           )
 
           ;; 4-2. 맞버팀대(2H) 내부 중앙 간극 공간 자동 트림 복원
+          ;; [버그B수정] 중앙 간극 선분은 draw-segs(CONT_BRACE)가 아닌 mid-gap-segs(MID_GAP)로 분리
+          ;; -> tsp-manual-add-post 에서 MID_GAP 태그를 확인하여 교차점 검색 제외
           (if is-double
             (progn
               (setq p-mid-left (polar p-center (- strut-ang (/ pi 2.0)) half-b))
               (setq p-mid-right (polar p-center (+ strut-ang (/ pi 2.0)) half-b))
-              (setq draw-segs (append draw-segs (list (cons p-mid-left p-mid-right))))
+              (setq mid-gap-segs (append mid-gap-segs (list (cons p-mid-left p-mid-right))))
             )
           )
 
@@ -12187,30 +12492,108 @@
         )
 
         ;; 5. 가상 트림이 완료된 빈 공간 세그먼트들에만 물리 객체 작도 (XDATA 결합)
+        (setq num-draw-segs (length draw-segs))
+        (setq seg-idx 0)
         (foreach seg draw-segs
           (setq pA (car seg) pB (cdr seg))
           (if (> (distance pA pB) 0.1)
             (progn
-              ;; 플랜지 외곽선 사각형 생성 및 XDATA 결합
-              (setq f1-1 (polar pA strut-ang half-b) f1-2 (polar pB strut-ang half-b))
-              (setq f2-1 (polar pA (+ strut-ang pi) half-b) f2-2 (polar pB (+ strut-ang pi) half-b))
-              (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 256) '(90 . 4) '(70 . 1)
-                             (list 10 (car f1-1) (cadr f1-1)) (list 10 (car f1-2) (cadr f1-2)) (list 10 (car f2-2) (cadr f2-2)) (list 10 (car f2-1) (cadr f2-1)))
+              (setq seg-ang (angle pA pB))
+              ;; 플랜지 선 1 (pA~pB의 +half-b 방향, 보강재 진행방향 수직)
+              (setq f1-1 (polar pA (+ seg-ang (/ pi 2.0)) half-b))
+              (setq f1-2 (polar pB (+ seg-ang (/ pi 2.0)) half-b))
+              (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 256) '(90 . 2) '(70 . 0)
+                             (list 10 (car f1-1) (cadr f1-1)) (list 10 (car f1-2) (cadr f1-2)))
                              (list brace-xdata)))
               (setq brace-ents (append brace-ents (list (entlast))))
-              (setq w1-1 (polar pA strut-ang half-tw) w1-2 (polar pB strut-ang half-tw))
-              (setq w2-1 (polar pA (+ strut-ang pi) half-tw) w2-2 (polar pB (+ strut-ang pi) half-tw))
+              ;; 플랜지 선 2 (pA~pB의 -half-b 방향)
+              (setq f2-1 (polar pA (- seg-ang (/ pi 2.0)) half-b))
+              (setq f2-2 (polar pB (- seg-ang (/ pi 2.0)) half-b))
+              (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 256) '(90 . 2) '(70 . 0)
+                             (list 10 (car f2-1) (cadr f2-1)) (list 10 (car f2-2) (cadr f2-2)))
+                             (list brace-xdata)))
+              (setq brace-ents (append brace-ents (list (entlast))))
+              ;; 끝면 연결선 - pA측 캡 (f1-1 ~ f2-1): 맨 처음 세그먼트에만 작도
+              (if (= seg-idx 0)
+                (progn
+                  (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 256) '(90 . 2) '(70 . 0)
+                                 (list 10 (car f1-1) (cadr f1-1)) (list 10 (car f2-1) (cadr f2-1)))
+                                  (list brace-xdata)))
+                  (setq brace-ents (append brace-ents (list (entlast))))
+                )
+              )
+              ;; 끝면 연결선 - pB측 캡 (f1-2 ~ f2-2): 맨 마지막 세그먼트에만 작도
+              (if (= seg-idx (1- num-draw-segs))
+                (progn
+                  (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 256) '(90 . 2) '(70 . 0)
+                                 (list 10 (car f1-2) (cadr f1-2)) (list 10 (car f2-2) (cadr f2-2)))
+                                  (list brace-xdata)))
+                  (setq brace-ents (append brace-ents (list (entlast))))
+                )
+              )
+              ;; 웹 파선 1 (+half-tw)
+              (setq w1-1 (polar pA (+ seg-ang (/ pi 2.0)) half-tw))
+              (setq w1-2 (polar pB (+ seg-ang (/ pi 2.0)) half-tw))
               (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 1) '(6 . "DASHED") 
                                      (cons 48 (* (if (and (boundp '*tsp-scale-plan*) *tsp-scale-plan*) *tsp-scale-plan* 600.0) (/ 500.0 600.0) (if (= (getvar "MEASUREMENT") 1) (/ 1.0 25.0) 1.0)))
                                      '(90 . 2) '(70 . 0)
                              (list 10 (car w1-1) (cadr w1-1)) (list 10 (car w1-2) (cadr w1-2)))
                              (list brace-xdata)))
               (setq brace-ents (append brace-ents (list (entlast))))
+              ;; 웹 파선 2 (-half-tw)
+              (setq w2-1 (polar pA (- seg-ang (/ pi 2.0)) half-tw))
+              (setq w2-2 (polar pB (- seg-ang (/ pi 2.0)) half-tw))
               (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 1) '(6 . "DASHED") 
                                      (cons 48 (* (if (and (boundp '*tsp-scale-plan*) *tsp-scale-plan*) *tsp-scale-plan* 600.0) (/ 500.0 600.0) (if (= (getvar "MEASUREMENT") 1) (/ 1.0 25.0) 1.0)))
                                      '(90 . 2) '(70 . 0)
                              (list 10 (car w2-1) (cadr w2-1)) (list 10 (car w2-2) (cadr w2-2)))
                              (list brace-xdata)))
+              (setq brace-ents (append brace-ents (list (entlast))))
+            )
+          )
+          (setq seg-idx (1+ seg-idx))
+        )
+
+        ;; 6. 맞버팀대 중앙 간극 선분 별도 작도 (MID_GAP XDATA로 교차점 검색에서 제외)
+        ;; 동일한 _보강재(Brace) 레이어에 그려져 시각적으로 동일하지만 tsp-manual-add-post가 건너뜀
+        ;; 플랜지를 4점 직사각형 대신 2선(흰색 실선)으로 작도
+        (foreach seg mid-gap-segs
+          (setq pA (car seg) pB (cdr seg))
+          (if (> (distance pA pB) 0.1)
+            (progn
+              ;; mid-gap도 pA->pB 방향(seg-ang) 기준으로 수직 오프셋
+              (setq seg-ang (angle pA pB))
+              ;; 플랜지 선 1 (+half-b)
+              (setq f1-1 (polar pA (+ seg-ang (/ pi 2.0)) half-b))
+              (setq f1-2 (polar pB (+ seg-ang (/ pi 2.0)) half-b))
+              (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 256) '(90 . 2) '(70 . 0)
+                             (list 10 (car f1-1) (cadr f1-1)) (list 10 (car f1-2) (cadr f1-2)))
+                             (list mid-gap-xdata)))
+              (setq brace-ents (append brace-ents (list (entlast))))
+              ;; 플랜지 선 2 (-half-b)
+              (setq f2-1 (polar pA (- seg-ang (/ pi 2.0)) half-b))
+              (setq f2-2 (polar pB (- seg-ang (/ pi 2.0)) half-b))
+              (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 256) '(90 . 2) '(70 . 0)
+                             (list 10 (car f2-1) (cadr f2-1)) (list 10 (car f2-2) (cadr f2-2)))
+                             (list mid-gap-xdata)))
+              (setq brace-ents (append brace-ents (list (entlast))))
+              ;; 웹 파선 1 (+half-tw)
+              (setq w1-1 (polar pA (+ seg-ang (/ pi 2.0)) half-tw))
+              (setq w1-2 (polar pB (+ seg-ang (/ pi 2.0)) half-tw))
+              (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 1) '(6 . "DASHED") 
+                                     (cons 48 (* (if (and (boundp '*tsp-scale-plan*) *tsp-scale-plan*) *tsp-scale-plan* 600.0) (/ 500.0 600.0) (if (= (getvar "MEASUREMENT") 1) (/ 1.0 25.0) 1.0)))
+                                     '(90 . 2) '(70 . 0)
+                             (list 10 (car w1-1) (cadr w1-1)) (list 10 (car w1-2) (cadr w1-2)))
+                             (list mid-gap-xdata)))
+              (setq brace-ents (append brace-ents (list (entlast))))
+              ;; 웹 파선 2 (-half-tw)
+              (setq w2-1 (polar pA (- seg-ang (/ pi 2.0)) half-tw))
+              (setq w2-2 (polar pB (- seg-ang (/ pi 2.0)) half-tw))
+              (entmake (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") '(8 . "_보강재(Brace)") '(62 . 1) '(6 . "DASHED") 
+                                     (cons 48 (* (if (and (boundp '*tsp-scale-plan*) *tsp-scale-plan*) *tsp-scale-plan* 600.0) (/ 500.0 600.0) (if (= (getvar "MEASUREMENT") 1) (/ 1.0 25.0) 1.0)))
+                                     '(90 . 2) '(70 . 0)
+                             (list 10 (car w2-1) (cadr w2-1)) (list 10 (car w2-2) (cadr w2-2)))
+                             (list mid-gap-xdata)))
               (setq brace-ents (append brace-ents (list (entlast))))
             )
           )
@@ -12225,7 +12608,7 @@
 ;;;;==========================================================================
 ;;;; defun tsp-manual-add-post : 중간말뚝 수동추가
 ;;;;==========================================================================
-(defun tsp-manual-add-post (active-seg-id / old-osmode pt p-center chk_p1 chk_p2 ss-cross p1_box p2_box ss i ent ent-data p1 p2 min-dist line-ang perp-dist best-p1 best-p2 stiff-dir sum-x sum-y count centroid vec_dir vec_c2p cross_z dot_z rot ins_pt post-block added-list session-ents last-act loop custom-h custom-b custom-tw custom-tf target-seg-id ss-all-struts valid-strut-found j e-data xdata x-vals t-p1 t-p2 t-p3 post-data-record check-id first-run pure-b cur-layer s-p1 s-p2 s-width s-ang d-proj d-perp y_scale)
+(defun tsp-manual-add-post (active-seg-id / old-osmode pt p-center chk_p1 chk_p2 ss-cross p1_box p2_box ss i ent ent-data p1 p2 min-dist line-ang perp-dist best-p1 best-p2 stiff-dir sum-x sum-y count centroid vec_dir vec_c2p cross_z dot_z rot ins_pt post-block added-list session-ents last-act loop custom-h custom-b custom-tw custom-tf target-seg-id ss-all-struts valid-strut-found j e-data xdata x-vals t-p1 t-p2 t-p3 post-data-record check-id first-run pure-b cur-layer s-p1 s-p2 s-width s-ang d-proj d-perp y_scale brace-xd brace-ang-ok bx-vals pt-cnt tmp-pa tmp-pb tmp-ang ang-diff)
   (setq old-osmode (getvar "OSMODE"))
   (setvar "OSMODE" 32)
   
@@ -12348,46 +12731,244 @@
        )
 
        (if (not valid-strut-found)
-         (princ (strcat "\n[오류] 현재 설정 중인 [Seg-" (itoa active-seg-id) "]의 사보강재 영역이 아닙니다. 지정된 구역 내부를 클릭해주세요."))
+         (princ (strcat "\n[오류] 현재 설정 중인 [Seg-" (if active-seg-id (itoa active-seg-id) "?") "]의 구역 내부가 아닙니다. 버팀보 또는 사보강재 영역 내부를 클릭해주세요."))
          (progn
            (setq chk_p1 (list (- (car p-center) 2.0) (- (cadr p-center) 2.0)))
            (setq chk_p2 (list (+ (car p-center) 2.0) (+ (cadr p-center) 2.0)))
            (setq ss-cross (ssget "C" chk_p1 chk_p2 '((0 . "*LINE"))))
-           
-           (if (and ss-cross (>= (sslength ss-cross) 2))
+
+           ;; ---------------------------------------------------------------
+           ;; [버그B-1 수정] 버팀보(RECT) 영역인 경우
+           ;; _버팀보(Strut) 레이어 플랜지 선분을 검색하여
+           ;; TRI 경로와 동일한 centroid -> cross_z/dot_z 방식으로 rot/y_scale 결정
+           ;; ---------------------------------------------------------------
+           (if (and valid-strut-found s-ang s-p1 s-p2)
+             ;; --- RECT(버팀보) 경로 ---
              (progn
+               (if (and ss-cross (>= (sslength ss-cross) 2))
+                 (progn
+               ;; [버그B-1 핵심] _버팀보(Strut) 레이어 CONT_BRACE 태그 없는 선분 검색
+               ;; -> 플랜지 선분의 centroid와 p-center 방향으로 rot/y_scale 결정
                (setq min-dist 1e99 best-p1 nil best-p2 nil sum-x 0.0 sum-y 0.0 count 0)
                (setq p1_box (list (- (car p-center) 500.0) (- (cadr p-center) 500.0)))
                (setq p2_box (list (+ (car p-center) 500.0) (+ (cadr p-center) 500.0)))
-               (setq ss (ssget "C" p1_box p2_box '((0 . "LWPOLYLINE") (8 . "_보강재(Brace),_버팀보(Strut)"))))
-               
+               ;; _버팀보(Strut) 레이어의 LWPOLYLINE 검색 (버팀보 본체 선분)
+               (setq ss (ssget "C" p1_box p2_box '((0 . "LWPOLYLINE") (8 . "_버팀보(Strut)"))))
                (if ss
                  (progn
                    (setq i 0)
                    (while (< i (sslength ss))
                      (setq ent (ssname ss i))
                      (setq ent-data (entget ent))
-                     (setq p1 nil p2 nil)
-                     (foreach item ent-data
-                       (if (= (car item) 10)
-                         (progn
-                           (if (null p1) (setq p1 (cdr item)) (setq p2 (cdr item)))
-                           (setq sum-x (+ sum-x (car (cdr item))))
-                           (setq sum-y (+ sum-y (cadr (cdr item))))
-                           (setq count (1+ count))
+                     ;; XDATA가 없는(보강재 태그 없는) 선분만 사용 - 버팀보 플랜지 외곽선
+                     (setq brace-xd (assoc -3 ent-data))
+                     (if (not brace-xd)
+                       (progn
+                         (setq p1 (cdr (assoc 10 ent-data)))
+                         (setq p2 nil)
+                         (setq pt-cnt 0)
+                         (foreach dxf ent-data
+                           (if (= (car dxf) 10)
+                             (progn
+                               (if (= pt-cnt 0) (setq p1 (cdr dxf)))
+                               (if (= pt-cnt 1) (setq p2 (cdr dxf)))
+                               (setq pt-cnt (1+ pt-cnt))
+                             )
+                           )
+                         )
+                         (if (and p1 p2)
+                           (progn
+                             (setq tmp-ang (angle p1 p2))
+                             (setq ang-diff (abs (- tmp-ang s-ang)))
+                             (if (> ang-diff pi) (setq ang-diff (- (* 2.0 pi) ang-diff)))
+                             ;; 버팀보 방향(s-ang)에 수직인 선분만 플랜지로 채택 (90도+/-20도)
+                             (if (or (and (> ang-diff (- (/ pi 2.0) 0.35)) (< ang-diff (+ (/ pi 2.0) 0.35)))
+                                     (and (> ang-diff (- (* 1.5 pi) 0.35)) (< ang-diff (+ (* 1.5 pi) 0.35))))
+                               (progn
+                                 (setq tmp-pa (list (/ (+ (car p1) (car p2)) 2.0) (/ (+ (cadr p1) (cadr p2)) 2.0) 0.0))
+                                 (setq perp-dist (distance p-center tmp-pa))
+                                 (if (< perp-dist min-dist)
+                                   (progn
+                                     (setq min-dist perp-dist)
+                                     (setq best-p1 p1 best-p2 p2)
+                                   )
+                                 )
+                                 (setq sum-x (+ sum-x (car tmp-pa)) sum-y (+ sum-y (cadr tmp-pa)) count (1+ count))
+                               )
+                             )
+                           )
                          )
                        )
                      )
-                     (if (and p1 p2)
+                     (setq i (1+ i))
+                   )
+                 )
+               )
+               ;; centroid 또는 s-p1~s-p2 중심으로 방향 계산
+               (if (and best-p1 best-p2 (> count 0))
+                 (progn
+                   (setq centroid (list (/ sum-x count) (/ sum-y count) 0.0))
+                   ;; 플랜지 선분 검색 성공: 그 선분 방향(= 보강재 방향)을 stiff-dir로 사용
+                   (setq stiff-dir (angle best-p1 best-p2))
+                 )
+                 (progn
+                   ;; [Fix6] 플랜지 선분 미발견 -> s-p1~s-p2 중심점으로 폴백
+                   ;; 폴백 시 stiff-dir = 보강재 방향 = 버팀보(s-ang)에 수직 = s-ang + pi/2
+                   (setq centroid (list (/ (+ (car s-p1) (car s-p2)) 2.0)
+                                        (/ (+ (cadr s-p1) (cadr s-p2)) 2.0) 0.0))
+                   (setq stiff-dir (+ s-ang (/ pi 2.0)))
+                 )
+               )
+               (setq vec_dir (list (cos stiff-dir) (sin stiff-dir)))
+               (setq vec_c2p (list (- (car p-center) (car centroid))
+                                    (- (cadr p-center) (cadr centroid))))
+               (setq cross_z (- (* (car vec_dir) (cadr vec_c2p)) (* (cadr vec_dir) (car vec_c2p))))
+               (setq dot_z   (+ (* (car vec_dir) (car vec_c2p)) (* (cadr vec_dir) (cadr vec_c2p))))
+               (if (>= dot_z 0.0) (setq rot stiff-dir) (setq rot (+ stiff-dir pi)))
+               (if (< (* cross_z dot_z) 0.0) (setq y_scale -1.0) (setq y_scale 1.0))
+               (setq ins_pt (polar p-center rot (/ custom-b 2.0)))
+               (setq post-block (create-post-pile-block custom-h custom-b custom-tw custom-tf))
+               (setq post-data-record (list ins_pt rot y_scale custom-h custom-b custom-tw custom-tf target-seg-id))
+
+               ;; [버그A수정 강화] 삭제 기록 제거: ins_pt 기준 거리 대신 valid-triangles 영역 기반
+               ;; -> 같은 구역 내 삭제된 모든 기록 중 ins_pt 근처(500mm) 것을 제거
+               (if *tsp-use-temp-posts*
+                 (if *tsp-temp-deleted-posts*
+                   (setq *tsp-temp-deleted-posts*
+                     (vl-remove-if
+                       '(lambda (del-pt) (< (distance ins_pt del-pt) 10.0))
+                       *tsp-temp-deleted-posts*
+                     )
+                   )
+                 )
+                 (progn
+                   (setq *tsp-deleted-post-points* (vlax-ldata-get "TSP_DICT" "DELETED_POSTS"))
+                   (if *tsp-deleted-post-points*
+                     (progn
+                       (setq *tsp-deleted-post-points*
+                         (vl-remove-if
+                           '(lambda (del-pt) (< (distance ins_pt del-pt) 10.0))
+                           *tsp-deleted-post-points*
+                         )
+                       )
+                       (vlax-ldata-put "TSP_DICT" "DELETED_POSTS" *tsp-deleted-post-points*)
+                     )
+                   )
+                 )
+               )
+
+               (if *tsp-use-temp-posts*
+                 (setq *tsp-temp-added-posts* (append *tsp-temp-added-posts* (list post-data-record)))
+                 (progn
+                   (setq added-list (vlax-ldata-get "TSP_DICT" "ADDED_POSTS"))
+                   (if (not added-list) (setq added-list '()))
+                   (setq added-list (append added-list (list post-data-record)))
+                   (vlax-ldata-put "TSP_DICT" "ADDED_POSTS" added-list)
+                 )
+               )
+               (setq *tsp-data-dirty* T)
+               (if (and (boundp '*tsp-boundary-ent*) *tsp-boundary-ent* (boundp '*tsp-boundary-orient*) *tsp-boundary-orient*)
+                 (progn
+                   (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*)
+                   (setq session-ents (cons 'REDRAW session-ents))
+                 )
+                 (progn
+                   (if (not (tblsearch "APPID" "TSP_LISP_POST")) (regapp "TSP_LISP_POST"))
+                   (entmake (list '(0 . "INSERT") (cons 2 post-block) (cons 8 "_중간말뚝(Post pile)") (cons 62 256) (cons 10 ins_pt) '(41 . 1.0) (cons 42 y_scale) '(43 . 1.0) (cons 50 rot)
+                                  (list -3 (list "TSP_LISP_POST" (cons 1000 "MANUAL_POST")))
+                             ))
+                   (setq session-ents (cons (entlast) session-ents))
+                 )
+               )
+               (princ "\n[완료] 중간말뚝 추가 완료.")
+                 ) ;; end ss-cross true-branch
+                 (princ "\n[오류] 두 선이 만나는 정확한 '교차점'이 아닙니다. 스냅을 이용해 다시 클릭하세요.")
+               ) ;; end if ss-cross (RECT 경로)
+             ) ;; end RECT progn
+             ;; --- TRI(사보강재) 경로: 기존 brace 검색 로직 ---
+             (progn
+           (if (and ss-cross (>= (sslength ss-cross) 2))
+             (progn
+               (setq min-dist 1e99 best-p1 nil best-p2 nil sum-x 0.0 sum-y 0.0 count 0)
+               (setq p1_box (list (- (car p-center) 500.0) (- (cadr p-center) 500.0)))
+               (setq p2_box (list (+ (car p-center) 500.0) (+ (cadr p-center) 500.0)))
+               ;; [버그B수정] _버팀보(Strut) 레이어 제거 - 버팀보 자체 선분이 잘못 선택되는 문제 방지
+               ;; _보강재(Brace) 레이어만 검색하고 XDATA로 연속보강재 식별
+               (setq ss (ssget "C" p1_box p2_box '((0 . "LWPOLYLINE") (8 . "_보강재(Brace)"))))
+               
+               (if ss
+                 (progn
+                   (setq i 0)
+                   (while (< i (sslength ss))
+                     (setq ent (ssname ss i))
+                     (setq ent-data (entget ent '("TSP_LISP_BRACE")))
+                     (setq p1 nil p2 nil)
+                     ;; [버그B수정] XDATA가 있는 연속보강재(TSP_LISP_BRACE)인 경우
+                     ;; 1단계: MID_GAP 태그 확인 -> 맞버팀대 중앙 간극 선분이면 즉시 제외
+                     ;; 2단계: 버팀보 방향(s-ang)과 평행 여부로 수직/사선 선분 추가 배제
+                     (setq brace-xd (assoc -3 ent-data))
+                     (setq brace-ang-ok T) ;; 기본적으로 통과 (XDATA 없는 일반 보강재)
+                     (if brace-xd
                        (progn
-                         (setq p1 (list (car p1) (cadr p1) 0.0))
-                         (setq p2 (list (car p2) (cadr p2) 0.0))
-                         (setq line-ang (angle p1 p2))
-                         (setq perp-dist (abs (- (* (- (car p-center) (car p1)) (sin line-ang)) (* (- (cadr p-center) (cadr p1)) (cos line-ang)))))
-                         (if (< perp-dist min-dist)
+                         (setq bx-vals (cdr (car (cdr brace-xd))))
+                         ;; [핵심 1단계] MID_GAP 태그 체크: 맞버팀대 중앙 선분은 즉시 제외
+                         (if (and (>= (length bx-vals) 8)
+                                  (= (cdr (nth 7 bx-vals)) "MID_GAP"))
+                           (setq brace-ang-ok nil)
                            (progn
-                             (setq min-dist perp-dist)
-                             (setq best-p1 p1 best-p2 p2)
+                             ;; [2단계] 각도 평행 검사 (기존 수직선분 제외 로직 유지)
+                             (setq pt-cnt 0)
+                             (foreach item ent-data
+                               (if (and (= (car item) 10) (< pt-cnt 2))
+                                 (progn
+                                   (if (= pt-cnt 0) (setq tmp-pa (cdr item)) (setq tmp-pb (cdr item)))
+                                   (setq pt-cnt (1+ pt-cnt))
+                                 )
+                               )
+                             )
+                             (if (and tmp-pa tmp-pb)
+                               (progn
+                                 (setq tmp-ang (angle (list (car tmp-pa) (cadr tmp-pa) 0.0)
+                                                      (list (car tmp-pb) (cadr tmp-pb) 0.0)))
+                                 ;; 버팀보 방향(s-ang)과 평행 여부 확인 (허용 오차 15도)
+                                 ;; s-ang은 RECT 경로에서만 설정됨, TRI 경로에서는 nil일 수 있으므로 nil 체크
+                                 (if s-ang
+                                   (progn
+                                     (setq ang-diff (abs (- (rem (abs tmp-ang) pi) (rem (abs s-ang) pi))))
+                                     (if (> ang-diff (/ pi 2.0)) (setq ang-diff (- pi ang-diff)))
+                                     (if (> ang-diff (/ pi 12.0)) (setq brace-ang-ok nil))
+                                   )
+                                 )
+                               )
+                             )
+                           )
+                         )
+                       )
+                     )
+                     (if brace-ang-ok
+                       (progn
+                         (foreach item ent-data
+                           (if (= (car item) 10)
+                             (progn
+                               (if (null p1) (setq p1 (cdr item)) (if (null p2) (setq p2 (cdr item))))
+                               (setq sum-x (+ sum-x (car (cdr item))))
+                               (setq sum-y (+ sum-y (cadr (cdr item))))
+                               (setq count (1+ count))
+                             )
+                           )
+                         )
+                         (if (and p1 p2)
+                           (progn
+                             (setq p1 (list (car p1) (cadr p1) 0.0))
+                             (setq p2 (list (car p2) (cadr p2) 0.0))
+                             (setq line-ang (angle p1 p2))
+                             (setq perp-dist (abs (- (* (- (car p-center) (car p1)) (sin line-ang)) (* (- (cadr p-center) (cadr p1)) (cos line-ang)))))
+                             (if (< perp-dist min-dist)
+                               (progn
+                                 (setq min-dist perp-dist)
+                                 (setq best-p1 p1 best-p2 p2)
+                               )
+                             )
                            )
                          )
                        )
@@ -12408,11 +12989,37 @@
                        (if (>= dot_z 0.0) (setq rot stiff-dir) (setq rot (+ stiff-dir pi)))
                        (if (< (* cross_z dot_z) 0.0) (setq y_scale -1.0) (setq y_scale 1.0))
                        
-                       (setq ins_pt (polar p-center rot (/ custom-h 2.0)))
+                       (setq ins_pt (polar p-center rot (/ custom-b 2.0)))
                        (setq post-block (create-post-pile-block custom-h custom-b custom-tw custom-tf))
                        
                        (setq post-data-record (list ins_pt rot y_scale custom-h custom-b custom-tw custom-tf target-seg-id))
                        
+                       ;; [버그A수정 강화] 삭제 기록 제거: ins_pt 기준 500mm 이내 모두 제거
+                       (if *tsp-use-temp-posts*
+                         (if *tsp-temp-deleted-posts*
+                           (setq *tsp-temp-deleted-posts*
+                             (vl-remove-if
+                               '(lambda (del-pt) (< (distance ins_pt del-pt) 10.0))
+                               *tsp-temp-deleted-posts*
+                             )
+                           )
+                         )
+                         (progn
+                           (setq *tsp-deleted-post-points* (vlax-ldata-get "TSP_DICT" "DELETED_POSTS"))
+                           (if *tsp-deleted-post-points*
+                             (progn
+                               (setq *tsp-deleted-post-points*
+                                 (vl-remove-if
+                                   '(lambda (del-pt) (< (distance ins_pt del-pt) 10.0))
+                                   *tsp-deleted-post-points*
+                                 )
+                               )
+                               (vlax-ldata-put "TSP_DICT" "DELETED_POSTS" *tsp-deleted-post-points*)
+                             )
+                           )
+                         )
+                       )
+
                        (if *tsp-use-temp-posts*
                          (setq *tsp-temp-added-posts* (append *tsp-temp-added-posts* (list post-data-record)))
                          (progn
@@ -12449,6 +13056,8 @@
              )
              (princ "\n[오류] 두 선이 만나는 정확한 '교차점'이 아닙니다. 스냅을 이용해 다시 클릭하세요.")
            )
+             ) ;; end TRI 경로
+           ) ;; end if RECT/TRI 분기
          )
        )
       )
@@ -12520,21 +13129,22 @@
         (if xdata
           (progn
             (setq x-vals (cdr (car (cdr xdata))))
-            (if (= (length x-vals) 8)
+            ;; [버그수정] 사보강재 XDATA 길이=8, 버팀보 XDATA 길이=10 → (>= length 8)로 통합 처리
+            (if (>= (length x-vals) 8)
               (progn
                 (setq check-id (cdr (nth 0 x-vals)))
                 ;; ID가 일치하는 구역만 유효 구역으로 수집
                 (if (= check-id active-seg-id)
                   (if (= cur-layer "_사보강재(Corner_Strut)")
                     (progn
-                      ;; 사보강재 데이터 수집
+                      ;; 사보강재 데이터 수집 (TRI)
                       (setq t-p1 (cdr (nth 5 x-vals)))
                       (setq t-p2 (cdr (nth 6 x-vals)))
                       (setq t-p3 (cdr (nth 7 x-vals)))
                       (setq valid-triangles (append valid-triangles (list (list "TRI" t-p1 t-p2 t-p3))))
                     )
                     (progn
-                      ;; 버팀보 데이터 수집
+                      ;; 버팀보 데이터 수집 (RECT) - XDATA 길이 10
                       (setq s-p1 (cdr (nth 2 x-vals)))
                       (setq s-p2 (cdr (nth 3 x-vals)))
                       (setq s-width (cdr (nth 1 x-vals)))
@@ -12751,7 +13361,8 @@
 ;;;;==========================================================================
 ;;;; defun tsp-redraw-realtime-plan : 실시간 작도 시 도면(DWG)에 영구 저장된 중간말뚝 삭제 기록 필터링 유지
 ;;;;==========================================================================
-(defun tsp-redraw-realtime-plan (boundary-ent boundary-orient / next-ent ent-data blk-name layer-name pt is-deleted post-data)
+(defun tsp-redraw-realtime-plan (boundary-ent boundary-orient / next-ent ent-data blk-name layer-name pt is-deleted post-data
+                                  orphan-ent xdata-strut xdata-post xdata-brace xdata cur-boundary-handle)
   ;; [Phase 2] Dirty Flag 체크: 변경 사항이 없으면 무거운 작도 로직 건너뜀
   (if (and (boundp '*tsp-data-dirty*) (not *tsp-data-dirty*))
     (princ "\n[TSP] 변경된 내용이 없어 재작도를 생략합니다.")
@@ -12774,52 +13385,85 @@
       (setq *tsp-realtime-entities* '())
       
       ;; 현재 작업 중인 경계선(boundary-ent) 핸들을 추출
-      (setq cur-boundary-handle (cdr (assoc 5 (entget boundary-ent))))
-      
-      ;; ARX 크래시 원인인 CONT_BRACE를 차단하기 위해 TSP_LISP_BRACE까지 모두 포함하여 검색
-      (setq orphan-ss (ssget "X" '((-3 ("TSP_STRUT_SPEC,TSP_LISP_POST,TSP_LISP_BRACE")))))
-      (if orphan-ss
-        (progn
-          (setq orphan-idx 0)
-          (while (< orphan-idx (sslength orphan-ss))
-            (setq orphan-ent (ssname orphan-ss orphan-idx))
-            (setq xdata-strut (assoc -3 (entget orphan-ent '("TSP_STRUT_SPEC"))))
-            (setq xdata-post (assoc -3 (entget orphan-ent '("TSP_LISP_POST"))))
-            (setq xdata-brace (assoc -3 (entget orphan-ent '("TSP_LISP_BRACE"))))
-            
-            (if xdata-strut
+      (setq cur-boundary-handle (cdr (assoc 5 (entget boundary-ent)))) 
+      (setq orphan-ent (entnext))
+      (while orphan-ent
+        ;; 삭제(entdel)된 객체에 entnext를 호출하면 nil이 반환되어 루프가 즉시 끊깁니다.
+        ;; 따라서 현재 객체를 검사/삭제하기 전에 무조건 '다음 객체'를 미리 안전하게 확보해 두어야 합니다.
+        (setq next-orphan (vl-catch-all-apply 'entnext (list orphan-ent)))
+        (if (vl-catch-all-error-p next-orphan) (setq next-orphan nil))
+        
+        (setq is-deleted nil) ;; 하나의 객체에 대해 중복 삭제 시도를 방지하는 플래그
+
+        ;; 세 APPID 각각 독립적으로 조회
+        (setq xdata-strut (assoc -3 (vl-catch-all-apply 'entget (list orphan-ent '("TSP_STRUT_SPEC")))))
+        (setq xdata-post  (assoc -3 (vl-catch-all-apply 'entget (list orphan-ent '("TSP_LISP_POST")))))
+        (setq xdata-brace (assoc -3 (vl-catch-all-apply 'entget (list orphan-ent '("TSP_LISP_BRACE")))))
+
+        ;; TSP_STRUT_SPEC: 레거시 CONT_BRACE 제거
+        (if (and (not is-deleted) xdata-strut (listp xdata-strut))
+          (progn
+            (setq xdata (vl-catch-all-apply 'cdadr (list xdata-strut)))
+            (if (and xdata (not (vl-catch-all-error-p xdata)) (listp xdata)
+                     (> (length xdata) 8))
               (progn
-                (setq xdata (cdadr xdata-strut))
-                ;; [레거시 호환] 과거에 TSP_STRUT_SPEC으로 잘못 저장되었던 옛날 보강재도 스캔하여 지움 (크래시 유발자 제거)
-                (if (and (> (length xdata) 8) (= (cdr (nth 7 xdata)) "CONT_BRACE") (= (cdr (nth 8 xdata)) cur-boundary-handle))
-                  (vl-catch-all-apply 'entdel (list orphan-ent))
+                (setq tag-name (cdr (nth 7 xdata)))
+                (setq saved-handle (cdr (nth 8 xdata)))
+                ;; 도면에서 이미 지워진 '유령 경계선'인지 판별
+                (setq is-ghost (if (and saved-handle (= (type saved-handle) 'STR)) (not (and (handent saved-handle) (entget (handent saved-handle)))) T))
+                (if (and (= tag-name "CONT_BRACE")
+                         (or (= saved-handle cur-boundary-handle) is-ghost))
+                  (progn
+                    (setq is-deleted T)
+                  )
                 )
               )
             )
-            (if xdata-post
-              (progn
-                (setq xdata (cdadr xdata-post))
-                (if (= (cdr (nth 0 xdata)) "MANUAL_POST")
-                  (vl-catch-all-apply 'entdel (list orphan-ent))
-                )
-              )
-            )
-            (if xdata-brace
-              (progn
-                (setq xdata (cdadr xdata-brace))
-                ;; LISP 전용 APPID로 저장된 연속 보강재 삭제
-                (if (and (> (length xdata) 8) (= (cdr (nth 7 xdata)) "CONT_BRACE") (= (cdr (nth 8 xdata)) cur-boundary-handle))
-                  (vl-catch-all-apply 'entdel (list orphan-ent))
-                )
-              )
-            )
-            (setq orphan-idx (1+ orphan-idx))
           )
         )
-       )
+
+        ;; TSP_LISP_POST: MANUAL_POST 제거
+        (if (and (not is-deleted) xdata-post (listp xdata-post))
+          (progn
+            (setq xdata (vl-catch-all-apply 'cdadr (list xdata-post)))
+            (if (and xdata (not (vl-catch-all-error-p xdata)) (listp xdata)
+                     (> (length xdata) 0)
+                     (= (cdr (nth 0 xdata)) "MANUAL_POST"))
+              (progn
+                (setq is-deleted T)
+              )
+            )
+          )
+        )
+
+        ;; TSP_LISP_BRACE: CONT_BRACE 및 MID_GAP 제거
+        (if (and (not is-deleted) xdata-brace (listp xdata-brace))
+          (progn
+            (setq xdata (vl-catch-all-apply 'cdadr (list xdata-brace)))
+            (if (and xdata (not (vl-catch-all-error-p xdata)) (listp xdata)
+                     (> (length xdata) 8))
+              (progn
+                (setq tag-name (cdr (nth 7 xdata)))
+                (setq saved-handle (cdr (nth 8 xdata)))
+                (setq is-ghost (if (and saved-handle (= (type saved-handle) 'STR)) (not (and (handent saved-handle) (entget (handent saved-handle)))) T))
+                (if (and (or (= tag-name "CONT_BRACE") (= tag-name "MID_GAP"))
+                         (or (= saved-handle cur-boundary-handle) is-ghost))
+                  (progn
+                    (setq is-deleted T)
+                  )
+                )
+              )
+            )
+          )
+        )
+
+        ;; 미리 확보해둔 다음 객체로 넘어가기
+        (setq orphan-ent next-orphan)
+      )
 
       ;; 2. 도면 새로 그리기 시작 지점 마킹
       (setq next-ent (entlast))
+      (setq group-start-ent next-ent)
       (if next-ent
         (tsp-log "[Redraw] 작도 시작 전 (entlast) 기준점 확보 성공.")
         (tsp-log "[Redraw] 경고! 작도 시작 전 (entlast)가 nil입니다.")
@@ -12865,10 +13509,31 @@
         (setq temp-segment-list (cons (subst (cons 'SUPPORT-LIST (reverse new-supp-list)) (assoc 'SUPPORT-LIST seg) seg) temp-segment-list))
       )
       
-      ;; 임시 변조된 리스트를 전역 변수에 덮어씌워 일괄 작도 실행 (옛날 보강재는 그려지지 않음)
+      ;; 임시 변조된 리스트를 전역 변수에 덮어씌워 일괄 작도 실행
       (setq *segment-list* (reverse temp-segment-list))
+      
+      ;; ====== [ARX 크래시 추적용 딥 디버깅 시작] ======
+      (princ "\n==================================================")
+      (princ "\n[DEBUG-ARX] C++ 모듈 진입 직전 데이터 무결성 검증")
+      (princ (strcat "\n 1. 경계선 엔티티(boundary-ent) 타입: " (vl-princ-to-string (type boundary-ent))))
+      (princ (strcat "\n 2. 경계선 엔티티 핸들 확인: " (if (and boundary-ent (entget boundary-ent)) (cdr (assoc 5 (entget boundary-ent))) "엔티티 소멸 또는 유효하지 않음!")))
+      (princ (strcat "\n 3. 방향(boundary-orient) 값: " (vl-princ-to-string boundary-orient)))
+      (princ (strcat "\n 4. *segment-list* 전역 변수 타입: " (vl-princ-to-string (type *segment-list*))))
+      (princ (strcat "\n 5. *segment-list* 내 세그먼트 개수: " (if (listp *segment-list*) (itoa (length *segment-list*)) "리스트 아님")))
+      (princ "\n 6. ARX로 전달될 첫 번째 세그먼트 데이터 덤프(구조 파괴 여부 확인):")
+      (if (and (listp *segment-list*) (> (length *segment-list*) 0))
+        (princ (car *segment-list*))
+        (princ "\n  -> [경고] *segment-list*가 비어있거나 잘못되었습니다!")
+      )
+      (princ "\n==================================================")
+      ;; ====== [ARX 크래시 추적용 딥 디버깅 끝] ======
+
       (tsp-log "[Redraw] ARX 함수 'create-hpile-set-on-boundary' 호출 직전")
+      (princ "\n[DEBUG-ARX] C++ 함수 실행 진입 (여기서 메시지가 끊기면 LISP 데이터-C++ 파싱 충돌입니다)...")
+      
       (vl-catch-all-apply 'create-hpile-set-on-boundary (list boundary-ent boundary-orient))
+      
+      (princ "\n[DEBUG-ARX] C++ 함수 무사 통과 완료!")
       (tsp-log "[Redraw] ARX 함수 'create-hpile-set-on-boundary' 무사 완료됨")
       
       ;; 작도가 끝나면 즉시 원본 리스트 복구 (엑셀 저장 등 데이터 무결성 보존)
@@ -13041,6 +13706,10 @@
           )
         )
       )
+      ;; ==========================================================================
+      ;; 6. 연속 보강재(TSP_LISP_BRACE) 객체를 TSP_GRP 그룹에 포함하여 재그룹화
+      ;; ==========================================================================
+      (tsp-group-last-entities group-start-ent boundary-ent) ;; [버그 해결] 소진된 next-ent 대신 보존해둔 group-start-ent 사용
       (setq *tsp-data-dirty* nil)
     )
   )
