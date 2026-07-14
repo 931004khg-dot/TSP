@@ -789,7 +789,7 @@
 
 
 ;;;;==========================================================================
-;;;; defun tsp-group-last-entities : 생성된 객체고유 그룹화 (ActiveX 기반 안전 강화 버전)
+;;;; defun tsp-group-last-entities : 생성된 객체고유 그룹화
 ;;;;==========================================================================
 (defun tsp-group-last-entities (start-ent boundary-ent / sset ent handle group-name debug-ss-cnt dict acad-obj doc groups new-group valid-objs i obj-array)
   (setq handle (tsp-get-entity-handle boundary-ent))
@@ -4598,6 +4598,8 @@
     )
   )
   
+  (vl-catch-all-apply 'vla-regen (list (vla-get-activedocument (vlax-get-acad-object)) 1))
+
   ;; 8. 내부에서 충돌(Crash)이 발생했다면, 커맨드창에 붉은 글로 에러 내용 보고
   (if (vl-catch-all-error-p draw-result)
     (princ (strcat "\n[에러 알림] 버팀보 작도 중 내부 충돌이 발생했습니다. (객체 추적은 정상 보존됨)\n상세 원인: " (vl-catch-all-error-message draw-result)))
@@ -4617,11 +4619,10 @@
     )
   )
 )
-;;;; defun tsp-create-cip-guideline : 외측 방향을 고려한 D/2 오프셋 보조선 생성
 
 
 ;;;;==========================================================================
-;;;; defun tsp-create-cip-guideline : 외측 방향을 고려한 D/2 오프셋 보조선 생성 (검증오류 픽스)
+;;;; defun tsp-create-cip-guideline : 외측 방향을 고려한 D/2 오프셋 보조선 생성
 ;;;;==========================================================================
 (defun tsp-create-cip-guideline (boundary-ent dia boundary-orient is-closed / vobj d start-pt p2 seg-angle out-norm target-pt off-obj off-ent closest-pt)
   (setq vobj (vlax-ename->vla-object boundary-ent))
@@ -10558,23 +10559,34 @@
             (princ "\n[DEBUG] 08. 재생성(REGEN) 및 버퍼 초기화 실행")
             (vl-catch-all-apply 'vla-regen (list (vla-get-activedocument (vlax-get-acad-object)) 1))
             
-            ;; [완벽 해결] 
-            ;; 잔여 클릭/엔터 신호가 ARX 측정 모드를 곧바로 스킵시켜버리는 현상을 막기 위한 가장 확실한 방법입니다.
-            ;; LISP의 alert(팝업 알림창)을 띄우면, 윈도우 OS가 캐드의 모든 잔여 입력 버퍼를 확실하게 강제 초기화합니다.
-            ;; 사용자가 [확인]을 누르거나 엔터를 치면, 그 신호는 알림창이 다 먹어치우고 ARX는 깨끗한 상태로 대기합니다.
+            ;; [디버깅 프롬프트 추가] 문제의 원인을 파악하기 위해 단계별 촘촘한 로그 기록
+            (princ "\n[DEBUG-FLOW] 08-1. Alert 팝업창 호출 직전")
             (alert "도면 갱신이 완료되었습니다.\n[확인]을 누르면 도면 측정/확인 모드로 진입합니다.")
+            (princ "\n[DEBUG-FLOW] 08-2. Alert 팝업창 닫힘 (사용자 확인 누름)")
 
-            (princ "\n[DEBUG] 09. ARX 도면제어 함수 호출 직전!")
+            (princ "\n[DEBUG-FLOW] 09. ARX 도면제어 함수 호출 직전!")
+            ;; ARX 함수가 메모리에 정상적으로 바인딩되어 있는지 먼저 확인합니다.
+            (princ (strcat "\n[DEBUG-FLOW] 09-1. tsp-pause-for-measurement 타입 확인: " (vl-princ-to-string (type tsp-pause-for-measurement))))
+
             (if tsp-pause-for-measurement
               (progn
-                (tsp-pause-for-measurement)
-                (princ "\n[DEBUG] 10. ARX 도면제어 함수 종료됨 (정상 복귀)")
+                (princ "\n[DEBUG-FLOW] 09-2. tsp-pause-for-measurement 내부 진입 시도...")
+                ;; 에러 발생 시 캐치하기 위해 vl-catch-all-apply로 래핑하여 실행합니다.
+                (setq debug-arx-result (vl-catch-all-apply 'tsp-pause-for-measurement))
+                
+                (if (vl-catch-all-error-p debug-arx-result)
+                  (princ (strcat "\n[DEBUG-ERROR] ARX 함수 내부에서 크래시 발생!: " (vl-catch-all-error-message debug-arx-result)))
+                  (princ (strcat "\n[DEBUG-FLOW] 10. ARX 도면제어 함수 무사 종료됨. 반환값: " (vl-princ-to-string debug-arx-result)))
+                )
                 (tsp-log ">>> [Main] ARX 도면제어 무사 종료됨")
               )
-              (alert "TSP - 도면 제어 모듈이 로드되지 않았습니다.")
+              (progn
+                (princ "\n[DEBUG-ERROR] TSP - 도면 제어 모듈(ARX)을 찾을 수 없습니다!")
+                (alert "TSP - 도면 제어 모듈이 로드되지 않았습니다.")
+              )
             )
             
-            (princ "\n[DEBUG] 11. DCL 다이얼로그 재호출 직전")
+            (princ "\n[DEBUG-FLOW] 11. DCL 다이얼로그 재호출 직전 (여기까지 딜레이 없이 한 번에 도달했다면 스킵된 것임)")
             (setq *tsp-support-list* orig-support-list)
             
             ;; [복원] 정상 작동 시 에러 트랩 복구 및 플래그 해제
@@ -13424,9 +13436,8 @@
 ;;;;==========================================================================
 (defun tsp-redraw-realtime-plan (boundary-ent boundary-orient / next-ent ent-data blk-name layer-name pt is-deleted post-data
                                   orphan-ent xdata-strut xdata-post xdata-brace xdata cur-boundary-handle)
-  ;; [Phase 2] Dirty Flag 체크: 변경 사항이 없으면 무거운 작도 로직 건너뜀
   (if (and (boundp '*tsp-data-dirty*) (not *tsp-data-dirty*))
-    (princ "\n[TSP] 변경된 내용이 없어 재작도를 생략합니다.")
+    (princ "\n 변경된 내용이 없어 재작도를 생략합니다.")
     (progn
       ;; 설정창(다이얼로그) 세션 중에는 임시 데이터를 사용, 평상시엔 LDATA 영구 기록 사용
       (if *tsp-use-temp-posts*
@@ -13747,8 +13758,14 @@
       ;; ==========================================================================
       ;; 6. 연속 보강재(TSP_LISP_BRACE) 객체를 TSP_GRP 그룹에 포함하여 재그룹화
       ;; ==========================================================================
-      (tsp-group-last-entities group-start-ent boundary-ent)
+      (tsp-group-last-entities group-start-ent boundary-ent) ;; [버그 해결] 소진된 next-ent 대신 보존해둔 group-start-ent 사용
+      
+      ;; [화면 갱신 누락 픽스]
       (vl-catch-all-apply 'vla-regen (list (vla-get-activedocument (vlax-get-acad-object)) 1))
+
+      ;; [자동저장 완벽 분리] 실제 작도가 일어났으므로 자동저장 전용 플래그를 T로 마킹
+      (setq *tsp-project-modified* T)
+      
       (setq *tsp-data-dirty* nil)
     )
   )
@@ -14526,10 +14543,10 @@
       )
       ((= next-step "RUN")
         (setq next-step nil)
-        ;; ----- 기존 도면 작업 루프 원본 유지 -----
       (setq step 0)
       (setq loop-program T)
       (setq *tsp-data-dirty* nil)
+      (setq *tsp-project-modified* nil)
       (setq *tsp-realtime-entities* '())
       
       (setq status (scale-dialog-callback dcl-path))
@@ -14709,7 +14726,7 @@
                     (cond
                       ((= status 0)
                         (setq loop-draw nil)
-                        (if *tsp-data-dirty*
+                        (if (or *tsp-data-dirty* *tsp-project-modified*)
                           (progn
                             (initget "Yes No")
                             (setq save-chk (getkword (strcat "\n변경된 내용을 저장하시겠습니까? (프로젝트: " *tsp-current-project-name* ") [Yes(Y)/No(N)] <Y>: ")))
