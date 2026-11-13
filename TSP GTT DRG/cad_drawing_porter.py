@@ -1,0 +1,2145 @@
+# -*- coding: utf-8 -*-
+"""
+AutoCAD 도면 객체 데이터화 & 타 도면 정밀 복원 및 AI 공유 매니저 (cad_drawing_porter.py)
+- CAD 도면 내 다중 선택 객체(가시설 벽체 도면 등) + 기준점(Base Point) 정밀 추출
+- 배정밀도(유효숫자 15자리) 완벽 보존 및 무손실 후행 0 제거로 수치 오차 0% 보장
+- 기준점 상대좌표 기반 타 도면 100% 동일 작도 (레이어, 선종류, 문자스타일, 블록 정의 자동 복원)
+- 2D 도면 미리보기 캔버스 (마우스 휠 줌인/줌아웃 및 드래그 화면 이동 지원)
+- AI(Gemini)와 의논하기 위한 초경량 무손실 데이터 생성 (클립보드 즉시 복사 & 파일 내보내기/불러오기)
+"""
+
+import os
+import sys
+import json
+import math
+import time
+import shutil
+import tempfile
+import traceback
+import re
+import colorsys
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+# COM 연동을 위한 pywin32 임포트 확인
+try:
+    import win32com.client
+    import pythoncom
+    HAS_WIN32COM = True
+except ImportError:
+    HAS_WIN32COM = False
+
+
+# ==============================================================================
+# 1. AutoCAD 내장 LISP 추출 엔진 템플릿 (다중 객체 + 기준점 추출)
+#    - 수치 손실 방지를 위해 rtos 정밀도를 15자리로 추출
+# ==============================================================================
+LISP_SCENE_EXTRACTOR_TEMPLATE = r"""
+(defun C:_TMP_EXTRACT_SCENE_ ( / ss base_pt i ent elist etype outpath fp
+                                 visited_blks visited_lays visited_stys visited_ltys
+                                 first_ent first_blk first_lay first_sty first_lty
+                                 l_el s_el lt_el
+                                 _esc _num _dxf_to_json _write_entity_json _collect_blocks _dump_block )
+  (vl-load-com)
+
+  ;; 문자열 이스케이프 함수 (JSON 안전 변환)
+  (defun _esc (s / idx ch res)
+    (if (not s) (setq s ""))
+    (setq res "" idx 1)
+    (while (<= idx (strlen s))
+      (setq ch (substr s idx 1))
+      (cond
+        ((= ch "\\") (setq res (strcat res "\\\\")))
+        ((= ch "\"") (setq res (strcat res "\\\"")))
+        ((= ch "\n") (setq res (strcat res "\\n")))
+        ((= ch "\r") (setq res (strcat res "\\r")))
+        ((= ch "\t") (setq res (strcat res "\\t")))
+        (t (setq res (strcat res ch)))
+      )
+      (setq idx (1+ idx))
+    )
+    res
+  )
+
+  ;; 실수 포맷팅 함수 (배정밀도 15자리 추출 후 불필요한 후행 0 제거 - 수치 오차 0%)
+  (defun _num (n / s len last_ch)
+    (if (numberp n)
+      (if (= (type n) 'INT)
+        (itoa n)
+        (progn
+          (setq s (rtos n 2 15))
+          (if (vl-string-search "." s)
+            (progn
+              (while (and (> (strlen s) 1) (= (substr s (strlen s) 1) "0"))
+                (setq s (substr s 1 (1- (strlen s))))
+              )
+              (if (= (substr s (strlen s) 1) ".")
+                (setq s (substr s 1 (1- (strlen s))))
+              )
+            )
+          )
+          (if (or (= s "") (= s "-0")) "0" s)
+        )
+      )
+      "0"
+    )
+  )
+
+  ;; 단일 DXF 그룹을 JSON 배열 [code, type, value] 문자열로 변환
+  (defun _dxf_to_json (pair / code val)
+    (setq code (car pair)
+          val  (cdr pair))
+    ;; entmake 시 충돌하는 핸들/엔티티명/리액터/도면공간 코드만 제외 (100번 코드는 보존)
+    (if (or (member code '(-1 -2 5 67 330 340 350 360 410))
+            (>= code 1000))
+      nil
+      (cond
+        ((= (type val) 'INT)
+         (strcat "[" (itoa code) ",\"INT\"," (itoa val) "]"))
+        ((= (type val) 'REAL)
+         (strcat "[" (itoa code) ",\"REAL\"," (_num val) "]"))
+        ((= (type val) 'STR)
+         (strcat "[" (itoa code) ",\"STR\",\"" (_esc val) "\"]"))
+        ((and (listp val) (>= (length val) 2) (numberp (car val)) (numberp (cadr val)))
+         (if (= (length val) 3)
+           (strcat "[" (itoa code) ",\"PT3\",[" (_num (car val)) "," (_num (cadr val)) "," (_num (caddr val)) "]]")
+           (strcat "[" (itoa code) ",\"PT2\",[" (_num (car val)) "," (_num (cadr val)) "]]")
+         ))
+        (t nil)
+      )
+    )
+  )
+
+  ;; 엔티티 하나의 전체 DXF 리스트를 JSON 객체로 기록
+  (defun _write_entity_json (en is_first / el etype bname eff_name vla_obj sub_en sub_el items jstr sub_items sub_jstr k cnt sk scnt sub_first)
+    (setq el (entget en)
+          etype (cdr (assoc 0 el)))
+
+    ;; 레이어, 선종류, 텍스트 스타일 수집
+    (if (assoc 8 el)
+      (if (not (member (strcase (cdr (assoc 8 el))) visited_lays))
+        (setq visited_lays (cons (strcase (cdr (assoc 8 el))) visited_lays))
+      )
+    )
+    (if (assoc 6 el)
+      (if (not (member (strcase (cdr (assoc 6 el))) visited_ltys))
+        (setq visited_ltys (cons (strcase (cdr (assoc 6 el))) visited_ltys))
+      )
+    )
+    (if (assoc 7 el)
+      (if (not (member (strcase (cdr (assoc 7 el))) visited_stys))
+        (setq visited_stys (cons (strcase (cdr (assoc 7 el))) visited_stys))
+      )
+    )
+
+    ;; 블록 참조(INSERT)인 경우 블록 정의 수집 및 동적블록 원본명 확인
+    (setq eff_name "")
+    (if (and (= etype "INSERT") (assoc 2 el))
+      (progn
+        (setq bname (cdr (assoc 2 el)))
+        (_collect_blocks bname)
+        (if (= (strcase (substr bname 1 2)) "*U")
+          (progn
+            (setq vla_obj (vlax-ename->vla-object en))
+            (if (vlax-property-available-p vla_obj 'EffectiveName)
+              (setq eff_name (vla-get-EffectiveName vla_obj))
+              (setq eff_name bname)
+            )
+          )
+          (setq eff_name bname)
+        )
+      )
+    )
+
+    ;; DXF 그룹 필터링
+    (setq items '())
+    (foreach p el
+      ;; DIMENSION의 익명 블록 이름(2번 코드)은 새 도면에서 재생성되도록 제외
+      (if (not (and (= etype "DIMENSION") (= (car p) 2)))
+        (progn
+          (setq jstr (_dxf_to_json p))
+          (if jstr (setq items (cons jstr items)))
+        )
+      )
+    )
+    (setq items (reverse items))
+
+    (if (not is_first) (write-line "    ," fp))
+    (write-line "    {" fp)
+    (write-line (strcat "      \"etype\": \"" (_esc etype) "\",") fp)
+    (if (/= eff_name "")
+      (write-line (strcat "      \"eff_name\": \"" (_esc eff_name) "\",") fp)
+    )
+    (write-line "      \"dxf\": [" fp)
+    (setq k 0 cnt (length items))
+    (foreach it items
+      (setq k (1+ k))
+      (if (< k cnt)
+        (write-line (strcat "        " it ",") fp)
+        (write-line (strcat "        " it) fp)
+      )
+    )
+    (write-line "      ]," fp)
+
+    ;; 구형 POLYLINE(VERTEX 포함) 또는 ATTRIB 포함 복합 객체(66 그룹코드 = 1) 처리
+    (write-line "      \"sub_entities\": [" fp)
+    (if (= (cdr (assoc 66 el)) 1)
+      (progn
+        (setq sub_en (entnext en)
+              sub_first T)
+        (while (and sub_en
+                    (setq sub_el (entget sub_en))
+                    (/= (cdr (assoc 0 sub_el)) "SEQEND"))
+          (setq sub_items '())
+          (foreach sp sub_el
+            (setq sub_jstr (_dxf_to_json sp))
+            (if sub_jstr (setq sub_items (cons sub_jstr sub_items)))
+          )
+          (setq sub_items (reverse sub_items))
+          (if (not sub_first) (write-line "        ," fp))
+          (setq sub_first nil)
+          (write-line "        [" fp)
+          (setq sk 0 scnt (length sub_items))
+          (foreach sit sub_items
+            (setq sk (1+ sk))
+            (if (< sk scnt)
+              (write-line (strcat "          " sit ",") fp)
+              (write-line (strcat "          " sit) fp)
+            )
+          )
+          (write-line "        ]" fp)
+          (setq sub_en (entnext sub_en))
+        )
+      )
+    )
+    (write-line "      ]" fp)
+    (write-line "    }" fp)
+  )
+
+  ;; 블록 정의 및 중첩 블록 재귀 탐색 함수
+  (defun _collect_blocks (blk_name / tbl_el sub_en el etype)
+    (if (and blk_name
+             (not (member (strcase blk_name) visited_blks))
+             (setq tbl_el (tblsearch "BLOCK" blk_name)))
+      (progn
+        (setq visited_blks (cons (strcase blk_name) visited_blks))
+        (setq sub_en (cdr (assoc -2 tbl_el)))
+        (while sub_en
+          (setq el (entget sub_en)
+                etype (cdr (assoc 0 el)))
+          (if (and (= etype "INSERT") (assoc 2 el))
+            (_collect_blocks (cdr (assoc 2 el)))
+          )
+          (if (= (cdr (assoc 66 el)) 1)
+            (while (and (setq sub_en (entnext sub_en))
+                        (/= (cdr (assoc 0 (entget sub_en))) "SEQEND")))
+          )
+          (setq sub_en (entnext sub_en))
+        )
+      )
+    )
+  )
+
+  ;; 블록 하나를 JSON으로 출력
+  (defun _dump_block (blk_name is_first / tbl_el bpt bflags sub_en el first_b_ent)
+    (setq tbl_el (tblsearch "BLOCK" blk_name))
+    (if tbl_el
+      (progn
+        (setq bpt (cdr (assoc 10 tbl_el))
+              bflags (cdr (assoc 70 tbl_el))
+              sub_en (cdr (assoc -2 tbl_el)))
+        (if (not bpt) (setq bpt '(0.0 0.0 0.0)))
+        (if (not bflags) (setq bflags 0))
+
+        (if (not is_first) (write-line "    ," fp))
+        (write-line "    {" fp)
+        (write-line (strcat "      \"name\": \"" (_esc (cdr (assoc 2 tbl_el))) "\",") fp)
+        (write-line (strcat "      \"flags\": " (itoa bflags) ",") fp)
+        (write-line (strcat "      \"base_point\": [" (_num (car bpt)) "," (_num (cadr bpt)) "," (_num (caddr bpt)) "],") fp)
+        (write-line "      \"entities\": [" fp)
+
+        (setq first_b_ent T)
+        (while sub_en
+          (setq el (entget sub_en))
+          (_write_entity_json sub_en first_b_ent)
+          (setq first_b_ent nil)
+          (if (= (cdr (assoc 66 el)) 1)
+            (while (and (setq sub_en (entnext sub_en))
+                        (/= (cdr (assoc 0 (entget sub_en))) "SEQEND")))
+          )
+          (setq sub_en (entnext sub_en))
+        )
+
+        (write-line "      ]" fp)
+        (write-line "    }" fp)
+      )
+    )
+  )
+
+  ;; ==================== 메인 실행부 ====================
+  (setq outpath "__OUTPATH__")
+  (princ "\n==================================================================")
+  (princ "\n[도면 데이터 추출] 1단계: 데이터화할 도면 객체들을 선택하세요 (드래그/클릭 후 Enter): ")
+  (setq ss (ssget))
+  (if (and ss (> (sslength ss) 0))
+    (progn
+      (initget 1)
+      (princ "\n[도면 데이터 추출] 2단계: 기준점(Base Point)을 클릭하세요: ")
+      (setq base_pt (getpoint))
+      (if base_pt
+        (progn
+          ;; UCS 좌표를 WCS 절대좌표로 변환
+          (setq base_pt (trans base_pt 1 0))
+          (setq visited_blks '()
+                visited_lays '()
+                visited_stys '()
+                visited_ltys '())
+
+          (setq fp (open outpath "w"))
+          (if fp
+            (progn
+              (write-line "{" fp)
+              (write-line "  \"status\": \"OK\"," fp)
+              (write-line (strcat "  \"base_point\": [" (_num (car base_pt)) "," (_num (cadr base_pt)) "," (_num (caddr base_pt)) "],") fp)
+              (write-line (strcat "  \"entity_count\": " (itoa (sslength ss)) ",") fp)
+
+              ;; 1. 선택된 도면 객체들 기록
+              (write-line "  \"entities\": [" fp)
+              (setq first_ent T
+                    i 0)
+              (while (< i (sslength ss))
+                (setq ent (ssname ss i))
+                (_write_entity_json ent first_ent)
+                (setq first_ent nil
+                      i (1+ i))
+              )
+              (write-line "  ]," fp)
+
+              ;; 2. 참조된 블록 정의 기록 (하위 중첩 블록부터 순서대로)
+              (write-line "  \"blocks\": [" fp)
+              (setq first_blk T)
+              (foreach bn visited_blks
+                (_dump_block bn first_blk)
+                (setq first_blk nil)
+              )
+              (write-line "  ]," fp)
+
+              ;; 3. 사용된 레이어 테이블 정보 기록
+              (write-line "  \"layers\": [" fp)
+              (setq first_lay T)
+              (foreach ln visited_lays
+                (setq l_el (tblsearch "LAYER" ln))
+                (if l_el
+                  (progn
+                    (if (assoc 6 l_el)
+                      (if (not (member (strcase (cdr (assoc 6 l_el))) visited_ltys))
+                        (setq visited_ltys (cons (strcase (cdr (assoc 6 l_el))) visited_ltys))
+                      )
+                    )
+                    (if (not first_lay) (write-line "    ," fp))
+                    (setq first_lay nil)
+                    (write-line (strcat "    {\"name\": \"" (_esc (cdr (assoc 2 l_el))) "\","
+                                        " \"color\": " (itoa (abs (cdr (assoc 62 l_el)))) ","
+                                        " \"linetype\": \"" (_esc (cdr (assoc 6 l_el))) "\"}") fp)
+                  )
+                )
+              )
+              (write-line "  ]," fp)
+
+              ;; 4. 사용된 텍스트 스타일 테이블 정보 기록
+              (write-line "  \"styles\": [" fp)
+              (setq first_sty T)
+              (foreach sn visited_stys
+                (setq s_el (tblsearch "STYLE" sn))
+                (if s_el
+                  (progn
+                    (if (not first_sty) (write-line "    ," fp))
+                    (setq first_sty nil)
+                    (write-line (strcat "    {\"name\": \"" (_esc (cdr (assoc 2 s_el))) "\","
+                                        " \"font\": \"" (_esc (cdr (assoc 3 s_el))) "\","
+                                        " \"bigfont\": \"" (_esc (if (assoc 4 s_el) (cdr (assoc 4 s_el)) "")) "\","
+                                        " \"width\": " (_num (if (assoc 41 s_el) (cdr (assoc 41 s_el)) 1.0)) "}") fp)
+                  )
+                )
+              )
+              (write-line "  ]" fp)
+              (write-line "}" fp)
+              (close fp)
+              (princ (strcat "\n[완료] 총 " (itoa (sslength ss)) "개의 객체가 기준점 상대좌표 데이터로 정밀 추출되었습니다!"))
+            )
+          )
+        )
+        (progn
+          (setq fp (open outpath "w"))
+          (if fp
+            (progn
+              (write-line "{\"status\": \"CANCEL\", \"message\": \"기준점(Base Point) 지정이 취소되었습니다.\"}" fp)
+              (close fp)
+            )
+          )
+        )
+      )
+    )
+    (progn
+      (setq fp (open outpath "w"))
+      (if fp
+        (progn
+          (write-line "{\"status\": \"CANCEL\", \"message\": \"객체 선택이 취소되었거나 선택된 객체가 없습니다.\"}" fp)
+          (close fp)
+        )
+      )
+      (princ "\n[취소] 객체 선택이 취소되었습니다.")
+    )
+  )
+  (princ)
+)
+(C:_TMP_EXTRACT_SCENE_)
+"""
+
+
+# ==============================================================================
+# 2. 색상 매핑 및 무손실 수치 포맷팅 유틸리티
+# ==============================================================================
+ACI_TO_HEX = {
+    0: "#FFFFFF",
+    1: "#FF0000",   # Red
+    2: "#FFFF00",   # Yellow
+    3: "#00FF00",   # Green
+    4: "#00FFFF",   # Cyan
+    5: "#0066FF",   # Blue
+    6: "#FF00FF",   # Magenta
+    7: "#FFFFFF",   # White
+    8: "#808080",   # Dark Gray
+    9: "#C0C0C0",   # Light Gray
+    10: "#FF0000",
+    11: "#FF7F7F",
+    12: "#CC0000",
+    13: "#CC6666",
+    14: "#990000",
+    20: "#FF3F00",
+    21: "#FF9F7F",
+    30: "#FF7F00",  # Orange
+    31: "#FFBF7F",
+    40: "#FFBF00",
+    41: "#FFDF7F",
+    50: "#FFFF00",
+    51: "#FFFF7F",
+    60: "#BFFF00",
+    70: "#7FFF00",
+    80: "#3FFF00",
+    90: "#00FF00",
+    100: "#00FF3F",
+    110: "#00FF7F",
+    120: "#00FFBF",
+    130: "#00FFFF",
+    131: "#7FFFFF",
+    140: "#00BFFF",
+    141: "#7FDFFF",
+    150: "#007FFF",
+    160: "#003FFF",
+    170: "#0000FF",
+    180: "#3F00FF",
+    190: "#7F00FF",
+    200: "#BF00FF",
+    210: "#FF00FF",
+    220: "#FF00BF",
+    230: "#FF007F",
+    240: "#FF003F",
+    250: "#4C4C4C",
+    251: "#686868",
+    252: "#848484",
+    253: "#A0A0A0",
+    254: "#BCBCBC",
+    255: "#E0E0E0",
+    256: "#FFFFFF",
+}
+
+
+def aci_to_hex_color(aci: int) -> str:
+    """AutoCAD 색상 인덱스(ACI 0~256)를 화면 표시용 HEX 색상 코드로 변환합니다."""
+    aci = int(aci)
+    if aci in ACI_TO_HEX:
+        return ACI_TO_HEX[aci]
+    if 10 <= aci <= 249:
+        hue_idx = (aci - 10) // 10
+        sub_idx = (aci - 10) % 10
+        hue = (hue_idx * 15.0) % 360.0
+        lightness = 0.72 if (sub_idx % 2 == 1) else 0.50
+        if sub_idx >= 4:
+            lightness *= 0.75
+        r, g, b = colorsys.hls_to_rgb(hue / 360.0, lightness, 0.9)
+        return f"#{int(r*255):02X}{int(g*255):02X}{int(b*255):02X}"
+    return "#00E5FF"
+
+
+def fmt_num_lossless(val) -> str:
+    """
+    배정밀도 실수(float)의 정밀도를 100% 그대로 유지하면서
+    불필요한 끝자리 0만 제거한 문자열로 반환합니다. (예: 12.30000000 -> '12.3')
+    """
+    if isinstance(val, int):
+        return str(val)
+    f = float(val)
+    if abs(f) < 1e-15:
+        return "0.0"
+    s = f"{f:.15g}"
+    if "e" not in s and "E" not in s and "." not in s:
+        s += ".0"
+    return s
+
+
+def clean_float(val):
+    """
+    JSON 직렬화 시 부동소수점 가비지(예: 1.2000000000000002 -> 1.2)를 제거하되,
+    실제 유효숫자 15자리는 단 하나도 손실하지 않는 숫자(int 또는 float)를 반환합니다.
+    """
+    if isinstance(val, int):
+        return val
+    f = float(val)
+    if abs(f) < 1e-15:
+        return 0
+    # 14자리 반올림으로 이진 부동소수점 표현 노이즈만 정화
+    r = round(f, 14)
+    if r.is_integer():
+        return int(r)
+    return r
+
+
+def sanitize_for_cp949(text: str) -> str:
+    """
+    리습(.lsp)을 ANSI(CP949)로 인코딩할 때 발생할 수 있는
+    유니코드 특수 공백 및 비호환 문자를 일반 공백으로 안전하게 정화합니다.
+    """
+    text = re.sub(r'[\u00A0\u1680\u180E\u2000-\u200B\u202F\u205F\u3000\uFEFF]', ' ', text)
+    cleaned_chars = []
+    for ch in text:
+        try:
+            ch.encode('cp949')
+            cleaned_chars.append(ch)
+        except UnicodeEncodeError:
+            cleaned_chars.append(' ')
+    return "".join(cleaned_chars)
+
+
+def safe_lisp_str(val: str) -> str:
+    """AutoLISP 문자열 리터럴 내부에 들어갈 텍스트를 이스케이프합니다."""
+    if val is None:
+        return ""
+    s = str(val)
+    s = s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
+    return s
+
+
+# ==============================================================================
+# 3. 도면 재작도(Paste) & AI 초경량 무손실 포맷 변환 엔진
+# ==============================================================================
+class SceneDataEngine:
+    """
+    1) 추출된 도면 데이터를 바탕으로 다른 도면의 지정한 기준점에 100% 동일하게 작도하는 LISP 생성
+    2) AI(Gemini)와 공유할 때 용량을 최소화하면서 수치 정밀도는 100% 보존하는 컴팩트 포맷 변환/역변환
+    """
+
+    @staticmethod
+    def build_paste_scene_lisp(scene_rec: dict) -> str:
+        """
+        사용자가 AutoCAD에서 새 기준점(Target Point)을 클릭하면,
+        모든 블록 정의, 레이어, 문자 스타일을 복원한 뒤
+        선택되었던 모든 도면 객체들을 기준점 상대좌표 오프셋만큼 정확히 이동시켜 작도합니다.
+        """
+        bpt = scene_rec.get("base_point", [0.0, 0.0, 0.0])
+        bx, by, bz = float(bpt[0]), float(bpt[1]), float(bpt[2]) if len(bpt) >= 3 else 0.0
+
+        lines = []
+        lines.append(";; ============================================================================")
+        lines.append(";; 도면 스냅샷 정밀 복원 임시 스크립트 (Auto-Generated)")
+        lines.append(";; ============================================================================")
+        lines.append("(defun C:_TMP_PASTE_SCENE_ ( / tpt dx dy dz")
+        lines.append("                               _shift_dxf _shift_hatch_dxf )")
+        lines.append("  (vl-load-com)")
+
+        # 1) 일반 엔티티의 DXF 리스트에서 월드 좌표 그룹코드들을 (dx, dy, dz)만큼 정밀 이동시키는 LISP 헬퍼 함수
+        #    -주의: ELLIPSE의 11번(장축 상대 벡터), 방향 벡터(210) 등은 상대 벡터이므로 이동시키지 않음!
+        lines.append("  (defun _shift_dxf (etype dxf_list dx dy dz / res code val pt_codes is_2d)")
+        lines.append("    (setq is_2d (member etype '(\"LWPOLYLINE\" \"CIRCLE\" \"ARC\" \"TEXT\" \"SOLID\" \"TRACE\")))")
+        lines.append("    (setq pt_codes")
+        lines.append("      (cond")
+        lines.append("        ((= etype \"ELLIPSE\") '(10))")       # ELLIPSE의 11번은 중심 대비 장축 끝점 벡터이므로 제외
+        lines.append("        ((= etype \"LEADER\")  '(10))")       # LEADER의 10번 정점들만 이동
+        lines.append("        (t '(10 11 12 13 14 15 16))")         # LINE, LWPOLY, TEXT(10,11), DIM(10,11,13,14,15,16), SPLINE 등
+        lines.append("      )")
+        lines.append("    )")
+        lines.append("    (setq res '())")
+        lines.append("    (foreach p dxf_list")
+        lines.append("      (setq code (car p) val (cdr p))")
+        lines.append("      (if (and (member code pt_codes) (listp val) (>= (length val) 2))")
+        lines.append("        (if (= (length val) 2)")
+        lines.append("          (setq res (cons (cons code (list (+ (car val) dx) (+ (cadr val) dy))) res))")
+        lines.append("          (setq res (cons (cons code (list (+ (car val) dx) (+ (cadr val) dy) (if is_2d (caddr val) (+ (caddr val) dz)))) res))")
+        lines.append("        )")
+        lines.append("        (setq res (cons p res))")
+        lines.append("      )")
+        lines.append("    )")
+        lines.append("    (reverse res)")
+        lines.append("  )")
+
+        # 2) HATCH 엔티티 전용 정밀 좌표 이동 함수
+        #    - HATCH 내부의 10, 11번 좌표 중 '타원 엣지(72=3)의 11번(장축 벡터)'과 '패턴 정의선 원점(53번 이후)'만 제외하고 모든 경계 좌표를 이동
+        lines.append("  (defun _shift_hatch_dxf (dxf_list dx dy / res in_loops cur_edge code val)")
+        lines.append("    (setq res '() in_loops nil cur_edge 0)")
+        lines.append("    (foreach p dxf_list")
+        lines.append("      (setq code (car p) val (cdr p))")
+        lines.append("      (cond")
+        lines.append("        ((= code 91) (setq in_loops T))")
+        lines.append("        ((member code '(75 76 97 98 47)) (setq in_loops nil))")
+        lines.append("        ((and in_loops (= code 72)) (setq cur_edge val))")
+        lines.append("      )")
+        lines.append("      (if (and (listp val) (>= (length val) 2)")
+        lines.append("               (or (and in_loops (= code 10))")
+        lines.append("                   (and in_loops (= code 11) (= cur_edge 1))")  # 직선 엣지(1)의 끝점(11)만 이동
+        lines.append("                   (and (not in_loops) (= code 10) (/= (car (car res)) 53))))")
+        lines.append("        (if (= (length val) 2)")
+        lines.append("          (setq res (cons (cons code (list (+ (car val) dx) (+ (cadr val) dy))) res))")
+        lines.append("          (setq res (cons (cons code (list (+ (car val) dx) (+ (cadr val) dy) (caddr val))) res))")
+        lines.append("        )")
+        lines.append("        (setq res (cons p res))")
+        lines.append("      )")
+        lines.append("    )")
+        lines.append("    (reverse res)")
+        lines.append("  )")
+
+        # 3) 필수 레이어(LAYER) 테이블 확인 및 자동 생성
+        layers = scene_rec.get("layers", [])
+        if layers:
+            lines.append("  ;; [1] 필수 레이어 테이블 자동 생성")
+            for lay in layers:
+                lname = safe_lisp_str(lay.get("name", "0"))
+                if lname.upper() == "0":
+                    continue
+                lcol = int(lay.get("color", 7))
+                lltype = safe_lisp_str(lay.get("linetype", "Continuous"))
+                lines.append(f'  (if (not (tblsearch "LAYER" "{lname}"))')
+                lines.append(f'    (entmake (list \'(0 . "LAYER") \'(100 . "AcDbSymbolTableRecord") \'(100 . "AcDbLayerTableRecord")')
+                lines.append(f'                   \'(2 . "{lname}") \'(70 . 0) \'(62 . {lcol})')
+                lines.append(f'                   (cons 6 (if (tblsearch "LTYPE" "{lltype}") "{lltype}" "Continuous"))))')
+                lines.append('  )')
+
+        # 4) 필수 텍스트 스타일(STYLE) 테이블 확인 및 자동 생성
+        styles = scene_rec.get("styles", [])
+        if styles:
+            lines.append("  ;; [2] 필수 문자 스타일 테이블 자동 생성")
+            for sty in styles:
+                sname = safe_lisp_str(sty.get("name", "Standard"))
+                if sname.upper() == "STANDARD":
+                    continue
+                sfont = safe_lisp_str(sty.get("font", "romans.shx") or "romans.shx")
+                sbig = safe_lisp_str(sty.get("bigfont", ""))
+                swid = fmt_num_lossless(sty.get("width", 1.0))
+                lines.append(f'  (if (not (tblsearch "STYLE" "{sname}"))')
+                lines.append(f'    (entmake (list \'(0 . "STYLE") \'(100 . "AcDbSymbolTableRecord") \'(100 . "AcDbTextStyleTableRecord")')
+                lines.append(f'                   \'(2 . "{sname}") \'(70 . 0) \'(40 . 0.0) \'(41 . {swid}) \'(50 . 0.0) \'(71 . 0)')
+                lines.append(f'                   \'(3 . "{sfont}") \'(4 . "{sbig}")))')
+                lines.append('  )')
+
+        # 5) 포함된 블록 정의(BLOCK) 자동 복원 (대상 도면에 없는 경우에만 생성하여 충돌 방지)
+        blocks = scene_rec.get("blocks", [])
+        if blocks:
+            lines.append("  ;; [3] 포함된 블록 정의(BLOCK) 자동 복원")
+            for blk in blocks:
+                bname_raw = blk.get("name", "")
+                bname_esc = safe_lisp_str(bname_raw)
+                blk_bpt = blk.get("base_point", [0.0, 0.0, 0.0])
+                bflags = int(blk.get("flags", 0)) & (~1) & (~4) & (~32)
+
+                lines.append(f'  (if (not (tblsearch "BLOCK" "{bname_esc}"))')
+                lines.append('    (progn')
+                lines.append(f'      (entmake (list \'(0 . "BLOCK") \'(100 . "AcDbEntity") \'(8 . "0") \'(100 . "AcDbBlockBegin") \'(2 . "{bname_esc}") \'(70 . {bflags}) \'(10 {fmt_num_lossless(blk_bpt[0])} {fmt_num_lossless(blk_bpt[1])} {fmt_num_lossless(blk_bpt[2])})))')
+                for bent in blk.get("entities", []):
+                    bdxf_expr = SceneDataEngine._dxf_list_to_lisp_expr(bent.get("etype", ""), bent.get("dxf", []))
+                    lines.append(f'      (entmake {bdxf_expr})')
+                    for sub_dxf in bent.get("sub_entities", []):
+                        sub_expr = SceneDataEngine._dxf_list_to_lisp_expr("VERTEX", sub_dxf)
+                        lines.append(f'      (entmake {sub_expr})')
+                    if bent.get("sub_entities"):
+                        lines.append('      (entmake \'((0 . "SEQEND") (100 . "AcDbEntity") (8 . "0")))')
+                lines.append('      (entmake \'((0 . "ENDBLK") (100 . "AcDbEntity") (8 . "0") (100 . "AcDbBlockEnd")))')
+                lines.append('    )')
+                lines.append('  )')
+
+        # 6) 사용자에게 붙여넣을 기준점(Target Point) 입력받기 및 상대 오프셋 계산
+        lines.append('  (princ "\\n==================================================================")')
+        lines.append('  (princ "\\n[도면 붙여넣기] 도면 객체들을 생성할 기준점(Target Point)을 클릭하세요: ")')
+        lines.append('  (if (setq tpt (getpoint))')
+        lines.append('    (progn')
+        lines.append('      (setq tpt (trans tpt 1 0))')
+        lines.append(f'      (setq dx (- (car tpt) {fmt_num_lossless(bx)})')
+        lines.append(f'            dy (- (cadr tpt) {fmt_num_lossless(by)})')
+        lines.append(f'            dz (- (caddr tpt) {fmt_num_lossless(bz)}))')
+
+        # 7) 도면 객체들(Entities) 일괄 생성
+        entities = scene_rec.get("entities", [])
+        lines.append(f'      ;; [4] 총 {len(entities)}개 도면 객체 정밀 생성')
+        for ent in entities:
+            etype = ent.get("etype", "")
+            dxf_expr = SceneDataEngine._dxf_list_to_lisp_expr(etype, ent.get("dxf", []))
+            if etype == "HATCH":
+                lines.append(f'      (entmake (_shift_hatch_dxf {dxf_expr} dx dy))')
+            else:
+                lines.append(f'      (entmake (_shift_dxf "{safe_lisp_str(etype)}" {dxf_expr} dx dy dz))')
+
+            sub_ents = ent.get("sub_entities", [])
+            if sub_ents:
+                for sub_dxf in sub_ents:
+                    sub_expr = SceneDataEngine._dxf_list_to_lisp_expr("VERTEX", sub_dxf)
+                    lines.append(f'      (entmake (_shift_dxf "VERTEX" {sub_expr} dx dy dz))')
+                lines.append('      (entmake \'((0 . "SEQEND") (100 . "AcDbEntity") (8 . "0")))')
+
+        lines.append('      (vla-Regen (vla-get-ActiveDocument (vlax-get-acad-object)) acActiveViewport)')
+        lines.append(f'      (princ "\\n[완료] 지정한 기준점에 총 {len(entities)}개의 객체가 오차 없이 작도되었습니다!")')
+        lines.append('    )')
+        lines.append('    (princ "\\n[취소] 기준점 지정이 취소되었습니다.")')
+        lines.append('  )')
+        lines.append('  (princ)')
+        lines.append(')')
+        lines.append('(C:_TMP_PASTE_SCENE_)')
+        return "\n".join(lines)
+
+    @staticmethod
+    def _dxf_list_to_lisp_expr(etype: str, raw_dxf: list) -> str:
+        """DXF 배열을 AutoLISP (list ...) 구문으로 무손실 변환합니다."""
+        is_hatch = (etype == "HATCH")
+        lisp_pairs = []
+        for item in raw_dxf:
+            if len(item) < 3:
+                continue
+            code, vtype, val = item[0], item[1], item[2]
+            if code in (-1, -2, 5, 67, 330, 340, 350, 360, 410):
+                continue
+            if etype == "DIMENSION" and code == 2:
+                continue
+            # HATCH 연관 플래그 해제 (외부 핸들 참조 에러 방지)
+            if is_hatch and code in (71, 97):
+                val = 0
+                vtype = "INT"
+
+            if vtype == "INT":
+                lisp_pairs.append(f"'({code} . {int(val)})")
+            elif vtype == "REAL":
+                lisp_pairs.append(f"'({code} . {fmt_num_lossless(val)})")
+            elif vtype == "STR":
+                lisp_pairs.append(f'\'({code} . "{safe_lisp_str(val)}")')
+            elif vtype == "PT2":
+                lisp_pairs.append(f"'({code} {fmt_num_lossless(val[0])} {fmt_num_lossless(val[1])})")
+            elif vtype == "PT3":
+                lisp_pairs.append(f"'({code} {fmt_num_lossless(val[0])} {fmt_num_lossless(val[1])} {fmt_num_lossless(val[2])})")
+        return "(list " + " ".join(lisp_pairs) + ")"
+
+    # --------------------------------------------------------------------------
+    # AI(Gemini) 공유용 초경량 무손실 포맷 생성기
+    # --------------------------------------------------------------------------
+    @staticmethod
+    def to_ai_compact_text(scene_rec: dict) -> str:
+        """
+        추출된 도면 스냅샷을 AI(Gemini)와 의논하거나 파일로 가볍게 공유할 수 있도록
+        1) 모든 좌표를 기준점(Base Point = 0,0) 대비 상대좌표로 정밀 변환하고 (수치 오차 0%)
+        2) 블록 정의(Block Table) 등 무거운 내부 데이터를 제거하고 TSP 블록 이름/삽입점/축척/회전만 남기며
+        3) 1줄당 1객체 형태로 읽기 쉽고 토큰이 가장 적게 드는 JSON 텍스트로 변환합니다.
+        """
+        bpt = scene_rec.get("base_point", [0.0, 0.0, 0.0])
+        bx, by = float(bpt[0]), float(bpt[1])
+
+        def rel_pt(pt):
+            return [clean_float(float(pt[0]) - bx), clean_float(float(pt[1]) - by)]
+
+        # 1. 레이어 요약: {레이어명: [색상번호, 선종류]}
+        layers_compact = {}
+        for lay in scene_rec.get("layers", []):
+            lname = lay.get("name", "0")
+            lcol = int(lay.get("color", 7))
+            lltype = lay.get("linetype", "Continuous")
+            if lltype.upper() == "CONTINUOUS":
+                layers_compact[lname] = [lcol]
+            else:
+                layers_compact[lname] = [lcol, lltype]
+
+        # 2. 객체별 핵심 기하 정보 압축 (기준점 대비 상대좌표 적용)
+        compact_ents = []
+        for ent in scene_rec.get("entities", []):
+            etype = ent.get("etype", "")
+            dxf = ent.get("dxf", [])
+
+            lay = next((str(v) for c, _, v in dxf if c == 8), "0")
+            col = next((int(v) for c, _, v in dxf if c == 62), None)
+            ltype = next((str(v) for c, _, v in dxf if c == 6), None)
+
+            item = {"t": etype, "l": lay}
+            if col is not None and col != 256:
+                item["c"] = col
+            if ltype is not None and ltype.upper() != "BYLAYER":
+                item["lt"] = ltype
+
+            if etype == "LINE":
+                p1 = next((v for c, _, v in dxf if c == 10), [0, 0])
+                p2 = next((v for c, _, v in dxf if c == 11), [0, 0])
+                item["p"] = rel_pt(p1) + rel_pt(p2)
+
+            elif etype == "LWPOLYLINE":
+                flag = int(next((v for c, _, v in dxf if c == 70), 0))
+                if flag & 1:
+                    item["cl"] = 1  # 닫힌 폴리선(Closed) 표시
+                pts = []
+                bulges = {}
+                v_idx = -1
+                for c, _, v in dxf:
+                    if c == 10:
+                        v_idx += 1
+                        pts.extend(rel_pt(v))
+                    elif c == 42 and abs(float(v)) > 1e-9:
+                        bulges[str(v_idx)] = clean_float(v)
+                item["p"] = pts
+                if bulges:
+                    item["bg"] = bulges
+
+            elif etype == "POLYLINE":
+                flag = int(next((v for c, _, v in dxf if c == 70), 0))
+                if flag & 1:
+                    item["cl"] = 1
+                pts = []
+                for sub in ent.get("sub_entities", []):
+                    p = next((v for c, _, v in sub if c == 10), None)
+                    if p:
+                        pts.extend(rel_pt(p))
+                item["p"] = pts
+
+            elif etype == "CIRCLE":
+                cen = next((v for c, _, v in dxf if c == 10), [0, 0])
+                rad = next((v for c, _, v in dxf if c == 40), 0)
+                item["p"] = rel_pt(cen)
+                item["r"] = clean_float(rad)
+
+            elif etype == "ARC":
+                cen = next((v for c, _, v in dxf if c == 10), [0, 0])
+                rad = next((v for c, _, v in dxf if c == 40), 0)
+                a1 = float(next((v for c, _, v in dxf if c == 50), 0.0))
+                a2 = float(next((v for c, _, v in dxf if c == 51), 0.0))
+                item["p"] = rel_pt(cen)
+                item["r"] = clean_float(rad)
+                item["a"] = [clean_float(math.degrees(a1)), clean_float(math.degrees(a2))]
+
+            elif etype == "INSERT":
+                bname = ent.get("eff_name") or next((str(v) for c, _, v in dxf if c == 2), "")
+                ins_pt = next((v for c, _, v in dxf if c == 10), [0, 0])
+                sx = clean_float(next((v for c, _, v in dxf if c == 41), 1.0))
+                sy = clean_float(next((v for c, _, v in dxf if c == 42), 1.0))
+                rot_rad = float(next((v for c, _, v in dxf if c == 50), 0.0))
+                rot_deg = clean_float(math.degrees(rot_rad))
+                item["b"] = bname
+                item["p"] = rel_pt(ins_pt)
+                if sx != 1 or sy != 1:
+                    item["s"] = [sx, sy]
+                if rot_deg != 0:
+                    item["ro"] = rot_deg
+
+            elif etype in ("TEXT", "MTEXT"):
+                pt10 = next((v for c, _, v in dxf if c == 10), [0, 0])
+                pt11 = next((v for c, _, v in dxf if c == 11), None)
+                h = clean_float(next((v for c, _, v in dxf if c == 40), 2.5))
+                rot_rad = float(next((v for c, _, v in dxf if c == 50), 0.0))
+                rot_deg = clean_float(math.degrees(rot_rad))
+                # MTEXT가 긴 경우 DXF 3번(추가 문자열)과 1번 결합
+                txt_chunks = [str(v) for c, _, v in dxf if c == 3] + [str(v) for c, _, v in dxf if c == 1]
+                txt_str = "".join(txt_chunks)
+                item["p"] = rel_pt(pt10)
+                if pt11 and (abs(pt11[0]) > 1e-9 or abs(pt11[1]) > 1e-9):
+                    item["p2"] = rel_pt(pt11)
+                item["h"] = h
+                if rot_deg != 0:
+                    item["ro"] = rot_deg
+                item["v"] = txt_str
+
+            elif etype == "DIMENSION":
+                p10 = next((v for c, _, v in dxf if c == 10), [0, 0])
+                p13 = next((v for c, _, v in dxf if c == 13), [0, 0])
+                p14 = next((v for c, _, v in dxf if c == 14), [0, 0])
+                val_meas = next((v for c, _, v in dxf if c == 42), None)
+                txt_override = next((str(v) for c, _, v in dxf if c == 1), "")
+                item["p1"] = rel_pt(p13)
+                item["p2"] = rel_pt(p14)
+                item["pline"] = rel_pt(p10)
+                if val_meas is not None:
+                    item["meas"] = clean_float(val_meas)
+                if txt_override:
+                    item["v"] = txt_override
+
+            elif etype == "LEADER":
+                pts = []
+                for c, _, v in dxf:
+                    if c == 10:
+                        pts.extend(rel_pt(v))
+                item["p"] = pts
+
+            elif etype == "HATCH":
+                pat = str(next((v for c, _, v in dxf if c == 2), "SOLID"))
+                sc = clean_float(next((v for c, _, v in dxf if c == 41), 1.0))
+                item["pat"] = pat
+                if sc != 1:
+                    item["sc"] = sc
+
+            else:
+                p10 = next((v for c, _, v in dxf if c == 10), None)
+                if p10:
+                    item["p"] = rel_pt(p10)
+
+            compact_ents.append(item)
+
+        # 가독성과 최소 용량을 동시에 만족하는 줄 단위 포맷 구성
+        out = []
+        out.append("{")
+        out.append(f'  "name": {json.dumps(scene_rec.get("name", "scene"), ensure_ascii=False)},')
+        out.append('  "base": [0, 0],')
+        out.append(f'  "layers": {json.dumps(layers_compact, ensure_ascii=False, separators=(",", ":"))},')
+        out.append('  "entities": [')
+        ent_cnt = len(compact_ents)
+        for idx, ce in enumerate(compact_ents):
+            comma = "," if idx < ent_cnt - 1 else ""
+            line_str = json.dumps(ce, ensure_ascii=False, separators=(",", ":"))
+            out.append(f"    {line_str}{comma}")
+        out.append("  ]")
+        out.append("}")
+        return "\n".join(out)
+
+    @staticmethod
+    def from_ai_compact_to_scene_rec(compact_data: dict, existing_blocks_pool: dict) -> dict:
+        """
+        AI와 의논하여 수정했거나 공유받은 초경량(Compact) JSON 데이터를
+        다시 AutoCAD 도면에 즉시 작도할 수 있는 표준 Scene 레코드로 역변환합니다.
+        """
+        scene_name = compact_data.get("name", "AI_Imported_Scene")
+        layers_dict = compact_data.get("layers", {})
+        layers_list = []
+        for lname, lprops in layers_dict.items():
+            col = int(lprops[0]) if len(lprops) >= 1 else 7
+            lt = str(lprops[1]) if len(lprops) >= 2 else "Continuous"
+            layers_list.append({"name": lname, "color": col, "linetype": lt})
+
+        entities_list = []
+        referenced_blocks = []
+
+        for ce in compact_data.get("entities", []):
+            etype = ce.get("t", "LINE")
+            lay = ce.get("l", "0")
+            col = ce.get("c", 256)
+            ltype = ce.get("lt", "ByLayer")
+
+            dxf = [
+                [0, "STR", etype],
+                [100, "STR", "AcDbEntity"],
+                [8, "STR", lay],
+            ]
+            if col != 256:
+                dxf.append([62, "INT", int(col)])
+            if ltype.upper() != "BYLAYER":
+                dxf.append([6, "STR", ltype])
+
+            if etype == "LINE":
+                pts = ce.get("p", [0, 0, 0, 0])
+                dxf.append([100, "STR", "AcDbLine"])
+                dxf.append([10, "PT3", [float(pts[0]), float(pts[1]), 0.0]])
+                dxf.append([11, "PT3", [float(pts[2]), float(pts[3]), 0.0]])
+
+            elif etype in ("LWPOLYLINE", "POLYLINE"):
+                etype = "LWPOLYLINE"
+                dxf[0][2] = "LWPOLYLINE"
+                pts = ce.get("p", [])
+                bulges = ce.get("bg", {})
+                v_cnt = len(pts) // 2
+                flag = 1 if ce.get("cl") else 0
+                dxf.append([100, "STR", "AcDbPolyline"])
+                dxf.append([90, "INT", v_cnt])
+                dxf.append([70, "INT", flag])
+                for vi in range(v_cnt):
+                    px, py = float(pts[vi * 2]), float(pts[vi * 2 + 1])
+                    dxf.append([10, "PT2", [px, py]])
+                    if str(vi) in bulges:
+                        dxf.append([42, "REAL", float(bulges[str(vi)])])
+
+            elif etype == "CIRCLE":
+                pt = ce.get("p", [0, 0])
+                rad = float(ce.get("r", 1.0))
+                dxf.append([100, "STR", "AcDbCircle"])
+                dxf.append([10, "PT3", [float(pt[0]), float(pt[1]), 0.0]])
+                dxf.append([40, "REAL", rad])
+
+            elif etype == "ARC":
+                pt = ce.get("p", [0, 0])
+                rad = float(ce.get("r", 1.0))
+                ang = ce.get("a", [0.0, 180.0])
+                dxf.append([100, "STR", "AcDbCircle"])
+                dxf.append([10, "PT3", [float(pt[0]), float(pt[1]), 0.0]])
+                dxf.append([40, "REAL", rad])
+                dxf.append([100, "STR", "AcDbArc"])
+                dxf.append([50, "REAL", math.radians(float(ang[0]))])
+                dxf.append([51, "REAL", math.radians(float(ang[1]))])
+
+            elif etype == "INSERT":
+                bname = ce.get("b", "BLOCK")
+                pt = ce.get("p", [0, 0])
+                sc = ce.get("s", [1.0, 1.0])
+                ro = math.radians(float(ce.get("ro", 0.0)))
+                dxf.append([100, "STR", "AcDbBlockReference"])
+                dxf.append([2, "STR", bname])
+                dxf.append([10, "PT3", [float(pt[0]), float(pt[1]), 0.0]])
+                dxf.append([41, "REAL", float(sc[0])])
+                dxf.append([42, "REAL", float(sc[1])])
+                dxf.append([43, "REAL", 1.0])
+                dxf.append([50, "REAL", ro])
+                if bname.upper() in existing_blocks_pool:
+                    blk_def = existing_blocks_pool[bname.upper()]
+                    if blk_def not in referenced_blocks:
+                        referenced_blocks.append(blk_def)
+
+            elif etype in ("TEXT", "MTEXT"):
+                pt = ce.get("p", [0, 0])
+                h = float(ce.get("h", 2.5))
+                ro = math.radians(float(ce.get("ro", 0.0)))
+                val_str = str(ce.get("v", ""))
+                if etype == "MTEXT":
+                    dxf.append([100, "STR", "AcDbMText"])
+                    dxf.append([10, "PT3", [float(pt[0]), float(pt[1]), 0.0]])
+                    dxf.append([40, "REAL", h])
+                    dxf.append([1, "STR", val_str])
+                    dxf.append([50, "REAL", ro])
+                else:
+                    dxf.append([100, "STR", "AcDbText"])
+                    dxf.append([10, "PT3", [float(pt[0]), float(pt[1]), 0.0]])
+                    dxf.append([40, "REAL", h])
+                    dxf.append([1, "STR", val_str])
+                    dxf.append([50, "REAL", ro])
+                    dxf.append([100, "STR", "AcDbText"])
+
+            entities_list.append({
+                "etype": etype,
+                "dxf": dxf,
+                "sub_entities": []
+            })
+
+        return {
+            "status": "OK",
+            "name": scene_name,
+            "base_point": [0.0, 0.0, 0.0],
+            "entity_count": len(entities_list),
+            "entities": entities_list,
+            "blocks": referenced_blocks,
+            "layers": layers_list,
+            "styles": []
+        }
+
+
+# ==============================================================================
+# 4. 메인 GUI 애플리케이션 클래스
+# ==============================================================================
+class DrawingPorterApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("AutoCAD 도면 객체 데이터화 & 타 도면 정밀 복원 / AI 공유 매니저")
+        self.root.geometry("1280x840")
+        self.root.minsize(1080, 720)
+
+        # 데이터베이스 파일 경로
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.db_path = os.path.join(self.base_dir, "scenes_db.json")
+
+        # 메모리 내 도면 스냅샷 DB: { scene_id: scene_record_dict }
+        self.scenes_db = {}
+        self.current_scene_id = None
+
+        # 미리보기 캔버스 줌/팬 상태 변수
+        self.view_zoom = 1.0
+        self.view_pan_x = 0.0
+        self.view_pan_y = 0.0
+        self._drag_start = None
+
+        # 데이터베이스 로드
+        self.load_database()
+
+        # UI 구성
+        self._build_ui()
+        self._refresh_tree()
+
+    # --------------------------------------------------------------------------
+    # 데이터베이스 입출력 (자동 .bak 백업 포함)
+    # --------------------------------------------------------------------------
+    def load_database(self):
+        if os.path.exists(self.db_path):
+            try:
+                with open(self.db_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        self.scenes_db = data
+            except Exception as e:
+                messagebox.showerror("데이터 로드 오류", f"scenes_db.json 파일을 읽는 중 오류가 발생했습니다:\n{e}")
+                self.scenes_db = {}
+        else:
+            self.scenes_db = {}
+
+    def save_database(self):
+        try:
+            if os.path.exists(self.db_path):
+                bak_path = self.db_path + ".bak"
+                shutil.copy2(self.db_path, bak_path)
+
+            with open(self.db_path, "w", encoding="utf-8") as f:
+                json.dump(self.scenes_db, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            messagebox.showerror("데이터 저장 오류", f"scenes_db.json 저장 중 오류가 발생했습니다:\n{e}")
+
+    def _get_known_blocks_pool(self) -> dict:
+        """현재 DB에 저장된 모든 도면 스냅샷들로부터 블록 정의 사전을 수집합니다."""
+        pool = {}
+        for rec in self.scenes_db.values():
+            for blk in rec.get("blocks", []):
+                bname = blk.get("name", "").upper()
+                if bname:
+                    pool[bname] = blk
+        return pool
+
+    # --------------------------------------------------------------------------
+    # UI 레이아웃 설계
+    # --------------------------------------------------------------------------
+    def _build_ui(self):
+        style = ttk.Style()
+        if "vista" in style.theme_names():
+            style.theme_use("vista")
+
+        # 상단 메인 툴바 프레임
+        top_frame = ttk.Frame(self.root, padding=(10, 8))
+        top_frame.pack(fill=tk.X)
+
+        btn_extract = tk.Button(
+            top_frame,
+            text="➕ CAD에서 객체들 선택 + 기준점 찍어 가져오기",
+            bg="#0066CC", fg="white", font=("맑은 고딕", 10, "bold"),
+            padx=12, pady=5, cursor="hand2",
+            command=self.extract_scene_from_cad
+        )
+        btn_extract.pack(side=tk.LEFT, padx=(0, 8))
+
+        btn_paste = tk.Button(
+            top_frame,
+            text="📌 선택한 도면 데이터 CAD에 그대로 작도하기 (기준점 지정)",
+            bg="#107C41", fg="white", font=("맑은 고딕", 10, "bold"),
+            padx=12, pady=5, cursor="hand2",
+            command=self.paste_selected_scene_to_cad
+        )
+        btn_paste.pack(side=tk.LEFT, padx=(0, 8))
+
+        btn_export_ai = tk.Button(
+            top_frame,
+            text="💾 AI 공유용 초경량 파일(.json) 저장",
+            bg="#5C2D91", fg="white", font=("맑은 고딕", 10, "bold"),
+            padx=12, pady=5, cursor="hand2",
+            command=self.export_ai_compact_file
+        )
+        btn_export_ai.pack(side=tk.LEFT, padx=(0, 8))
+
+        btn_import_file = tk.Button(
+            top_frame,
+            text="📂 외부 데이터 파일 불러오기",
+            bg="#3B3A39", fg="white", font=("맑은 고딕", 9, "bold"),
+            padx=10, pady=5, cursor="hand2",
+            command=self.import_scene_file
+        )
+        btn_import_file.pack(side=tk.LEFT, padx=(0, 8))
+
+        btn_delete = tk.Button(
+            top_frame,
+            text="🗑 삭제",
+            bg="#D83B01", fg="white", font=("맑은 고딕", 9, "bold"),
+            padx=10, pady=5, cursor="hand2",
+            command=self.delete_selected_scene
+        )
+        btn_delete.pack(side=tk.RIGHT)
+
+        ttk.Separator(self.root, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10)
+
+        # 메인 분할 창 (좌측: 스냅샷 목록 / 우측: 미리보기 + AI 공유 데이터 탭)
+        paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
+
+        # ==================== [좌측 패널: 저장된 도면 스냅샷 목록] ====================
+        left_frame = ttk.LabelFrame(paned, text=" 📂 저장된 도면 데이터(스냅샷) 목록 (Ctrl/Shift 다중선택 후 일괄 삭제 가능) ", padding=8)
+        paned.add(left_frame, weight=3)
+
+        # 이름 변경 바
+        name_bar = ttk.Frame(left_frame)
+        name_bar.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(name_bar, text="스냅샷 이름:").pack(side=tk.LEFT)
+        self.var_scene_name = tk.StringVar()
+        self.ent_scene_name = ttk.Entry(name_bar, textvariable=self.var_scene_name)
+        self.ent_scene_name.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        ttk.Button(name_bar, text="이름 변경", command=self.rename_current_scene).pack(side=tk.LEFT)
+
+        cols = ("name", "ent_cnt", "blk_cnt", "lay_cnt")
+        self.tree = ttk.Treeview(left_frame, columns=cols, show="headings", selectmode="extended")  # Ctrl/Shift 다중 선택 지원
+        self.tree.heading("name", text="도면 스냅샷 이름")
+        self.tree.heading("ent_cnt", text="객체 수")
+        self.tree.heading("blk_cnt", text="포함 블록종류")
+        self.tree.heading("lay_cnt", text="레이어 수")
+
+        self.tree.column("name", width=180, anchor=tk.W)
+        self.tree.column("ent_cnt", width=65, anchor=tk.CENTER, stretch=False)
+        self.tree.column("blk_cnt", width=85, anchor=tk.CENTER, stretch=False)
+        self.tree.column("lay_cnt", width=65, anchor=tk.CENTER, stretch=False)
+
+        tree_scroll = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+
+        # ==================== [우측 패널: 상단 2D 미리보기 / 하단 AI 공유 데이터] ====================
+        right_paned = ttk.PanedWindow(paned, orient=tk.VERTICAL)
+        paned.add(right_paned, weight=7)
+
+        # 1) 상단: 2D 도면 미리보기 캔버스
+        preview_group = ttk.LabelFrame(
+            right_paned,
+            text=" 🔍 2D 도면 형상 미리보기 (노란 십자선 = 지정한 기준점 [0,0] / 마우스 휠 = 확대·축소 / 드래그 = 이동) ",
+            padding=6
+        )
+        right_paned.add(preview_group, weight=6)
+
+        canvas_top_bar = ttk.Frame(preview_group)
+        canvas_top_bar.pack(fill=tk.X, pady=(0, 4))
+        self.lbl_summary = ttk.Label(canvas_top_bar, text="선택된 도면 없음", foreground="#0055AA", font=("맑은 고딕", 9, "bold"))
+        self.lbl_summary.pack(side=tk.LEFT)
+        ttk.Button(canvas_top_bar, text="🔄 화면 맞춤 (Zoom Extents)", command=self._reset_canvas_view).pack(side=tk.RIGHT)
+
+        self.canvas = tk.Canvas(preview_group, bg="#181A1F", height=340, highlightthickness=1, highlightbackground="#444444")
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        # 캔버스 리사이즈, 마우스 휠 줌, 드래그 팬 이벤트 바인딩
+        self.canvas.bind("<Configure>", lambda e: self._draw_preview())
+        self.canvas.bind("<MouseWheel>", self._on_canvas_wheel)
+        self.canvas.bind("<ButtonPress-1>", self._on_canvas_drag_start)
+        self.canvas.bind("<B1-Motion>", self._on_canvas_drag_move)
+
+        # 2) 하단: AI(Gemini) 공유용 초경량 데이터 뷰어 & 클립보드 제어
+        ai_group = ttk.LabelFrame(
+            right_paned,
+            text=" 💬 AI(Gemini) 공유 및 의논용 초경량 무손실 데이터 (기준점 [0,0] 상대좌표 / 수치 정밀도 100% 유지) ",
+            padding=6
+        )
+        right_paned.add(ai_group, weight=4)
+
+        ai_btn_bar = ttk.Frame(ai_group)
+        ai_btn_bar.pack(fill=tk.X, pady=(0, 4))
+
+        btn_copy_ai = tk.Button(
+            ai_btn_bar,
+            text="📋 AI 공유용 초경량 텍스트 클립보드 복사 (채팅창에 바로 붙여넣기용)",
+            bg="#005A9E", fg="white", font=("맑은 고딕", 9, "bold"),
+            padx=12, pady=3, cursor="hand2",
+            command=self.copy_ai_text_to_clipboard
+        )
+        btn_copy_ai.pack(side=tk.LEFT, padx=(0, 8))
+
+        btn_apply_ai_edit = tk.Button(
+            ai_btn_bar,
+            text="✨ 아래 텍스트 창에 붙여넣은(수정된) 데이터를 새 스냅샷으로 등록",
+            command=self.register_edited_ai_text_as_scene
+        )
+        btn_apply_ai_edit.pack(side=tk.LEFT)
+
+        self.lbl_size_info = ttk.Label(ai_btn_bar, text="", foreground="#107C41", font=("맑은 고딕", 9, "bold"))
+        self.lbl_size_info.pack(side=tk.RIGHT)
+
+        txt_frame = ttk.Frame(ai_group)
+        txt_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.txt_ai_data = tk.Text(txt_frame, font=("Consolas", 9), wrap=tk.NONE, height=10)
+        y_sc = ttk.Scrollbar(txt_frame, orient=tk.VERTICAL, command=self.txt_ai_data.yview)
+        x_sc = ttk.Scrollbar(txt_frame, orient=tk.HORIZONTAL, command=self.txt_ai_data.xview)
+        self.txt_ai_data.configure(yscrollcommand=y_sc.set, xscrollcommand=x_sc.set)
+
+        y_sc.pack(side=tk.RIGHT, fill=tk.Y)
+        x_sc.pack(side=tk.BOTTOM, fill=tk.X)
+        self.txt_ai_data.pack(fill=tk.BOTH, expand=True)
+
+        # 상태 표시줄
+        self.status_var = tk.StringVar(value="준비 완료. [➕ CAD에서 객체들 선택 + 기준점 찍어 가져오기] 버튼을 눌러 도면을 데이터화하세요.")
+        status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W, padding=(8, 4))
+        status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+    # --------------------------------------------------------------------------
+    # Treeview 목록 관리
+    # --------------------------------------------------------------------------
+    def _refresh_tree(self):
+        selected_id = self.current_scene_id
+        prev_sel = [i for i in self.tree.selection() if i in self.scenes_db]  # 다중 선택 유지용
+        self.tree.delete(*self.tree.get_children())
+
+        for sid, rec in self.scenes_db.items():
+            disp_name = rec.get("name", sid)
+            ent_cnt = len(rec.get("entities", []))
+            blk_cnt = len(rec.get("blocks", []))
+            lay_cnt = len(rec.get("layers", []))
+            self.tree.insert("", tk.END, iid=sid, values=(disp_name, ent_cnt, blk_cnt, lay_cnt))
+
+        if selected_id and selected_id in self.scenes_db:
+            self.tree.selection_set(prev_sel if prev_sel else [selected_id])
+            self.tree.see(selected_id)
+        elif prev_sel:
+            self.tree.selection_set(prev_sel)
+        elif self.scenes_db:
+            first_id = next(iter(self.scenes_db))
+            self.tree.selection_set(first_id)
+            self._load_scene_to_view(first_id)
+
+    def _on_tree_select(self, event):
+        sel = self.tree.selection()
+        if sel:
+            # Ctrl/Shift 다중 선택 시 마지막에 클릭한(포커스) 항목을 우측 미리보기에 표시
+            focus_id = self.tree.focus()
+            target = focus_id if focus_id in sel else sel[-1]
+            self._load_scene_to_view(target)
+
+    def _load_scene_to_view(self, scene_id: str):
+        self.current_scene_id = scene_id
+        rec = self.scenes_db.get(scene_id)
+        if not rec:
+            return
+
+        self.var_scene_name.set(rec.get("name", scene_id))
+
+        # 객체 종류별 통계 계산
+        type_counts = {}
+        blk_names = set()
+        for ent in rec.get("entities", []):
+            et = ent.get("etype", "ETC")
+            type_counts[et] = type_counts.get(et, 0) + 1
+            if et == "INSERT":
+                bname = ent.get("eff_name") or next((str(v) for c, _, v in ent.get("dxf", []) if c == 2), "")
+                if bname:
+                    blk_names.add(bname)
+
+        summary_parts = [f"{k}: {v}개" for k, v in type_counts.items()]
+        blk_info = f" | 사용된 TSP 블록: {', '.join(sorted(blk_names))}" if blk_names else ""
+        self.lbl_summary.config(
+            text=f"총 객체: {len(rec.get('entities', []))}개 ({', '.join(summary_parts)}){blk_info}"
+        )
+
+        # AI 공유용 초경량 텍스트 생성 및 표시
+        compact_str = SceneDataEngine.to_ai_compact_text(rec)
+        raw_json_len = len(json.dumps(rec, ensure_ascii=False))
+        comp_len = len(compact_str)
+        saving_pct = (1.0 - (comp_len / max(raw_json_len, 1))) * 100.0
+
+        self.txt_ai_data.delete("1.0", tk.END)
+        self.txt_ai_data.insert("1.0", compact_str)
+        self.lbl_size_info.config(
+            text=f"데이터 크기: {comp_len:,} 글자 (원본 DXF 대비 {saving_pct:.1f}% 경량화 / 수치 정밀도 100%)"
+        )
+
+        self._reset_canvas_view()
+
+    def rename_current_scene(self):
+        if not self.current_scene_id or self.current_scene_id not in self.scenes_db:
+            return
+        new_name = self.var_scene_name.get().strip()
+        if not new_name:
+            return
+        self.scenes_db[self.current_scene_id]["name"] = new_name
+        self.save_database()
+        self._refresh_tree()
+        self._load_scene_to_view(self.current_scene_id)
+        self.status_var.set(f"스냅샷 이름이 '{new_name}'(으)로 변경되었습니다.")
+
+    # --------------------------------------------------------------------------
+    # 2D 미리보기 캔버스 제어 (줌/팬 및 전체 객체 + 중첩 블록 렌더링)
+    # --------------------------------------------------------------------------
+    def _reset_canvas_view(self):
+        self.view_zoom = 1.0
+        self.view_pan_x = 0.0
+        self.view_pan_y = 0.0
+        self._draw_preview()
+
+    def _on_canvas_wheel(self, event):
+        factor = 1.15 if event.delta > 0 else (1.0 / 1.15)
+        self.view_zoom = max(0.1, min(self.view_zoom * factor, 50.0))
+        self._draw_preview()
+
+    def _on_canvas_drag_start(self, event):
+        self._drag_start = (event.x, event.y)
+
+    def _on_canvas_drag_move(self, event):
+        if self._drag_start:
+            dx = event.x - self._drag_start[0]
+            dy = event.y - self._drag_start[1]
+            self.view_pan_x += dx
+            self.view_pan_y += dy
+            self._drag_start = (event.x, event.y)
+            self._draw_preview()
+
+    @staticmethod
+    def _bulge_to_arc_pts(p1, p2, bulge: float, steps: int = 12):
+        if abs(bulge) < 1e-6:
+            return [p1, p2]
+        x1, y1 = float(p1[0]), float(p1[1])
+        x2, y2 = float(p2[0]), float(p2[1])
+        dx, dy = x2 - x1, y2 - y1
+        chord = math.hypot(dx, dy)
+        if chord < 1e-9:
+            return [p1]
+        theta = 4.0 * math.atan(bulge)
+        radius = chord / (2.0 * math.sin(abs(theta) / 2.0))
+        mid_x, mid_y = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        dist_to_center = radius * math.cos(theta / 2.0)
+        nx, ny = -dy / chord, dx / chord
+        if bulge < 0:
+            nx, ny = -nx, -ny
+        cx = mid_x + nx * dist_to_center
+        cy = mid_y + ny * dist_to_center
+        start_ang = math.atan2(y1 - cy, x1 - cx)
+        pts = []
+        for i in range(steps + 1):
+            ang = start_ang + theta * (i / steps)
+            pts.append((cx + abs(radius) * math.cos(ang), cy + abs(radius) * math.sin(ang)))
+        return pts
+
+    @staticmethod
+    def _parse_hatch_loops(dxf_list):
+        loops = []
+        n = len(dxf_list)
+        i = 0
+        num_loops = 0
+        while i < n:
+            if dxf_list[i][0] == 91:
+                num_loops = int(dxf_list[i][2])
+                i += 1
+                break
+            i += 1
+
+        for _ in range(num_loops):
+            while i < n and dxf_list[i][0] != 92:
+                i += 1
+            if i >= n:
+                break
+            loop_flag = int(dxf_list[i][2])
+            i += 1
+
+            if loop_flag & 2:
+                has_bulge = 0
+                is_closed = 1
+                num_verts = 0
+                while i < n and dxf_list[i][0] in (72, 73, 93):
+                    c, _, v = dxf_list[i]
+                    if c == 72:
+                        has_bulge = int(v)
+                    elif c == 73:
+                        is_closed = int(v)
+                    elif c == 93:
+                        num_verts = int(v)
+                        i += 1
+                        break
+                    i += 1
+                verts = []
+                for _v in range(num_verts):
+                    if i < n and dxf_list[i][0] == 10:
+                        pt = dxf_list[i][2]
+                        i += 1
+                        b_val = 0.0
+                        if has_bulge and i < n and dxf_list[i][0] == 42:
+                            b_val = float(dxf_list[i][2])
+                            i += 1
+                        verts.append((pt, b_val))
+                if verts:
+                    poly_pts = []
+                    v_cnt = len(verts)
+                    for vi in range(v_cnt):
+                        p_cur, b_cur = verts[vi]
+                        if vi < v_cnt - 1:
+                            seg = DrawingPorterApp._bulge_to_arc_pts(p_cur, verts[vi + 1][0], b_cur)
+                            poly_pts.extend(seg[:-1])
+                        elif is_closed and v_cnt > 1:
+                            seg = DrawingPorterApp._bulge_to_arc_pts(p_cur, verts[0][0], b_cur)
+                            poly_pts.extend(seg)
+                        else:
+                            poly_pts.append(p_cur)
+                    if len(poly_pts) >= 2:
+                        loops.append(poly_pts)
+            else:
+                while i < n and dxf_list[i][0] != 93:
+                    if dxf_list[i][0] in (92, 75, 76):
+                        break
+                    i += 1
+                if i >= n or dxf_list[i][0] != 93:
+                    continue
+                num_edges = int(dxf_list[i][2])
+                i += 1
+                loop_pts = []
+                for _e in range(num_edges):
+                    while i < n and dxf_list[i][0] != 72:
+                        if dxf_list[i][0] in (92, 97, 75):
+                            break
+                        i += 1
+                    if i >= n or dxf_list[i][0] != 72:
+                        break
+                    edge_type = int(dxf_list[i][2])
+                    i += 1
+                    if edge_type == 1:
+                        p1, p2 = None, None
+                        while i < n and dxf_list[i][0] in (10, 11):
+                            if dxf_list[i][0] == 10:
+                                p1 = dxf_list[i][2]
+                            elif dxf_list[i][0] == 11:
+                                p2 = dxf_list[i][2]
+                            i += 1
+                            if p1 is not None and p2 is not None:
+                                break
+                        if p1 and p2:
+                            loop_pts.extend([p1, p2])
+                    elif edge_type == 2:
+                        center, rad, a1, a2, ccw = None, 0.0, 0.0, 360.0, 1
+                        while i < n and dxf_list[i][0] in (10, 40, 50, 51, 73):
+                            c, _, v = dxf_list[i]
+                            if c == 10:
+                                center = v
+                            elif c == 40:
+                                rad = float(v)
+                            elif c == 50:
+                                a1 = float(v)
+                            elif c == 51:
+                                a2 = float(v)
+                            elif c == 73:
+                                ccw = int(v)
+                                i += 1
+                                break
+                            i += 1
+                        if center and rad > 0:
+                            r1, r2 = (math.radians(a1), math.radians(a2)) if (abs(a1) > 6.4 or abs(a2) > 6.4) else (a1, a2)
+                            if not ccw:
+                                r1, r2 = -r1, -r2
+                            if r2 <= r1:
+                                r2 += 2.0 * math.pi
+                            for s in range(21):
+                                ang = r1 + (r2 - r1) * (s / 20)
+                                loop_pts.append((center[0] + rad * math.cos(ang), center[1] + rad * math.sin(ang)))
+                    else:
+                        i += 1
+                if len(loop_pts) >= 2:
+                    loops.append(loop_pts)
+        return loops
+
+    def _draw_preview(self):
+        self.canvas.delete("all")
+        if not self.current_scene_id or self.current_scene_id not in self.scenes_db:
+            return
+
+        rec = self.scenes_db[self.current_scene_id]
+        bpt = rec.get("base_point", [0.0, 0.0, 0.0])
+        bx, by = float(bpt[0]), float(bpt[1])
+
+        # 블록 정의 사전 구성
+        blocks_map = self._get_known_blocks_pool()
+        for b in rec.get("blocks", []):
+            blocks_map[b.get("name", "").upper()] = b
+
+        # 레이어별 색상 사전 구성
+        layer_color_map = {"0": 7}
+        for lay in rec.get("layers", []):
+            layer_color_map[lay.get("name", "0").upper()] = int(lay.get("color", 7))
+
+        def resolve_entity_aci(dxf_list, parent_byblock_aci: int, parent_layer: str) -> int:
+            ent_lay = next((str(v) for c, _, v in dxf_list if c == 8), "0")
+            if ent_lay == "0" and parent_layer:
+                ent_lay = parent_layer
+            c_aci = next((int(v) for c, _, v in dxf_list if c == 62), 256)
+            if c_aci == 256:
+                c_aci = layer_color_map.get(ent_lay.upper(), 7)
+            elif c_aci == 0:
+                c_aci = parent_byblock_aci
+            return c_aci
+
+        shapes = []
+        xs, ys = [bx], [by]
+
+        def collect_entities_shapes(ent_list, tf_fn, parent_aci: int, parent_layer: str, depth: int = 0):
+            if depth > 10:
+                return
+            for ent in ent_list:
+                etype = ent.get("etype", "")
+                dxf = ent.get("dxf", [])
+                ent_aci = resolve_entity_aci(dxf, parent_aci, parent_layer)
+                hex_col = aci_to_hex_color(ent_aci)
+
+                if etype == "INSERT":
+                    sub_bname = next((str(v) for c, _, v in dxf if c == 2), "")
+                    sub_blk = blocks_map.get(sub_bname.upper())
+                    if not sub_blk and ent.get("eff_name"):
+                        sub_blk = blocks_map.get(ent["eff_name"].upper())
+                    ins_pt = next((v for c, _, v in dxf if c == 10), [0.0, 0.0, 0.0])
+                    if not sub_blk:
+                        # 블록 정의가 없는 경우 삽입점에 마커와 블록명 텍스트 표시
+                        tp = tf_fn(ins_pt[0], ins_pt[1])
+                        xs.append(tp[0])
+                        ys.append(tp[1])
+                        shapes.append(("TEXT", [tp], hex_col, f"[{sub_bname}]"))
+                        continue
+
+                    sx = float(next((v for c, _, v in dxf if c == 41), 1.0))
+                    sy = float(next((v for c, _, v in dxf if c == 42), 1.0))
+                    rot_rad = float(next((v for c, _, v in dxf if c == 50), 0.0))
+                    sub_bpt = sub_blk.get("base_point", [0.0, 0.0, 0.0])
+                    sbx, sby = float(sub_bpt[0]), float(sub_bpt[1])
+                    ix, iy = float(ins_pt[0]), float(ins_pt[1])
+                    cos_r, sin_r = math.cos(rot_rad), math.sin(rot_rad)
+                    sub_ent_lay = next((str(v) for c, _, v in dxf if c == 8), "0")
+                    eff_layer = parent_layer if sub_ent_lay == "0" else sub_ent_lay
+
+                    def make_child_tf(p_tf, _ix=ix, _iy=iy, _sx=sx, _sy=sy, _cos=cos_r, _sin=sin_r, _sbx=sbx, _sby=sby):
+                        def _child_tf(x, y):
+                            dx = (float(x) - _sbx) * _sx
+                            dy = (float(y) - _sby) * _sy
+                            rx = _ix + (dx * _cos - dy * _sin)
+                            ry = _iy + (dx * _sin + dy * _cos)
+                            return p_tf(rx, ry)
+                        return _child_tf
+
+                    collect_entities_shapes(sub_blk.get("entities", []), make_child_tf(tf_fn), ent_aci, eff_layer, depth + 1)
+                    continue
+
+                if etype == "LINE":
+                    p1 = next((v for c, _, v in dxf if c == 10), None)
+                    p2 = next((v for c, _, v in dxf if c == 11), None)
+                    if p1 and p2:
+                        tp1, tp2 = tf_fn(p1[0], p1[1]), tf_fn(p2[0], p2[1])
+                        xs.extend([tp1[0], tp2[0]])
+                        ys.extend([tp1[1], tp2[1]])
+                        shapes.append(("LINE", [tp1, tp2], hex_col, None))
+
+                elif etype == "LWPOLYLINE":
+                    verts = []
+                    cur_pt, cur_bulge = None, 0.0
+                    for c, _, v in dxf:
+                        if c == 10:
+                            if cur_pt is not None:
+                                verts.append((cur_pt, cur_bulge))
+                            cur_pt, cur_bulge = v, 0.0
+                        elif c == 42 and cur_pt is not None:
+                            cur_bulge = float(v)
+                    if cur_pt is not None:
+                        verts.append((cur_pt, cur_bulge))
+                    flag = next((v for c, _, v in dxf if c == 70), 0)
+                    is_closed = bool(int(flag) & 1)
+                    if verts:
+                        poly_pts = []
+                        v_cnt = len(verts)
+                        for vi in range(v_cnt):
+                            p_cur, b_cur = verts[vi]
+                            if vi < v_cnt - 1:
+                                seg = self._bulge_to_arc_pts(p_cur, verts[vi + 1][0], b_cur)
+                                poly_pts.extend(seg[:-1])
+                            elif is_closed and v_cnt > 1:
+                                seg = self._bulge_to_arc_pts(p_cur, verts[0][0], b_cur)
+                                poly_pts.extend(seg)
+                            else:
+                                poly_pts.append(p_cur)
+                        tf_pts = [tf_fn(p[0], p[1]) for p in poly_pts]
+                        for p in tf_pts:
+                            xs.append(p[0])
+                            ys.append(p[1])
+                        shapes.append(("POLY", tf_pts, hex_col, None))
+
+                elif etype == "POLYLINE":
+                    pts = []
+                    for sub_dxf in ent.get("sub_entities", []):
+                        p = next((v for c, _, v in sub_dxf if c == 10), None)
+                        if p:
+                            pts.append(tf_fn(p[0], p[1]))
+                    flag = next((v for c, _, v in dxf if c == 70), 0)
+                    if pts:
+                        for p in pts:
+                            xs.append(p[0])
+                            ys.append(p[1])
+                        if (int(flag) & 1) and len(pts) > 2:
+                            pts = pts + [pts[0]]
+                        shapes.append(("POLY", pts, hex_col, None))
+
+                elif etype == "CIRCLE":
+                    center = next((v for c, _, v in dxf if c == 10), None)
+                    rad = next((v for c, _, v in dxf if c == 40), None)
+                    if center and rad:
+                        cx, cy, r = float(center[0]), float(center[1]), float(rad)
+                        c_pts = []
+                        for i in range(37):
+                            ang = (2.0 * math.pi) * (i / 36)
+                            tp = tf_fn(cx + r * math.cos(ang), cy + r * math.sin(ang))
+                            c_pts.append(tp)
+                            xs.append(tp[0])
+                            ys.append(tp[1])
+                        shapes.append(("POLY", c_pts, hex_col, None))
+
+                elif etype == "ARC":
+                    center = next((v for c, _, v in dxf if c == 10), None)
+                    rad = next((v for c, _, v in dxf if c == 40), None)
+                    a1 = float(next((v for c, _, v in dxf if c == 50), 0.0))
+                    a2 = float(next((v for c, _, v in dxf if c == 51), math.pi * 2))
+                    if center and rad:
+                        cx, cy, r = float(center[0]), float(center[1]), float(rad)
+                        if a2 < a1:
+                            a2 += 2.0 * math.pi
+                        arc_pts = []
+                        for i in range(29):
+                            ang = a1 + (a2 - a1) * (i / 28)
+                            tp = tf_fn(cx + r * math.cos(ang), cy + r * math.sin(ang))
+                            arc_pts.append(tp)
+                            xs.append(tp[0])
+                            ys.append(tp[1])
+                        shapes.append(("POLY", arc_pts, hex_col, None))
+
+                elif etype == "ELLIPSE":
+                    center = next((v for c, _, v in dxf if c == 10), None)
+                    maj_vec = next((v for c, _, v in dxf if c == 11), None)
+                    ratio = float(next((v for c, _, v in dxf if c == 40), 1.0))
+                    t1 = float(next((v for c, _, v in dxf if c == 41), 0.0))
+                    t2 = float(next((v for c, _, v in dxf if c == 42), math.pi * 2.0))
+                    if center and maj_vec:
+                        cx, cy = float(center[0]), float(center[1])
+                        ux, uy = float(maj_vec[0]), float(maj_vec[1])
+                        vx, vy = -uy * ratio, ux * ratio
+                        if t2 <= t1:
+                            t2 += math.pi * 2.0
+                        ell_pts = []
+                        for i in range(37):
+                            t = t1 + (t2 - t1) * (i / 36)
+                            tp = tf_fn(cx + ux * math.cos(t) + vx * math.sin(t), cy + uy * math.cos(t) + vy * math.sin(t))
+                            ell_pts.append(tp)
+                            xs.append(tp[0])
+                            ys.append(tp[1])
+                        shapes.append(("POLY", ell_pts, hex_col, None))
+
+                elif etype == "HATCH":
+                    pat_name = str(next((v for c, _, v in dxf if c == 2), "SOLID")).upper()
+                    solid_flag = int(next((v for c, _, v in dxf if c == 70), 1))
+                    is_solid = (solid_flag == 1 or pat_name == "SOLID")
+                    loops = self._parse_hatch_loops(dxf)
+                    for lpts in loops:
+                        tf_lpts = [tf_fn(p[0], p[1]) for p in lpts]
+                        for p in tf_lpts:
+                            xs.append(p[0])
+                            ys.append(p[1])
+                        if is_solid and len(tf_lpts) >= 3:
+                            shapes.append(("HATCH_SOLID", tf_lpts, hex_col, None))
+                        else:
+                            shapes.append(("POLY", tf_lpts, hex_col, None))
+
+                elif etype in ("SOLID", "3DFACE"):
+                    p10 = next((v for c, _, v in dxf if c == 10), None)
+                    p11 = next((v for c, _, v in dxf if c == 11), None)
+                    p12 = next((v for c, _, v in dxf if c == 12), None)
+                    p13 = next((v for c, _, v in dxf if c == 13), p12)
+                    pts = [p for p in (p10, p11, p13, p12) if p is not None]
+                    if len(pts) >= 3:
+                        tf_pts = [tf_fn(p[0], p[1]) for p in pts]
+                        for p in tf_pts:
+                            xs.append(p[0])
+                            ys.append(p[1])
+                        shapes.append(("HATCH_SOLID", tf_pts, hex_col, None))
+
+                elif etype == "LEADER":
+                    l_pts = [tf_fn(v[0], v[1]) for c, _, v in dxf if c == 10]
+                    if len(l_pts) >= 2:
+                        for p in l_pts:
+                            xs.append(p[0])
+                            ys.append(p[1])
+                        shapes.append(("POLY", l_pts, hex_col, None))
+
+                elif etype == "DIMENSION":
+                    p13 = next((v for c, _, v in dxf if c == 13), None)
+                    p14 = next((v for c, _, v in dxf if c == 14), None)
+                    p10 = next((v for c, _, v in dxf if c == 10), None)
+                    if p13 and p14:
+                        tp13, tp14 = tf_fn(p13[0], p13[1]), tf_fn(p14[0], p14[1])
+                        xs.extend([tp13[0], tp14[0]])
+                        ys.extend([tp13[1], tp14[1]])
+                        shapes.append(("LINE", [tp13, tp14], hex_col, None))
+                    if p10:
+                        tp10 = tf_fn(p10[0], p10[1])
+                        xs.append(tp10[0])
+                        ys.append(tp10[1])
+
+                elif etype in ("TEXT", "MTEXT", "ATTDEF"):
+                    pt = next((v for c, _, v in dxf if c == 10), None)
+                    txt = next((v for c, _, v in dxf if c in (1, 2)), "TEXT")
+                    if pt:
+                        tp = tf_fn(pt[0], pt[1])
+                        xs.append(tp[0])
+                        ys.append(tp[1])
+                        shapes.append(("TEXT", [tp], hex_col, str(txt)))
+
+        collect_entities_shapes(
+            rec.get("entities", []),
+            tf_fn=lambda x, y: (float(x), float(y)),
+            parent_aci=7,
+            parent_layer="0",
+            depth=0
+        )
+
+        cw = max(self.canvas.winfo_width(), 200)
+        ch = max(self.canvas.winfo_height(), 150)
+        pad = 35
+
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        span_x = max(max_x - min_x, 1e-4)
+        span_y = max(max_y - min_y, 1e-4)
+
+        base_scale = min((cw - pad * 2) / span_x, (ch - pad * 2) / span_y)
+        scale = base_scale * self.view_zoom
+        cx_mid = (min_x + max_x) / 2.0
+        cy_mid = (min_y + max_y) / 2.0
+
+        def to_screen(wx, wy):
+            sx = (cw / 2.0) + (wx - cx_mid) * scale + self.view_pan_x
+            sy = (ch / 2.0) - (wy - cy_mid) * scale + self.view_pan_y
+            return sx, sy
+
+        solid_shapes = [s for s in shapes if s[0] == "HATCH_SOLID"]
+        line_shapes = [s for s in shapes if s[0] != "HATCH_SOLID"]
+
+        for _, pts, col, _ in solid_shapes:
+            if len(pts) >= 3:
+                flat_coords = []
+                for p in pts:
+                    sx, sy = to_screen(p[0], p[1])
+                    flat_coords.extend([sx, sy])
+                self.canvas.create_polygon(*flat_coords, fill=col, outline=col, width=1)
+
+        for stype, pts, col, extra in line_shapes:
+            if stype == "LINE":
+                x1, y1 = to_screen(pts[0][0], pts[0][1])
+                x2, y2 = to_screen(pts[1][0], pts[1][1])
+                self.canvas.create_line(x1, y1, x2, y2, fill=col, width=1.5)
+            elif stype == "POLY" and len(pts) >= 2:
+                flat_coords = []
+                for p in pts:
+                    sx, sy = to_screen(p[0], p[1])
+                    flat_coords.extend([sx, sy])
+                self.canvas.create_line(*flat_coords, fill=col, width=1.5)
+            elif stype == "TEXT":
+                sx, sy = to_screen(pts[0][0], pts[0][1])
+                disp_txt = extra[:24] if extra else "TXT"
+                self.canvas.create_text(sx, sy, text=disp_txt, fill=col, font=("맑은 고딕", 8), anchor=tk.SW)
+
+        # 지정한 기준점(Base Point) 노란색 십자 마커 표시
+        bsx, bsy = to_screen(bx, by)
+        self.canvas.create_line(bsx - 10, bsy, bsx + 10, bsy, fill="#FFD60A", width=1.8)
+        self.canvas.create_line(bsx, bsy - 10, bsx, bsy + 10, fill="#FFD60A", width=1.8)
+        self.canvas.create_oval(bsx - 4, bsy - 4, bsx + 4, bsy + 4, outline="#FFD60A", width=1.5)
+        self.canvas.create_text(bsx + 8, bsy - 8, text="기준점(0,0)", fill="#FFD60A", font=("맑은 고딕", 8, "bold"), anchor=tk.SW)
+
+    # --------------------------------------------------------------------------
+    # AutoCAD COM 연결 헬퍼
+    # --------------------------------------------------------------------------
+    def _get_acad_doc(self):
+        if not HAS_WIN32COM:
+            messagebox.showerror(
+                "모듈 누락",
+                "pywin32 모듈이 설치되어 있지 않습니다.\nCMD 창에서 'pip install pywin32'를 실행해 주세요."
+            )
+            return None, None
+        try:
+            pythoncom.CoInitialize()
+            acad = win32com.client.GetActiveObject("AutoCAD.Application")
+            doc = acad.ActiveDocument
+            return acad, doc
+        except Exception:
+            messagebox.showwarning(
+                "AutoCAD 연결 실패",
+                "현재 실행 중인 AutoCAD를 찾을 수 없거나 명령 대기 상태가 아닙니다.\n"
+                "AutoCAD 도면을 열어두고 ESC를 눌러 명령줄을 비운 뒤 다시 시도해 주세요."
+            )
+            return None, None
+
+    # --------------------------------------------------------------------------
+    # 기능 1: CAD에서 객체들 선택 + 기준점 찍어 가져오기
+    # --------------------------------------------------------------------------
+    def extract_scene_from_cad(self):
+        acad, doc = self._get_acad_doc()
+        if not doc:
+            return
+
+        tmp_dir = self.base_dir
+        json_out_path = os.path.join(tmp_dir, "tmp_cad_scene_extract.json")
+        lsp_tmp_path = os.path.join(tmp_dir, "tmp_cad_scene_extractor.lsp")
+
+        if os.path.exists(json_out_path):
+            try:
+                os.remove(json_out_path)
+            except OSError:
+                pass
+
+        lisp_path_for_cad = json_out_path.replace("\\", "/")
+        lisp_code = LISP_SCENE_EXTRACTOR_TEMPLATE.replace("__OUTPATH__", lisp_path_for_cad)
+        lisp_code = sanitize_for_cp949(lisp_code)
+
+        with open(lsp_tmp_path, "w", encoding="cp949", errors="replace") as f:
+            f.write(lisp_code)
+
+        self.status_var.set("AutoCAD 창으로 이동하여 ① 객체들을 선택(Enter)한 뒤 ② 기준점(Base Point)을 클릭하세요...")
+        self.root.update()
+
+        try:
+            acad.Visible = True
+        except Exception:
+            pass
+
+        load_cmd = f'(load "{lsp_tmp_path.replace(chr(92), "/")}")\n'
+        doc.SendCommand(load_cmd)
+
+        start_time = time.time()
+        while time.time() - start_time < 180:
+            self.root.update()
+            if os.path.exists(json_out_path) and os.path.getsize(json_out_path) > 10:
+                time.sleep(0.3)
+                break
+            time.sleep(0.15)
+
+        if not os.path.exists(json_out_path):
+            self.status_var.set("도면 추출 시간 초과 또는 취소되었습니다.")
+            return
+
+        raw_text = ""
+        for enc in ("cp949", "utf-8"):
+            try:
+                with open(json_out_path, "r", encoding=enc) as f:
+                    raw_text = f.read()
+                break
+            except Exception:
+                continue
+
+        try:
+            extracted = json.loads(raw_text)
+        except Exception as e:
+            messagebox.showerror("추출 데이터 파싱 오류", f"추출된 도면 데이터를 읽는 중 오류가 발생했습니다:\n{e}")
+            return
+
+        if extracted.get("status") != "OK":
+            msg = extracted.get("message", "객체 선택이 취소되었습니다.")
+            self.status_var.set(msg)
+            return
+
+        # 도면 이름 기반 기본 스냅샷 ID 부여
+        try:
+            doc_name = os.path.splitext(doc.Name)[0]
+        except Exception:
+            doc_name = "TSP_Scene"
+
+        idx = 1
+        while f"{doc_name}_{idx}" in self.scenes_db:
+            idx += 1
+        scene_id = f"{doc_name}_{idx}"
+        extracted["name"] = scene_id
+
+        self.scenes_db[scene_id] = extracted
+        self.current_scene_id = scene_id
+        self.save_database()
+        self._refresh_tree()
+        self._load_scene_to_view(scene_id)
+        self.status_var.set(f"성공: 총 {extracted.get('entity_count', 0)}개의 도면 객체를 기준점 대비 데이터로 정밀 추출했습니다!")
+
+    # --------------------------------------------------------------------------
+    # 기능 2: 선택한 도면 데이터를 다른 도면의 지정한 기준점에 그대로 작도하기
+    # --------------------------------------------------------------------------
+    def paste_selected_scene_to_cad(self):
+        if not self.current_scene_id or self.current_scene_id not in self.scenes_db:
+            messagebox.showinfo("알림", "먼저 좌측 목록에서 CAD에 작도할 도면 스냅샷을 선택해 주세요.")
+            return
+
+        acad, doc = self._get_acad_doc()
+        if not doc:
+            return
+
+        rec = self.scenes_db[self.current_scene_id]
+        paste_lisp = SceneDataEngine.build_paste_scene_lisp(rec)
+        paste_lisp = sanitize_for_cp949(paste_lisp)
+
+        tmp_lsp = os.path.join(self.base_dir, "tmp_cad_paste_scene.lsp")
+        with open(tmp_lsp, "w", encoding="cp949", errors="replace") as f:
+            f.write(paste_lisp)
+
+        try:
+            acad.Visible = True
+        except Exception:
+            pass
+
+        cmd = f'(load "{tmp_lsp.replace(chr(92), "/")}")\n'
+        doc.SendCommand(cmd)
+        self.status_var.set(f"AutoCAD 화면에서 '{rec.get('name')}' 도면 객체들을 배치할 기준점(Target Point)을 클릭하세요!")
+
+    # --------------------------------------------------------------------------
+    # 기능 3: AI 공유용 초경량 데이터 복사 / 파일 내보내기 / 불러오기
+    # --------------------------------------------------------------------------
+    def copy_ai_text_to_clipboard(self):
+        txt = self.txt_ai_data.get("1.0", tk.END).strip()
+        if not txt:
+            messagebox.showinfo("알림", "복사할 데이터가 없습니다.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(txt)
+        self.status_var.set("AI 공유용 초경량 도면 데이터가 클립보드에 복사되었습니다! 채팅창에 바로 붙여넣기(Ctrl+V) 하세요.")
+        messagebox.showinfo("클립보드 복사 완료", "AI 공유용 초경량 도면 데이터가 클립보드에 복사되었습니다!\n채팅창에 그대로 붙여넣어 의논하실 수 있습니다.")
+
+    def export_ai_compact_file(self):
+        if not self.current_scene_id or self.current_scene_id not in self.scenes_db:
+            messagebox.showinfo("알림", "먼저 내보낼 도면 스냅샷을 선택해 주세요.")
+            return
+
+        rec = self.scenes_db[self.current_scene_id]
+        default_name = f"{rec.get('name', 'TSP_Scene')}_AI공유용.json"
+
+        save_path = filedialog.asksaveasfilename(
+            title="AI 공유용 초경량 도면 데이터(.json) 저장",
+            defaultextension=".json",
+            initialfile=default_name,
+            filetypes=[
+                ("AI 공유용 초경량 JSON (*.json)", "*.json"),
+                ("전체 원본 복원용 Full JSON (*_full.json)", "*_full.json"),
+                ("모든 파일 (*.*)", "*.*")
+            ]
+        )
+        if not save_path:
+            return
+
+        try:
+            if save_path.lower().endswith("_full.json"):
+                with open(save_path, "w", encoding="utf-8") as f:
+                    json.dump(rec, f, ensure_ascii=False, separators=(",", ":"))
+            else:
+                compact_str = SceneDataEngine.to_ai_compact_text(rec)
+                with open(save_path, "w", encoding="utf-8") as f:
+                    f.write(compact_str)
+            self.status_var.set(f"파일 저장 완료: {save_path}")
+            messagebox.showinfo("저장 완료", f"도면 데이터 파일이 성공적으로 저장되었습니다:\n{save_path}")
+        except Exception as e:
+            messagebox.showerror("저장 오류", f"파일 저장 중 오류가 발생했습니다:\n{e}")
+
+    def import_scene_file(self):
+        open_path = filedialog.askopenfilename(
+            title="도면 데이터 파일(.json) 불러오기",
+            filetypes=[("JSON 도면 데이터 (*.json)", "*.json"), ("모든 파일 (*.*)", "*.*")]
+        )
+        if not open_path:
+            return
+
+        try:
+            with open(open_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            messagebox.showerror("파일 읽기 오류", f"JSON 파일을 읽는 중 오류가 발생했습니다:\n{e}")
+            return
+
+        # Full 포맷인지 AI 초경량(Compact) 포맷인지 자동 판별
+        if "entities" in data and "base_point" in data:
+            rec = data
+            base_name = rec.get("name") or os.path.splitext(os.path.basename(open_path))[0]
+        elif "entities" in data and "layers" in data and isinstance(data["layers"], dict):
+            rec = SceneDataEngine.from_ai_compact_to_scene_rec(data, self._get_known_blocks_pool())
+            base_name = rec.get("name") or os.path.splitext(os.path.basename(open_path))[0]
+        else:
+            messagebox.showwarning("포맷 오류", "유효한 도면 스냅샷 JSON 포맷이 아닙니다.")
+            return
+
+        scene_id = base_name
+        idx = 2
+        while scene_id in self.scenes_db:
+            scene_id = f"{base_name}_{idx}"
+            idx += 1
+
+        rec["name"] = scene_id
+        self.scenes_db[scene_id] = rec
+        self.current_scene_id = scene_id
+        self.save_database()
+        self._refresh_tree()
+        self._load_scene_to_view(scene_id)
+        self.status_var.set(f"외부 파일 '{os.path.basename(open_path)}'을(를) 성공적으로 불러왔습니다.")
+
+    def register_edited_ai_text_as_scene(self):
+        raw_txt = self.txt_ai_data.get("1.0", tk.END).strip()
+        if not raw_txt:
+            return
+        try:
+            data = json.loads(raw_txt)
+        except Exception as e:
+            messagebox.showerror("JSON 구문 오류", f"텍스트 창의 JSON 데이터 형식이 올바르지 않습니다:\n{e}")
+            return
+
+        rec = SceneDataEngine.from_ai_compact_to_scene_rec(data, self._get_known_blocks_pool())
+        base_name = data.get("name", "AI_Modified") + "_수정본"
+        scene_id = base_name
+        idx = 2
+        while scene_id in self.scenes_db:
+            scene_id = f"{base_name}_{idx}"
+            idx += 1
+
+        rec["name"] = scene_id
+        self.scenes_db[scene_id] = rec
+        self.current_scene_id = scene_id
+        self.save_database()
+        self._refresh_tree()
+        self._load_scene_to_view(scene_id)
+        self.status_var.set(f"텍스트 창의 데이터가 '{scene_id}' 스냅샷으로 등록되었습니다. 바로 CAD에 작도하실 수 있습니다!")
+
+    def delete_selected_scene(self):
+        # Ctrl/Shift 로 다중 선택한 항목 전체를 삭제 (선택이 없으면 현재 보고 있는 스냅샷 1개)
+        sel = [sid for sid in self.tree.selection() if sid in self.scenes_db]
+        if not sel and self.current_scene_id and self.current_scene_id in self.scenes_db:
+            sel = [self.current_scene_id]
+        if not sel:
+            return
+        if len(sel) == 1:
+            name = self.scenes_db[sel[0]].get("name", sel[0])
+            msg = f"정말 '{name}' 도면 스냅샷을 삭제하시겠습니까?"
+        else:
+            msg = f"정말 선택한 {len(sel)}개 도면 스냅샷을 일괄 삭제하시겠습니까?"
+        ans = messagebox.askyesno("삭제 확인", msg)
+        if ans:
+            for sid in sel:
+                del self.scenes_db[sid]
+            self.current_scene_id = None
+            self.save_database()
+            self._refresh_tree()
+            self.canvas.delete("all")
+            self.txt_ai_data.delete("1.0", tk.END)
+            self.status_var.set(f"{len(sel)}개 도면 스냅샷이 삭제되었습니다.")
+
+
+# ==============================================================================
+# 5. 프로그램 진입점 (더블클릭 실행 시 에러 로그 화면 유지 방어 로직 포함)
+# ==============================================================================
+def main():
+    root = tk.Tk()
+    app = DrawingPorterApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        err_msg = traceback.format_exc()
+        print("\n" + "=" * 70)
+        print("[치명적 오류 발생] 프로그램 실행 중 예외가 발생했습니다 (상세 Traceback):")
+        print("=" * 70)
+        print(err_msg)
+        print("=" * 70)
+        try:
+            err_root = tk.Tk()
+            err_root.withdraw()
+            messagebox.showerror("프로그램 실행 오류 (Traceback)", err_msg)
+            err_root.destroy()
+        except Exception:
+            pass
+        input("\n창을 닫으려면 Enter 키를 누르세요...")

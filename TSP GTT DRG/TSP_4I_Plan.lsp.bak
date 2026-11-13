@@ -1,0 +1,1473 @@
+;;; ==========================================================================
+;;; 파일명: TSP_4I_Plan.lsp
+;;; 구  분: 평면도 벽체(H-Pile/CIP/띠장/그라우팅), 사보강재 및 번호표 작도 (Part I)
+;;; 역  할: 평면 띠장 오프셋/상향, H-Pile/토류판 배치, 사보강재/화타쐐기, 차수그라우팅, 연속 CIP 평면 배열, 세그먼트/모서리 번호표 및 수동말뚝 삭제 [tsp-draw-cip-plan-per-segment, draw-bracket-poly, tsp-update-gap]
+;;; 포함 함수: tsp-draw-cip-plan-per-segment, draw-bracket-poly, tsp-update-gap
+;;; --------------------------------------------------------------------------
+;;; [안내] 이 파일은 TSP.lsp(메인 로더)에 의해 자동으로 로드되는 하위 모듈입니다.
+;;;        코드 수정 시 전체 파일을 합칠 필요 없이 이 파일만 단독 패치하면 됩니다.
+;;; ==========================================================================
+
+;;;;==========================================================================
+;;;; defun tsp-safe-vla-offset : vla-offset 안전 래퍼 (실패 시 nil 반환 - 작도 중단 방지)
+(defun tsp-safe-vla-offset (obj d / r)
+  (setq r (vl-catch-all-apply 'vla-offset (list obj d)))
+  (if (vl-catch-all-error-p r) nil (vlax-safearray-get-element (vlax-variant-value r) 0))
+)
+
+;;;; defun tsp-draw-cip-plan-per-segment : 세그먼트별 연속 CIP 작도 및 브래킷 통합
+;;;;==========================================================================
+(defun tsp-draw-cip-plan-per-segment (boundary-ent boundary-orient / corner-pts corner-dists corner-info-list d-on-path exact-corner-pt pt-on-path p-start p-end d-from-start d-from-end is-full-chain is-closed orig-vertices n-verts max-segs seg-idx seg-data seg-wall-type chain-pts j next-data next-type stop-chain end-pt save-dia save-mode save-overlap save-interval save-hpile-idx temp-pl vla-pl test-pt vla-offset-list vla-path d wall-dist out-norm hpile-vals h b cip-ctc max-path-len num-verts k dist-start dist-end start-d end-d effective-len num-intervals actual-dist i curr-dist curr-pt param deriv ang interval hpile-block ins-pt hpile-rot seg-hpile-count doc mspace br-layer br-color num-dia num-h num-b h-scale err-catch p-start-center p-end-center p1 p2 p3 p4 br-pl hatch-obj sa save-equal-divide save-grouting grouting-dia old-offsetgap p-orig-start p-path-0 p-path-1 ang-b-start dist-a-start ang-a-start path-origin-dist p-orig-end end-param p-path-last p-path-prev ang-b-end dist-a-end ang-a-end end-shift path-end-dist full-loop sim-dist sim-count prev-sim-dist chain-end-dist d-wrap next-sim err-over err-under num-gaps dist-list d-acc d-raw-list n-dist-raw n-dist last-raw-d total-error raw-pts wrap-d pt adj-indices idx v pt-prev pt-curr dist-prev next-d next-adj curr-adj wrap-dist prev-cip-pt first-cip-pt pt-on-orig orig-param target-k target-index total-counted-in-list v-idx init-val delta max-anchor-L max-anchor-ang max-anchor-free max-anchor-bond has-anchor cip-wale-spec cip-wale-vals cip-wale-h prev-hpile-raw-dist anchor-raw-dist anchor-d-wrap over-dist end-pt-path end-param-path anchor-pt anchor-out-norm cur-brace next-brace next-seg-real-idx dist-to-start dist-to-end brace-blocked chk-last-b-row chk-b-custom chk-b-dist chk-b-h chk-margin cos-val proj-free proj-bond proj-prot pt-base pt-free-end pt-bond-end pt-h1 pt-h2 pt-h3 pt-h4 pt-anchor-start s-item cur-free cur-bond cur-ang cur-L cur-support-list pt-on-orig-anch orig-param-anch target-k-anch target-index-anch cur-vertex-anch next-vertex-anch path-total-len sample-inside-count sample-pt ratio grout-total-len grout-sample-inside-count grout-sample-pt g-test-pt sample-fail-count pt-off pt-orig orig-param-test param-safe orig-deriv orig-tangent expected-offset-norm vec-expect-x vec-expect-y vec-actual-x vec-actual-y dot-prod grout-sample-fail-count chain-seg-indices calc-corner-dists search-d-A wrapped-d auto-grout-mode cip-chain-pts cip-gap-i cip-gap-total cip-gap-p1 cip-gap-p2 cip-gap-mid cip-gap-s cip-gap-y cip-gap-dir cip-gap-near cip-gap-pt cip-gap-ang cip-gap-ptA cip-gap-ptB cip-gap-dA cip-gap-dB tmp-off has-mixed-start has-mixed-end hpile-flags sim-i sim-prev-target-index sim-local-i sim-last-hpile-i sim-cur-interval sim-seg-data sim-interval-idx sim-gap total-cip-items draw-hpile-here)
+  ;; 닫힌 폴리라인 강제 생성
+  (defun draw-bracket-poly (pts layer color / lst ent)
+    (setq lst (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline")
+                    (cons 8 layer) (cons 62 color) (cons 90 (length pts)) '(70 . 1)))
+    (foreach p pts (setq lst (append lst (list (list 10 (car p) (cadr p))))))
+    (setq ent (entmakex lst))
+    (if (not ent)
+      (progn
+        (setq lst (subst (cons 8 (getvar "CLAYER")) (assoc 8 lst) lst))
+        (setq ent (entmakex lst))
+      )
+    )
+    ent
+  )
+
+  ;; COM 객체용 공간 및 레이어 설정 (브래킷용)
+  (setq doc (vla-get-activedocument (vlax-get-acad-object)))
+  (if (= (getvar "CVPORT") 1)
+    (setq mspace (vla-get-paperspace doc))
+    (setq mspace (vla-get-modelspace doc))
+  )
+  (setq br-layer "_브래킷(bracket)")
+  (setq br-color 8)
+  (create-layer-if-not-exists br-layer (itoa br-color))
+
+  (setq is-closed (is-closed-polyline boundary-ent))
+  (setq orig-vertices (mapcar '(lambda (s) (cdr (assoc 'V-START s))) *segment-list*))
+  (setq *tsp-actual-drawn-hpiles* 0)
+  (if (not is-closed)
+    (setq orig-vertices (append orig-vertices (list (cdr (assoc 'V-END (last *segment-list*))))))
+  )
+  (setq n-verts (length orig-vertices))
+  (setq max-segs (if is-closed n-verts (1- n-verts)))
+
+  (setq visited-segs '())
+  (setq seg-idx 0)
+  (while (< seg-idx max-segs)
+    (setq seg-data (nth seg-idx *segment-list*))
+    (setq seg-wall-type (cdr (assoc 'WALL-TYPE seg-data)))
+
+    (if (and (= seg-wall-type "CIP") (cdr (assoc 'IS-DEFINED seg-data)) (not (member seg-idx visited-segs)))
+      (progn
+        ;; 1. 연속된 CIP 세그먼트 찾기 (원형 체인 형성 및 실제 인덱스 보존)
+        (setq chain-pts (list (nth seg-idx orig-vertices)))
+        (setq chain-seg-indices (list seg-idx)) ;; 실제 세그먼트 인덱스를 1:1로 매핑
+        (setq visited-segs (cons seg-idx visited-segs))
+        (setq j (if is-closed (rem (1+ seg-idx) max-segs) (1+ seg-idx)))
+        (setq stop-chain nil)
+
+        (while (and (not stop-chain) (/= j seg-idx) (if is-closed T (< j max-segs)) (not (member j visited-segs)))
+          (setq next-data (nth j *segment-list*))
+          (setq next-type (cdr (assoc 'WALL-TYPE next-data)))
+          (if (and (= next-type "CIP") (cdr (assoc 'IS-DEFINED next-data)))
+            (progn
+              (setq chain-pts (append chain-pts (list (nth j orig-vertices))))
+              (setq chain-seg-indices (append chain-seg-indices (list j)))
+              (setq visited-segs (cons j visited-segs))
+              (setq j (if is-closed (rem (1+ j) max-segs) (1+ j)))
+            )
+            (setq stop-chain T)
+          )
+        )
+        ;; 체인의 마지막 끝점 안전하게 추가
+        (setq end-pt (if (< j n-verts) (nth j orig-vertices) (nth 0 orig-vertices)))
+        (setq chain-pts (append chain-pts (list end-pt)))
+        (setq chain-seg-indices (append chain-seg-indices (list j)))
+
+        ;; 2. 세그먼트 파라미터 로드
+        (setq save-dia *tsp-cip-dia*
+              save-mode *tsp-cip-mode-idx*
+              save-overlap *tsp-cip-overlap*
+              save-equal-divide *tsp-cip-equal-divide*
+              save-interval *tsp-cip-interval-idx*
+              save-anchor-n *tsp-cip-anchor-n*
+              save-hpile-idx *tsp-cip-hpile-idx*
+              save-grouting *tsp-cip-grouting-idx*)
+        (setq *tsp-cip-dia* (cdr (assoc 'CIP-DIA seg-data)))
+        (setq *tsp-cip-mode-idx* (cdr (assoc 'CIP-MODE-IDX seg-data)))
+        (setq *tsp-cip-overlap* (cdr (assoc 'CIP-OVERLAP seg-data)))
+        (setq *tsp-cip-equal-divide* (if (assoc 'CIP-EQUAL-DIVIDE seg-data) (cdr (assoc 'CIP-EQUAL-DIVIDE seg-data)) "0"))
+        (setq *tsp-cip-interval-idx* (cdr (assoc 'CIP-INTERVAL-IDX seg-data)))
+        (setq *tsp-cip-anchor-n*
+          (if (assoc 'CIP-ANCHOR-N seg-data)
+            (cdr (assoc 'CIP-ANCHOR-N seg-data))
+            (itoa (1+ (atoi (if *tsp-cip-interval-idx* *tsp-cip-interval-idx* "2"))))
+          )
+        )
+        (setq *tsp-cip-hpile-idx* (cdr (assoc 'CIP-HPILE-IDX seg-data)))
+        (setq *tsp-cip-grouting-idx* (cdr (assoc 'CIP-GROUTING-IDX seg-data)))
+        (setq grouting-dia (if (= *tsp-cip-grouting-idx* "1") 600.0 200.0))
+
+        (setq d (atof *tsp-cip-dia*))
+        (setq wall-dist (/ d 2.0))
+        (setq cip-ctc (if (= *tsp-cip-mode-idx* "0") d (- d (atof *tsp-cip-overlap*))))
+        (setq hpile-vals (parse-h-spec (nth (atoi *tsp-cip-hpile-idx*) *tsp-std-wall-list*)))
+        (setq h (nth 0 hpile-vals) b (nth 1 hpile-vals))
+        (setq hpile-block (create-hpile-section-block h b (nth 2 hpile-vals) (nth 3 hpile-vals)))
+        (setq interval (cond ((= *tsp-cip-interval-idx* "1") 2) ((= *tsp-cip-interval-idx* "2") 3) (t 1)))
+
+        ;; 3. 임시 연속 폴리선 생성 및 오프셋
+        (setq is-full-chain (and is-closed (> (length chain-pts) 1) (< (distance (car chain-pts) (last chain-pts)) 0.001)))
+        (if is-full-chain
+          (setq chain-pts (reverse (cdr (reverse chain-pts))))
+        )
+        (setq geo-path-pts (tsp-geo-augment-chain boundary-ent chain-pts))
+        (if (or (null geo-path-pts) (< (length geo-path-pts) 2)) (setq geo-path-pts chain-pts))
+        (setq temp-pl (entmakex (append (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline")
+                                              (cons 90 (length geo-path-pts)) (cons 70 (if is-full-chain 1 0)))
+                                        (mapcar '(lambda (p) (list 10 (car p) (cadr p))) geo-path-pts))))
+        (setq vla-pl (if temp-pl (vl-catch-all-apply 'vlax-ename->vla-object (list temp-pl)) nil))
+        (if (vl-catch-all-error-p vla-pl) (setq vla-pl nil))
+
+(setq in-norm (+ (angle (nth 0 chain-pts) (nth 1 chain-pts)) (* boundary-orient (/ pi 2.0))))
+(setq earth-dir (+ in-norm pi)) ; 완벽한 바깥쪽(흙 배면) 벡터
+
+(setq old-offsetgap (getvar "OFFSETGAPTYPE"))
+(setvar "OFFSETGAPTYPE" 1) ; 모서리 라운딩(Arc) 복원
+
+;; 기본적으로 마이너스(-wall-dist) 방향이 바깥쪽을 향함 (기존 로직 기준)
+(setq vla-offset-list (vl-catch-all-apply 'vla-offset (list vla-pl (- wall-dist))))
+(if (not (vl-catch-all-error-p vla-offset-list))
+  (progn
+    (setq vla-path (vlax-safearray-get-element (vlax-variant-value vla-offset-list) 0))
+
+    ;; [방향 검증] 내적(Dot Product)을 이용한 100% 확실한 안팎 판정 로직
+    (setq pt-orig (vlax-curve-getPointAtParam vla-pl 0.5))
+    (setq pt-off (vlax-curve-getClosestPointTo vla-path pt-orig))
+    (if (and pt-orig pt-off)
+      (progn
+        (setq vec-expect-x (cos earth-dir))
+        (setq vec-expect-y (sin earth-dir))
+        (setq vec-actual-x (- (car pt-off) (car pt-orig)))
+        (setq vec-actual-y (- (cadr pt-off) (cadr pt-orig)))
+        (setq dot-prod (+ (* vec-actual-x vec-expect-x) (* vec-actual-y vec-expect-y)))
+
+        ;; 내적값이 0보다 작으면 안쪽(굴착면)으로 파고든 것이므로 강제로 뒤집어서 생성
+        (if (< dot-prod 0.0)
+          (progn
+            (setq tmp-off (tsp-safe-vla-offset vla-pl wall-dist))
+            (if tmp-off
+              (progn
+                (princ "\n[경고] CIP 오프셋 재생성 실패 - 기존 오프셋 경로로 대체합니다.")
+                (vla-delete vla-path)
+                (setq vla-path tmp-off)
+              )
+            )
+          )
+        )
+      )
+    )
+
+    (setvar "OFFSETGAPTYPE" old-offsetgap)
+
+    ;; [1. 코너 선탐색 및 강제 삽입점 산출 (Arc 정점 및 중간 절점 국소 접선 완벽 대응)]
+    (setq corner-dists '() corner-info-list '() corner-pts '()) ;; corner-pts 초기화 추가
+    (setq num-chain (length chain-pts))
+    (setq pl-total-len (if vla-pl (vlax-curve-getDistAtParam vla-pl (vlax-curve-getEndParam vla-pl)) 0.0))
+    (setq path-max-len- tmp-off)
+    (setq path-max-len (vlax-curve-getDistAtParam vla-path (vlax-curve-getEndParam vla-path)))
+    (setq k 0)
+    (while (< k num-chain)
+      (setq v-curr (nth k chain-pts))
+      (if is-full-chain
+        (progn
+          (setq v-prev (if (> k 0) (nth (1- k) chain-pts) (last chain-pts)))
+          (setq v-next (if (< k (1- num-chain)) (nth (1+ k) chain-pts) (car chain-pts)))
+        )
+        (progn
+          (setq v-prev (if (> k 0) (nth (1- k) chain-pts) nil))
+          (setq v-next (if (< k (1- num-chain)) (nth (1+ k) chain-pts) nil))
+        )
+      )
+      ;; [패치] 세그먼트 내부에 자동삭제된 중간 꺾임점이 있는 경우, 현(chain-pts)이 아닌
+      ;; 실제 경계선 폴리선(vla-pl)의 코너 전후 10mm 지점을 사용하여 국소 접선/법선 오차(4.21mm 등)를 원천 차단합니다.
+      (if (and vla-pl (> pl-total-len 1.0))
+        (progn
+          (setq cp-pl (vlax-curve-getClosestPointTo vla-pl v-curr))
+          (setq d-pl (if cp-pl (vlax-curve-getDistAtPoint vla-pl cp-pl) nil))
+          (if d-pl
+            (progn
+              (if v-prev
+                (progn
+                  (setq d-prev-pl (- d-pl 10.0))
+                  (if is-full-chain
+                    (while (< d-prev-pl 0.0) (setq d-prev-pl (+ d-prev-pl pl-total-len)))
+                    (setq d-prev-pl (max 0.0 d-prev-pl))
+                  )
+                  (setq p-prev-pl (vlax-curve-getPointAtDist vla-pl d-prev-pl))
+                  (if (and p-prev-pl (> (distance p-prev-pl v-curr) 0.1))
+                    (setq v-prev (list (car p-prev-pl) (cadr p-prev-pl) 0.0))
+                  )
+                )
+              )
+              (if v-next
+                (progn
+                  (setq d-next-pl (+ d-pl 10.0))
+                  (if is-full-chain
+                    (while (>= d-next-pl pl-total-len) (setq d-next-pl (- d-next-pl pl-total-len)))
+                    (setq d-next-pl (min pl-total-len d-next-pl))
+                  )
+                  (setq p-next-pl (vlax-curve-getPointAtDist vla-pl d-next-pl))
+                  (if (and p-next-pl (> (distance v-curr p-next-pl) 0.1))
+                    (setq v-next (list (car p-next-pl) (cadr p-next-pl) 0.0))
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+
+      (setq corner-geom-dir nil)
+      (setq hpile-earth-dir nil)
+
+      (if (and v-prev v-next)
+        (progn
+          (setq n1 (+ (angle v-prev v-curr) (* boundary-orient (/ pi 2.0)) pi))
+          (setq n2 (+ (angle v-curr v-next) (* boundary-orient (/ pi 2.0)) pi))
+
+          ;; 벡터 외적(Cross Product)을 통한 오목/볼록 자동 판별
+          (setq turn-cross (* (sin (- (angle v-curr v-next) (angle v-prev v-curr))) boundary-orient))
+          (setq is-concave (if (< turn-cross -1e-5) T nil))
+
+          (setq p1-s (polar v-prev n1 wall-dist)) (setq p1-e (polar v-curr n1 wall-dist))
+          (setq p2-s (polar v-curr n2 wall-dist)) (setq p2-e (polar v-next n2 wall-dist))
+          (setq p-corner-check (inters p1-s p1-e p2-s p2-e nil))
+          (if (null p-corner-check) (setq p-corner-check (polar v-curr n1 wall-dist)))
+
+          ;; CIP 원 생성을 위한 기하학적 중심 방향
+          (setq corner-geom-dir (angle v-curr p-corner-check))
+          (if (< (distance v-curr p-corner-check) 0.1) (setq corner-geom-dir n1))
+
+          ;; 오목 모서리(배면이 좁아지는 구간)일 경우 H-pile을 이등분선 대신 다음 세그먼트 직교각(n2)에 맞춤
+          (if is-concave
+            (setq hpile-earth-dir n2)
+            (setq hpile-earth-dir corner-geom-dir)
+          )
+        )
+        (progn
+          (if v-next
+            (setq corner-geom-dir (+ (angle v-curr v-next) (* boundary-orient (/ pi 2.0)) pi))
+            (setq corner-geom-dir (+ (angle v-prev v-curr) (* boundary-orient (/ pi 2.0)) pi))
+          )
+          (setq hpile-earth-dir corner-geom-dir)
+        )
+      )
+
+      ;; vla-path(오프셋 경로) 상의 정확한 모서리/라운드 정점 위치 거리 도출
+      (setq exact-corner-pt (polar v-curr corner-geom-dir wall-dist))
+      (setq pt-on-path (vlax-curve-getClosestPointTo vla-path exact-corner-pt))
+      (if pt-on-path
+        (progn
+          (setq d-on-path (vlax-curve-getDistAtPoint vla-path pt-on-path))
+          (if d-on-path
+            (progn
+              ;; [패치] CIP 체인의 시작점(k=0) 또는 끝점(k=num-chain-1)이 H-Pile+토류판 세그먼트와
+              ;; 만나는 이종 벽체 접합 모서리인지 판별합니다.
+              (setq is-mixed-hpile-corner nil)
+              (if (not is-full-chain)
+                (progn
+                  (setq B-val (if (= (type b) 'STR) (atof b) b))
+                  (if (= k 0)
+                    (progn
+                      (setq first-seg-idx (car chain-seg-indices))
+                      (setq prev-seg-idx (if is-closed (if (= first-seg-idx 0) (1- max-segs) (1- first-seg-idx)) (1- first-seg-idx)))
+                      (if (and (>= prev-seg-idx 0)
+                               (cdr (assoc 'IS-DEFINED (nth prev-seg-idx *segment-list*)))
+                               (/= (cdr (assoc 'WALL-TYPE (nth prev-seg-idx *segment-list*))) "CIP"))
+                        (setq is-mixed-hpile-corner T)
+                        (setq d-on-path (+ d-on-path (/ B-val 2.0)))
+                      )
+                    )
+                  )
+                  (if (= k (1- num-chain))
+                    (progn
+                      (setq end-seg-idx (last chain-seg-indices))
+                      (if (and (< end-seg-idx max-segs)
+                               (cdr (assoc 'IS-DEFINED (nth end-seg-idx *segment-list*)))
+                               (/= (cdr (assoc 'WALL-TYPE (nth end-seg-idx *segment-list*))) "CIP"))
+                        (setq is-mixed-hpile-corner T)
+                        (setq d-on-path (- d-on-path (/ B-val 2.0)))
+                      )
+                    )
+                  )
+                  ;; 변경된 거리로 삽입점 좌표 갱신 (추후 간섭 체크 등을 위해 정확한 위치 보존)
+                  (setq pt-on-path (vlax-curve-getPointAtDist vla-path d-on-path))
+                )
+              )
+              (setq corner-dists (append corner-dists (list d-on-path)))
+
+              ;; H-pile 배치 기준 방향(hpile-earth-dir) 및 이종 벽체 모서리 플래그(is-mixed-hpile-corner)를 리스트에 저장
+              (setq corner-info-list (append corner-info-list (list (list d-on-path hpile-earth-dir k is-mixed-hpile-corner))))
+            )
+          )
+          (setq corner-pts (append corner-pts (list (list pt-on-path))))
+        )
+        (setq corner-pts (append corner-pts (list (list exact-corner-pt))))
+      )
+      (setq k (1+ k))
+    )
+
+    (setq corner-dists (vl-sort corner-dists '<))
+    (setq max-path-len (vlax-curve-getdistatparam vla-path (vlax-curve-getendparam vla-path)))
+    (setq full-loop is-full-chain)
+
+    ;; [2. 직선구간 겹침(Overlap) 양끝 공유 분배 알고리즘]
+    (setq cip-layout-items '())
+
+    ;; 코너 선배치 (단, H-Pile+토류판과 만나는 이종 모서리는 4C에서 단독 H-Pile을 모서리에 그리므로
+    ;; CIP 모듈에서는 모서리 CIP/H-Pile을 생략하고 세그먼트 카운트만 +1 보정함)
+    (foreach c-info corner-info-list
+      (setq d-on-path (car c-info))
+      (setq corner-earth-dir (cadr c-info))
+      (setq target-k (caddr c-info))
+      (setq is-mixed-c (nth 3 c-info))
+      (if (not full-loop)
+        (if (>= target-k (1- num-chain)) (setq target-k (- num-chain 2)))
+      )
+      (if is-mixed-c
+        ;; 시작점(k=0)이 H-Pile 세그먼트와 만나는 경우, draw-corner-numbers의 CIP 시작점 -1 차감과
+        ;; 정합성을 맞추기 위해 해당 CIP 세그먼트 카운트를 +1 보상합니다.
+        (if (= (caddr c-info) 0)
+          (progn
+            (setq m-seg-idx (nth target-k chain-seg-indices))
+            (if m-seg-idx
+              (setq *tsp-segment-pile-counts*
+                (update-list-item *tsp-segment-pile-counts* m-seg-idx
+                  (1+ (if (nth m-seg-idx *tsp-segment-pile-counts*) (nth m-seg-idx *tsp-segment-pile-counts*) 0))))
+            )
+          )
+        )
+        (progn
+          (setq pt (vlax-curve-getPointAtDist vla-path d-on-path))
+          (if pt
+            (setq cip-layout-items (append cip-layout-items (list (list pt T corner-earth-dir target-k d-on-path))))
+          )
+        )
+      )
+    )
+
+    ;; 폐합선일 경우, 1번 세그먼트(마지막 코너->첫 코너) 누락을 막기 위해 가상의 순환 거리를 삽입
+    (setq calc-corner-dists corner-dists)
+    (if full-loop
+      (setq calc-corner-dists (append calc-corner-dists (list (+ (car corner-dists) max-path-len))))
+    )
+
+    ;; 직선 구간 분배
+    (setq d-idx 0)
+    (while (< d-idx (1- (length calc-corner-dists)))
+      (setq d-A (nth d-idx calc-corner-dists))
+      (setq d-B (nth (1+ d-idx) calc-corner-dists))
+      (setq L-seg (- d-B d-A))
+
+      (setq target-k 0)
+      (setq search-d-A (if (>= d-A max-path-len) (- d-A max-path-len) d-A))
+      (foreach c-info corner-info-list
+        (if (equal (car c-info) search-d-A 0.01) (setq target-k (caddr c-info)))
+      )
+      (if (not full-loop)
+        (if (>= target-k (1- num-chain)) (setq target-k (- num-chain 2)))
+      )
+
+      (if (> L-seg 0.01)
+        (progn
+          ;; [1] 동적 한계 피치 계산을 위한 H-Pile 제원 파싱
+          (setq H-val (if (= (type h) 'STR) (atof h) h))
+          (setq B-val (if (= (type b) 'STR) (atof b) b))
+          (setq tf-raw (nth 3 hpile-vals))
+          (setq tf-val (if (= (type tf-raw) 'STR) (atof tf-raw) tf-raw))
+
+                    ;; [2] 직선부 최소 피치 방정식 해 (H-Pile 플랜지 간섭 한계 + 나선철근 0.1D 옵셋 한계 동시 반영)
+          ;; - H-Pile이 없는 빈 CIP공에도 나선철근(직경의 1/10 옵셋)이 들어가므로
+          ;;   일반 구간의 최소 허용 간격은 (- cip-ctc (* 0.1 d)) 이상이어야 함 (맞닿음 시 0.9D, 겹침 모드 시 기존 겹침 + 0.1D)
+          (setq min-hpile-flange (+ (/ B-val 2.0) (sqrt (abs (- (* wall-dist wall-dist) (expt (- (/ H-val 2.0) tf-val) 2.0))))))
+          (setq min-spiral-cage (max (* 0.1 d) (- cip-ctc (* 0.1 d))))
+          (setq min-straight (max min-hpile-flange min-spiral-cage))
+
+          ;; [2-1] 이종 벽체(H-Pile+토류판 <-> CIP) 모서리의 단독 H-Pile(경계선 기준 배치)과
+          ;;       그 옆 첫 번째 비어있는 CIP 원이 겹치지 않는 외접 한계 피치 (예: H300, D500 -> 397.5379mm)
+          ;;       단, 이종 모서리를 제외한 일반 코너/직선부는 min-straight(0.9D 등) 한계를 기본 보장함
+          (setq min-mixed-corner (+ (/ B-val 2.0) (sqrt (max 0.0 (- (* wall-dist wall-dist) (expt (- H-val wall-dist tf-val) 2.0))))))
+
+          ;; [3] 코너부 최소 피치 계산을 위한 접점 탐색기
+          (setq search-d-B (if (>= d-B max-path-len) (- d-B max-path-len) d-B))
+          (setq start-corner-info nil end-corner-info nil)
+          (foreach c-info corner-info-list
+            (if (equal (car c-info) search-d-A 0.01) (setq start-corner-info c-info))
+            (if (equal (car c-info) search-d-B 0.01) (setq end-corner-info c-info))
+          )
+
+          ;; 모서리부 H-Pile 간섭 회피를 위한 실제 곡선(Arc) 경로 탐색 알고리즘
+          (defun calc-corner-limit (c-info is-start / c-earth c-inward c-perp c-pt c1x c1y c2x c2y target-k-val d-base search-dir low high mid iter test-d wrap-d pt-test dist1 dist2)
+            (if c-info
+              (progn
+                (setq target-k-val (caddr c-info))
+                (if (and (not is-full-chain) (or (= target-k-val 0) (= target-k-val (1- num-chain))))
+                  (if (nth 3 c-info) min-mixed-corner min-straight)
+                  (progn
+                    (setq c-earth (cadr c-info) c-inward (+ c-earth pi) c-perp (+ c-inward (/ pi 2.0)))
+
+                    ;; 해당 코너 CIP의 실제 중심점 추출
+                    (setq c-pt (vlax-curve-getPointAtDist vla-path (car c-info)))
+
+                    ;; H-Pile 아래 플랜지 바닥면 양쪽 꼭지점의 절대 좌표 계산
+                    (setq c1x (+ (car c-pt) (* (/ H-val 2.0) (cos c-inward)) (* (/ B-val 2.0) (cos c-perp))))
+                    (setq c1y (+ (cadr c-pt) (* (/ H-val 2.0) (sin c-inward)) (* (/ B-val 2.0) (sin c-perp))))
+                    (setq c2x (+ (car c-pt) (* (/ H-val 2.0) (cos c-inward)) (* (- (/ B-val 2.0)) (cos c-perp))))
+                    (setq c2y (+ (cadr c-pt) (* (/ H-val 2.0) (sin c-inward)) (* (- (/ B-val 2.0)) (sin c-perp))))
+
+                    ;; 이분법(Bisection)을 통해 vla-path 곡선을 따라가며 간섭 없는 최소 경로 거리 탐색
+                    (setq d-base (car c-info))
+                    (setq search-dir (if is-start 1.0 -1.0))
+                    (setq low 0.0 high 1500.0) ;; 최대 1.5m 탐색
+                    (setq iter 0)
+                    (while (< iter 50)
+                      (setq mid (/ (+ low high) 2.0))
+                      (setq test-d (+ d-base (* search-dir mid)))
+
+                      ;; 폐합선 보정
+                      (setq wrap-d test-d)
+                      (if (and full-loop (>= wrap-d max-path-len)) (setq wrap-d (- wrap-d max-path-len)))
+                      (if (and full-loop (< wrap-d 0.0)) (setq wrap-d (+ wrap-d max-path-len)))
+                      (if (> wrap-d max-path-len) (setq wrap-d max-path-len))
+                      (if (< wrap-d 0.0) (setq wrap-d 0.0))
+
+                      (setq pt-test (vlax-curve-getPointAtDist vla-path wrap-d))
+                      (if pt-test
+                        (progn
+                          (setq dist1 (distance pt-test (list c1x c1y 0.0)))
+                          (setq dist2 (distance pt-test (list c2x c2y 0.0)))
+                          ;; 둘 중 하나라도 반경(wall-dist) 이내로 들어오면 겹침 발생
+                          (if (< (min dist1 dist2) wall-dist)
+                            (setq low mid)  ;; 간섭 발생 -> 거리를 더 벌려야 함
+                            (setq high mid) ;; 간섭 없음 -> 더 가깝게 붙여봄
+                          )
+                        )
+                        (setq high mid) ;; 에러 방어
+                      )
+                      (setq iter (1+ iter))
+                    )
+                    ;; 코너 회전 H-Pile 간섭 한계(high)가 0.9D(min-straight)보다 작더라도,
+                    ;; 나선철근 간섭 방지를 위해 최소한 min-straight 이상을 유지함 (단, 특수 코너로 high > min-straight 이면 high 적용)
+                    (max high min-straight)
+                  )
+                )
+              )
+              min-straight
+            )
+          )
+
+          (setq is-mixed-start-seg (and start-corner-info (nth 3 start-corner-info)))
+          (setq is-mixed-end-seg (and end-corner-info (nth 3 end-corner-info)))
+          (setq min-corner-start (calc-corner-limit start-corner-info T))
+          (setq min-corner-end (calc-corner-limit end-corner-info nil))
+
+          ;; [4] 겹침량 연쇄 분배 (Cascading Overlap: 2개 우선 -> 한계 초과 시 3개, 4개... 순차 확장)
+          (defun tsp-update-gap (lst idx val / i res)
+            (setq i 0 res '())
+            (foreach x lst (if (= i idx) (setq res (cons val res)) (setq res (cons x res))) (setq i (1+ i)))
+            (reverse res)
+          )
+
+          ;; 초기 칸 수 산정
+          (setq N-int (fix (+ (/ L-seg cip-ctc) 0.9999)))
+          (if (< N-int 1) (setq N-int 1))
+
+          ;; 갭 리스트 생성 및 총 겹침량(overlap) 계산 루프:
+          ;; - 이종 벽체 모서리(is-mixed-start-seg / is-mixed-end-seg)와 접하는 양단 갭은
+          ;;   모서리 H-Pile과 정확히 외접하는 min-mixed-corner(397.54mm 등)로 고정합니다.
+          ;; - 이때 min-mixed-corner < cip-ctc 이므로 total-gaps가 L-seg보다 짧아지면(overlap < -0.001)
+          ;;   끝단 모서리에 빈틈이 벌어지지 않도록 N-int를 +1 증가시켜 재계산합니다!
+          (setq need-recalc T)
+          (while need-recalc
+            (setq gaps '() m 0)
+            (while (< m N-int)
+              (setq cur-gap cip-ctc)
+              (if (= m 0)
+                (setq cur-gap (if is-mixed-start-seg min-corner-start (max cip-ctc min-corner-start)))
+              )
+              (if (= m (1- N-int))
+                (setq cur-gap (if is-mixed-end-seg min-corner-end (max cur-gap min-corner-end)))
+              )
+              (setq gaps (append gaps (list cur-gap)))
+              (setq m (1+ m))
+            )
+            (setq total-gaps 0.0)
+            (foreach g gaps (setq total-gaps (+ total-gaps g)))
+            (setq overlap (- total-gaps L-seg))
+
+            (cond
+              ((< overlap -0.001)
+               (setq N-int (1+ N-int))
+              )
+              ((and (> N-int 1) (>= overlap (- cip-ctc 0.001)))
+               (setq N-int (1- N-int))
+              )
+              (t
+               (setq need-recalc nil)
+              )
+            )
+          )
+
+          (setq rem-excess overlap)
+
+          ;; [단계별 겹침 분배]
+          (if (> rem-excess 0.001)
+            (progn
+              ;; 1단계: 기본 양끝 2개 갭(0번 및 N-int-1번)에서 최우선 균등/대칭 차감
+              ;; (단, 이종 모서리 외접 갭은 이미 min-corner-start/end로 고정되어 있으므로 max-r1/r2 = 0.0으로 보호됨)
+              (setq max-r1 (max 0.0 (- (nth 0 gaps) min-corner-start)))
+              (setq max-r2 (max 0.0 (- (nth (1- N-int) gaps) min-corner-end)))
+              (if (= 0 (1- N-int))
+                (setq d1 (min rem-excess max-r1) d2 0.0)
+                (progn
+                  (setq req (/ rem-excess 2.0) d1 (min req max-r1) d2 (min req max-r2))
+                  (if (< d1 req) (setq d2 (min (- rem-excess d1) max-r2)))
+                  (if (< d2 req) (setq d1 (min (- rem-excess d2) max-r1)))
+                )
+              )
+              (setq gaps (tsp-update-gap gaps 0 (- (nth 0 gaps) d1)))
+              (if (/= 0 (1- N-int)) (setq gaps (tsp-update-gap gaps (1- N-int) (- (nth (1- N-int) gaps) d2))))
+              (setq rem-excess (- rem-excess d1 d2))
+
+              ;; 2단계: 안쪽 갭을 1개씩 순차 동원하여 겹침 분배
+              (if (and (> rem-excess 0.001) (>= N-int 3))
+                (progn
+                  (setq cand-indices '() step-i 1)
+                  (while (<= step-i (- N-int 1 step-i))
+                    (setq idx-left step-i)
+                    (setq idx-right (- N-int 1 step-i))
+                    (setq cand-indices (append cand-indices (list idx-left)))
+                    (if (/= idx-left idx-right)
+                      (setq cand-indices (append cand-indices (list idx-right)))
+                    )
+                    (setq step-i (1+ step-i))
+                  )
+
+                  (foreach c-idx cand-indices
+                    (if (> rem-excess 0.001)
+                      (progn
+                        (setq max-rc (max 0.0 (- (nth c-idx gaps) min-straight)))
+                        (setq dc (min rem-excess max-rc))
+                        (setq gaps (tsp-update-gap gaps c-idx (- (nth c-idx gaps) dc)))
+                        (setq rem-excess (- rem-excess dc))
+                      )
+                    )
+                  )
+                )
+              )
+
+              ;; 3단계: 극한 예외 상황 폴백 (이종 모서리 인접 양끝 갭은 외접 거리 보존)
+              (if (> rem-excess 0.001)
+                (progn
+                  (setq free-cnt 0 m 0)
+                  (while (< m N-int)
+                    (if (not (or (and (= m 0) is-mixed-start-seg) (and (= m (1- N-int)) is-mixed-end-seg)))
+                      (setq free-cnt (1+ free-cnt))
+                    )
+                    (setq m (1+ m))
+                  )
+                  (if (> free-cnt 0)
+                    (progn
+                      (setq avg-deduct (/ rem-excess free-cnt) m 0 new-gaps '())
+                      (while (< m N-int)
+                        (if (or (and (= m 0) is-mixed-start-seg) (and (= m (1- N-int)) is-mixed-end-seg))
+                          (setq new-gaps (append new-gaps (list (nth m gaps))))
+                          (setq new-gaps (append new-gaps (list (- (nth m gaps) avg-deduct))))
+                        )
+                        (setq m (1+ m))
+                      )
+                      (setq gaps new-gaps)
+                    )
+                  )
+                )
+              )
+            )
+          )
+
+          ;; [5] 최종 산출된 Gap을 바탕으로 좌표 배열 실행
+          (setq cur-d d-A mid-i 0)
+          (while (< mid-i (1- N-int))
+            (setq cur-d (+ cur-d (nth mid-i gaps)))
+            (setq wrapped-d cur-d)
+            (if (and full-loop (>= wrapped-d max-path-len)) (setq wrapped-d (- wrapped-d max-path-len)))
+            (if (> wrapped-d max-path-len) (setq wrapped-d max-path-len))
+
+            (setq pt (vlax-curve-getPointAtDist vla-path wrapped-d))
+            (if pt
+              (progn
+                (setq pt-on-orig (vlax-curve-getClosestPointTo vla-pl pt))
+                (if pt-on-orig
+                  (progn
+                    (setq orig-param (vlax-curve-getParamAtPoint vla-pl pt-on-orig))
+                    (if (null orig-param) (setq orig-param (+ target-k 0.5)))
+                    (setq orig-deriv (vlax-curve-getFirstDeriv vla-pl orig-param))
+                    (setq straight-earth-dir (+ (angle '(0 0 0) orig-deriv) (* boundary-orient (/ pi 2.0)) pi))
+                    (setq cip-layout-items (append cip-layout-items (list (list pt nil straight-earth-dir target-k cur-d))))
+                  )
+                )
+              )
+            )
+            (setq mid-i (1+ mid-i))
+          )
+        )
+      )
+      (setq d-idx (1+ d-idx))
+    )
+
+        (setq cip-layout-items (vl-sort cip-layout-items '(lambda (a b) (< (nth 4 a) (nth 4 b)))))
+
+    ;; [2.5] H-Pile+토류판 세그먼트와 접하는 양끝단 CIP 공의 H-Pile 1칸 이동(Shift) 사전 시뮬레이션
+    ;; - H-Pile+토류판 공법의 모서리 H-Pile 바로 옆 첫 번째(또는 마지막) CIP 공에는 시공상 H-Pile 타설이 불가능하므로 빈 공으로 비워두고,
+    ;;   벽체 지지력 유지를 위해 바로 옆 빈 공에 H-Pile을 삽입합니다. (단, 1공 건너 1개 배치 등으로 이미 옆 공에 H-Pile이 있으면 생략)
+    (setq has-mixed-start nil has-mixed-end nil)
+    (foreach c-info corner-info-list
+      (if (and (= (caddr c-info) 0) (nth 3 c-info))
+        (setq has-mixed-start T)
+      )
+      (if (and (= (caddr c-info) (1- num-chain)) (nth 3 c-info))
+        (setq has-mixed-end T)
+      )
+    )
+
+    ;; 1차 패스: 기존 주기 규칙에 따른 H-Pile 배치 여부(hpile-flags) 사전 산출
+    (setq hpile-flags '())
+    (setq sim-i 0 sim-prev-target-index -1 sim-local-i 0 sim-last-hpile-i -999 sim-cur-interval interval)
+    (foreach cip-item cip-layout-items
+      (setq is-corner (nth 1 cip-item))
+      (setq target-k (nth 3 cip-item))
+      (setq target-index (nth target-k chain-seg-indices))
+      (if (null target-index) (setq target-index seg-idx))
+
+      (if (/= target-index sim-prev-target-index)
+        (progn
+          (setq sim-seg-data (nth target-index *segment-list*))
+          (setq sim-interval-idx (if (assoc 'CIP-INTERVAL-IDX sim-seg-data) (cdr (assoc 'CIP-INTERVAL-IDX sim-seg-data)) *tsp-cip-interval-idx*))
+          (setq sim-cur-interval (cond ((= sim-interval-idx "1") 2) ((= sim-interval-idx "2") 3) (t 1)))
+          (if is-corner
+            (setq sim-local-i 0)
+            (if (/= sim-prev-target-index -1)
+              (progn
+                (setq sim-local-i 0)
+                (setq sim-gap (- sim-i sim-last-hpile-i))
+                (if (< sim-gap sim-cur-interval)
+                  (setq sim-local-i sim-gap)
+                )
+              )
+              (setq sim-local-i 0)
+            )
+          )
+          (setq sim-prev-target-index target-index)
+        )
+      )
+      (if (and is-corner (= target-index sim-prev-target-index))
+        (setq sim-local-i 0)
+      )
+
+      (if (or is-corner (= (rem sim-local-i sim-cur-interval) 0))
+        (progn
+          (setq hpile-flags (append hpile-flags (list T)))
+          (setq sim-last-hpile-i sim-i)
+        )
+        (setq hpile-flags (append hpile-flags (list nil)))
+      )
+      (setq sim-local-i (1+ sim-local-i))
+      (setq sim-i (1+ sim-i))
+    )
+
+    ;; 2차 패스: 시작단(0번 공) 및 끝단(마지막 공)이 H-Pile+토류판 세그먼트와 접할 때 H-Pile을 안쪽 빈 공으로 1칸 이동
+    (setq total-cip-items (length hpile-flags))
+    (if (and has-mixed-start (>= total-cip-items 1) (nth 0 hpile-flags))
+      (progn
+        ;; 첫 번째 CIP 공(0번)은 빈 공으로 변경
+        (setq hpile-flags (tsp-update-gap hpile-flags 0 nil))
+        ;; 바로 옆 두 번째 CIP 공(1번)이 코너가 아니고 비어 있으면 H-Pile 배치 (이미 있으면 생략)
+        (if (and (>= total-cip-items 2)
+                 (not (nth 1 (nth 1 cip-layout-items)))
+                 (not (nth 1 hpile-flags)))
+          (setq hpile-flags (tsp-update-gap hpile-flags 1 T))
+        )
+      )
+    )
+    (if (and has-mixed-end (>= total-cip-items 1) (nth (1- total-cip-items) hpile-flags))
+      (progn
+        ;; 마지막 CIP 공(N-1번)은 빈 공으로 변경
+        (setq hpile-flags (tsp-update-gap hpile-flags (1- total-cip-items) nil))
+        ;; 바로 앞 CIP 공(N-2번)이 코너가 아니고 비어 있으면 H-Pile 배치 (단, 0번 공이 시작단 이종 접합부인 경우는 제외)
+        (if (and (>= total-cip-items 2)
+                 (not (and (= (- total-cip-items 2) 0) has-mixed-start))
+                 (not (nth 1 (nth (- total-cip-items 2) cip-layout-items)))
+                 (not (nth (- total-cip-items 2) hpile-flags)))
+          (setq hpile-flags (tsp-update-gap hpile-flags (- total-cip-items 2) T))
+        )
+      )
+    )
+
+    ;; [3] 통합 작도 실행 루프 (앵커 포함)
+    (setq i 0)
+    (setq cip-center-list '())
+
+    (setq prev-target-index -1)
+    (setq local-i 0 local-anchor-i 0)
+    (setq last-hpile-i -999 last-anchor-i -999)
+    (setq cur-h h cur-b b cur-hpile-block hpile-block)
+
+    (foreach cip-item cip-layout-items
+      (setq curr-pt (nth 0 cip-item))
+      (setq is-corner (nth 1 cip-item))
+      (setq earth-dir (nth 2 cip-item))
+      (setq target-k (nth 3 cip-item))
+      (setq inward-dir (+ earth-dir pi))
+      (setq hpile-rot (+ inward-dir (/ pi 2.0)))
+      (setq target-index (nth target-k chain-seg-indices))
+      (if (null target-index) (setq target-index seg-idx)) ;; 오류 방어용 폴백
+
+      ;; [실시간 세그먼트 파라미터 로드 및 스마트 카운터 보정]
+      (if (/= target-index prev-target-index)
+        (progn
+          (setq cur-seg-data (nth target-index *segment-list*))
+
+          ;; H-Pile 규격 실시간 업데이트
+          (setq cur-hpile-idx (if (assoc 'CIP-HPILE-IDX cur-seg-data) (cdr (assoc 'CIP-HPILE-IDX cur-seg-data)) *tsp-cip-hpile-idx*))
+          (setq cur-hpile-vals (parse-h-spec (nth (atoi cur-hpile-idx) *tsp-std-wall-list*)))
+          (setq cur-h (nth 0 cur-hpile-vals) cur-b (nth 1 cur-hpile-vals))
+          (setq cur-hpile-block (create-hpile-section-block cur-h cur-b (nth 2 cur-hpile-vals) (nth 3 cur-hpile-vals)))
+
+          ;; 간격 실시간 업데이트
+          (setq cur-interval-idx (if (assoc 'CIP-INTERVAL-IDX cur-seg-data) (cdr (assoc 'CIP-INTERVAL-IDX cur-seg-data)) *tsp-cip-interval-idx*))
+          (setq cur-interval (cond ((= cur-interval-idx "1") 2) ((= cur-interval-idx "2") 3) (t 1)))
+
+          (setq cur-anchor-n-str (if (assoc 'CIP-ANCHOR-N cur-seg-data) (cdr (assoc 'CIP-ANCHOR-N cur-seg-data)) (itoa (1+ (atoi (if cur-interval-idx cur-interval-idx "2"))))))
+          (setq cur-anchor-n (if (and cur-anchor-n-str (/= cur-anchor-n-str "")) (atoi cur-anchor-n-str) 1))
+          (if (<= cur-anchor-n 0) (setq cur-anchor-n 1))
+
+          ;; [복원] 세그먼트 변경 시 물리적 코너 여부에 따른 카운팅 연속성 보정
+          (if is-corner
+            (progn
+              (setq local-i 0 local-anchor-i 0)
+            )
+            (if (/= prev-target-index -1)
+                (progn
+                  (setq local-i 0 local-anchor-i 0)
+
+                  (setq gap-since-last-hpile (- i last-hpile-i))
+                  (if (< gap-since-last-hpile cur-interval)
+                    (setq local-i gap-since-last-hpile)
+                  )
+
+                  (setq gap-since-last-anchor (- i last-anchor-i))
+                  (if (< gap-since-last-anchor cur-anchor-n)
+                    (setq local-anchor-i gap-since-last-anchor)
+                  )
+                )
+                (progn (setq local-i 0 local-anchor-i 0))
+              )
+          )
+          (setq prev-target-index target-index)
+        )
+      )
+
+      ;; 단일 코너 진입 시 리셋 (세그먼트 변경이 없는 일반 물리적 코너 대비)
+      (if (and is-corner (= target-index prev-target-index))
+        (progn
+          (setq local-i 0 local-anchor-i 0)
+        )
+      )
+
+      ;; [3.1] CIP 원형 콘크리트 감싸기 작도 (모서리/직선구간 공통)
+      (entmake (list '(0 . "CIRCLE") (cons 8 "_CIP") (cons 62 2) (list 10 (car curr-pt) (cadr curr-pt) 0.0) (cons 40 (/ d 2.0))))
+      (setq cip-center-list (append cip-center-list (list curr-pt)))
+
+      ;; [3.2] H-Pile 작성 및 브래킷 생성 (사전 시뮬레이션 및 양끝단 1칸 이동 보정 플래그 반영)
+      (setq draw-hpile-here (nth i hpile-flags))
+      (if draw-hpile-here
+        (progn
+          (setq ins-pt (polar curr-pt inward-dir (/ cur-h 2.0)))
+          (entmake (list '(0 . "INSERT") (cons 2 cur-hpile-block) '(8 . "_측면말뚝") (list 10 (car ins-pt) (cadr ins-pt) 0.0) '(41 . 1.0) '(42 . 1.0) '(43 . 1.0) (cons 50 hpile-rot)))
+          (setq *tsp-hpile-points* (append *tsp-hpile-points* (list (list (car ins-pt) (cadr ins-pt) 0.0))))
+
+          ;; 브래킷 및 해치 작도
+          (setq num-dia (if (= (type d) 'STR) (atof d) d))
+          (setq num-h (if (= (type cur-h) 'STR) (atof cur-h) cur-h))
+          (setq num-b (if (= (type cur-b) 'STR) (atof cur-b) cur-b))
+
+          (if (> num-dia num-h)
+            (progn
+              ;; 브래킷은 모서리든 직선구간이든 항상 H/2 에서 D/2 만큼 그려짐 (Inward 방향)
+              (setq p-start-center (polar curr-pt inward-dir (/ num-h 2.0)))
+              (setq p-end-center (polar curr-pt inward-dir (/ num-dia 2.0)))
+
+              (setq p1 (polar p-start-center (+ inward-dir (/ pi 2.0)) (/ num-b 2.0)))
+              (setq p2 (polar p-end-center (+ inward-dir (/ pi 2.0)) (/ num-b 2.0)))
+              (setq p3 (polar p-end-center (- inward-dir (/ pi 2.0)) (/ num-b 2.0)))
+              (setq p4 (polar p-start-center (- inward-dir (/ pi 2.0)) (/ num-b 2.0)))
+              (setq br-pl (draw-bracket-poly (list p1 p2 p3 p4) br-layer br-color))
+
+              (if br-pl
+                (progn
+                  (setq err-catch (vl-catch-all-apply 'vla-addhatch (list mspace 0 "ANSI31" :vlax-true)))
+                  (if (not (vl-catch-all-error-p err-catch))
+                    (progn
+                      (setq hatch-obj err-catch)
+                      (setq sa (vlax-make-safearray 9 (cons 0 0)))
+                      (vlax-safearray-fill sa (list (vlax-ename->vla-object br-pl)))
+                      (vla-appendouterloop hatch-obj sa)
+                      (vla-evaluate hatch-obj)
+                      (vla-put-patternscale hatch-obj (if (= (getvar "MEASUREMENT") 0) 400.0 20.0))
+                      (vla-put-layer hatch-obj br-layer)
+                      (vla-put-color hatch-obj br-color)
+                    )
+                  )
+                )
+              )
+            )
+          )
+
+          ;; H-Pile 개수 카운팅
+          (setq seg-hpile-count (nth target-index *tsp-segment-pile-counts*))
+          (if (null seg-hpile-count) (setq seg-hpile-count 0))
+          (if (and (= target-index 0) (= seg-hpile-count 1) (= i 0))
+            nil
+            (setq *tsp-segment-pile-counts* (update-list-item *tsp-segment-pile-counts* target-index (1+ seg-hpile-count)))
+          )
+          (setq *tsp-actual-drawn-hpiles* (1+ *tsp-actual-drawn-hpiles*))
+          (setq last-hpile-i i)
+        )
+      )
+
+      ;; [3.3] 앵커 작도 (스마트 카운터 기준)
+      (if (or is-corner (= (rem local-anchor-i cur-anchor-n) 0))
+        (progn
+          ;; [누락 로직 복구] 앵커가 H-Pile과 겹치지 않도록 이음매(0.5칸 또는 1.5칸)로 오프셋 이동
+          (setq target-anchor-chord
+            (if (and (= cur-interval 3) (= (rem cur-anchor-n 3) 0))
+              (* cip-ctc 1.5)
+              (* cip-ctc 0.5)
+            )
+          )
+
+          (setq cur-d-on-path (nth 4 cip-item))
+          (setq anchor-d (+ cur-d-on-path target-anchor-chord))
+
+          ;; 경로 초과 시 순환 또는 연장 처리
+          (if (and full-loop (> max-path-len 0.0))
+            (while (>= anchor-d max-path-len) (setq anchor-d (- anchor-d max-path-len)))
+          )
+
+          (if (> anchor-d max-path-len)
+            (progn
+              (setq pt-end (vlax-curve-getPointAtDist vla-path max-path-len))
+              (setq end-param (vlax-curve-getendparam vla-path))
+              (setq deriv (vlax-curve-getfirstderiv vla-path end-param))
+              (setq ang (atan (cadr deriv) (car deriv)))
+              (setq anchor-pt (polar pt-end ang (- anchor-d max-path-len)))
+            )
+            (setq anchor-pt (vlax-curve-getPointAtDist vla-path anchor-d))
+          )
+
+          ;; 이동한 앵커 위치에서의 정확한 법선 벡터(배면 및 굴착면 방향) 재도출
+          (setq pt-on-orig-anch (vlax-curve-getClosestPointTo vla-pl anchor-pt))
+          (if pt-on-orig-anch
+            (progn
+              (setq orig-param-anch (vlax-curve-getParamAtPoint vla-pl pt-on-orig-anch))
+              (setq orig-deriv-anch (vlax-curve-getFirstDeriv vla-pl orig-param-anch))
+              (setq anchor-in-norm (+ (angle '(0 0 0) orig-deriv-anch) (* boundary-orient (/ pi 2.0))))
+            )
+            (setq anchor-in-norm in-norm) ; 에러 시 기존 방향 유지
+          )
+          (setq anchor-earth-dir (+ anchor-in-norm pi))
+          (setq anchor-inward-dir (+ anchor-earth-dir pi))
+
+          (setq target-index-anch target-index)
+
+          (setq cip-wale-spec (cdr (assoc 'WALE-SPEC (nth target-index-anch *segment-list*))))
+          (if (= cip-wale-spec "User-defined")
+            (setq cip-wale-vals (cdr (assoc 'WALE-CUSTOM (nth target-index-anch *segment-list*))))
+            (setq cip-wale-vals (parse-h-spec cip-wale-spec))
+          )
+          (if (null cip-wale-vals) (setq cip-wale-vals '(300 300 10 15)))
+          (setq cip-wale-h (nth 0 cip-wale-vals))
+
+          ;; [지보재 적용 구간 연동] 현재 앵커 위치(anchor-pt)에서 적용 구간에 해당하는 앵커 및 최대 외곽 띠장 폭(cip-wale-h) 산출
+          (setq max-anchor-L 0.0 max-anchor-ang 0.0 max-anchor-free 0.0 max-anchor-bond 0.0 has-anchor nil)
+          (setq cur-support-list (cdr (assoc 'SUPPORT-LIST (nth target-index-anch *segment-list*))))
+          (setq seg-start-v-anch (nth target-index-anch orig-vertices))
+          (setq seg-end-v-anch (nth (if is-closed (rem (+ target-index-anch 1) n-verts) (+ target-index-anch 1)) orig-vertices))
+          (setq seg-ang-anch (angle seg-start-v-anch seg-end-v-anch))
+          (setq seg-len-anch (distance seg-start-v-anch seg-end-v-anch))
+          (setq anch-proj-d (+ (* (- (car anchor-pt) (car seg-start-v-anch)) (cos seg-ang-anch))
+                               (* (- (cadr anchor-pt) (cadr seg-start-v-anch)) (sin seg-ang-anch))))
+          (setq local-anc-wale-h 0)
+          (if cur-support-list
+            (foreach s-item cur-support-list
+              (if (wcmatch (car s-item) "*앵커*")
+                (progn
+                  (setq s-iv (tsp-get-support-item-dist-interval s-item seg-start-v-anch seg-ang-anch seg-len-anch))
+                  (if (and (>= anch-proj-d (- (car s-iv) (/ cur-b 2.0) 10.0))
+                           (<= anch-proj-d (+ (cdr s-iv) (/ cur-b 2.0) 10.0)))
+                    (progn
+                      (setq s-w-vals (tsp-get-support-item-wale-vals s-item cip-wale-spec (cdr (assoc 'WALE-CUSTOM (nth target-index-anch *segment-list*)))))
+                      (if (> (nth 0 s-w-vals) local-anc-wale-h) (setq local-anc-wale-h (nth 0 s-w-vals)))
+                      (setq cur-free (nth 5 s-item) cur-bond (nth 6 s-item) cur-ang (nth 4 s-item))
+                      (setq cur-L (+ cur-free cur-bond))
+                      (if (> cur-L max-anchor-L)
+                        (setq max-anchor-L cur-L max-anchor-ang cur-ang max-anchor-free cur-free max-anchor-bond cur-bond has-anchor T)
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+          (if (> local-anc-wale-h 0) (setq cip-wale-h local-anc-wale-h))
+
+          (setq cur-brace (cdr (assoc 'CORNER-BRACE (nth target-index-anch *segment-list*))))
+          (setq next-seg-real-idx (if is-closed (rem (+ target-index-anch 1) n-verts) (+ target-index-anch 1)))
+          (setq next-brace nil)
+          (if (and next-seg-real-idx (< next-seg-real-idx (length *segment-list*)))
+            (setq next-brace (cdr (assoc 'CORNER-BRACE (nth next-seg-real-idx *segment-list*))))
+          )
+
+          (setq brace-blocked nil)
+
+          ;; 코너 부근 앵커 및 사보강재 간섭 검사 (안전거리 계산)
+          (setq c-upg-s (cdr (assoc 'UPGRADE-WALE (nth target-index-anch *segment-list*))))
+          (setq has-upg-s (and c-upg-s (= (car c-upg-s) "Y")))
+          (setq c-upg-e (cdr (assoc 'UPGRADE-WALE (nth next-seg-real-idx *segment-list*))))
+          (setq has-upg-e (and c-upg-e (= (car c-upg-e) "Y")))
+
+          ;; 수동으로 선택된 상향 띠장 범위를 위한 CIP 세그먼트 벡터 산출 및 길이 추출
+          (setq manual-L-start nil manual-L-end nil)
+          (setq seg-start-v (nth target-index-anch orig-vertices))
+          (setq seg-end-v (nth (if is-closed (rem (+ target-index-anch 1) n-verts) (+ target-index-anch 1)) orig-vertices))
+          (setq seg-ang (angle seg-start-v seg-end-v))
+
+          (if (and has-upg-s (> (length c-upg-s) 2))
+            (foreach pt-data (nth 2 c-upg-s)
+              (setq pt (cadr pt-data) dx (- (car pt) (car seg-start-v)) dy (- (cadr pt) (cadr seg-start-v)))
+              (setq pt-d (+ (* dx (cos seg-ang)) (* dy (sin seg-ang))))
+              (setq pt-perp (abs (- (* dy (cos seg-ang)) (* dx (sin seg-ang)))))
+              (if (and (> pt-d 0) (< pt-perp 1000.0)) (setq manual-L-start pt-d))
+            )
+          )
+          (if (and has-upg-e (> (length c-upg-e) 2))
+            (foreach pt-data (nth 2 c-upg-e)
+              (setq pt (cadr pt-data) dx (- (car pt) (car seg-end-v)) dy (- (cadr pt) (cadr seg-end-v)))
+              (setq pt-d (+ (* dx (cos (+ seg-ang pi))) (* dy (sin (+ seg-ang pi)))))
+              (setq pt-perp (abs (- (* dy (cos (+ seg-ang pi))) (* dx (sin (+ seg-ang pi))))))
+              (if (and (> pt-d 0) (< pt-perp 1000.0)) (setq manual-L-end pt-d))
+            )
+          )
+
+          (setq is-brace-s (and cur-brace (= (car cur-brace) "Y") (cadr cur-brace)))
+          (setq is-brace-e (and next-brace (= (car next-brace) "Y") (cadr next-brace)))
+
+          ;; 실제 세그먼트 시점(seg-start-v) 및 종점(seg-end-v) 기준 투영 거리와 직선 거리를 동시에 산출하여 인덱스 밀림 원천 차단
+          (setq p-start (if (and corner-pts (< target-k (length corner-pts))) (car (nth target-k corner-pts)) seg-start-v))
+          (setq p-end (if (and corner-pts (< (1+ target-k) (length corner-pts))) (car (nth (1+ target-k) corner-pts)) seg-end-v))
+
+          (setq d-from-start (min (if p-start (distance anchor-pt p-start) 1e99)
+                                  (distance pt-on-orig-anch seg-start-v)
+                                  (max 0.0 anch-proj-d)))
+          (setq d-from-end (min (if p-end (distance anchor-pt p-end) 1e99)
+                                (distance pt-on-orig-anch seg-end-v)
+                                (max 0.0 (- seg-len-anch anch-proj-d))))
+          (setq limit-s 0.0 limit-e 0.0)
+
+          ;; 사보강재 물리적 간섭 범위 산정 (45도 사선 투영폭 반영)
+          (if is-brace-s
+            (foreach b-r (cadr cur-brace)
+              (setq chk-b-h (nth 0 (cadr b-r)))
+              (setq chk-edge (if (wcmatch (strcase (nth 0 b-r)) "2H*") (* chk-b-h 2.1213) (* chk-b-h 0.7071)))
+              (if (> (+ (* (nth 2 b-r) 1000.0) chk-edge 150.0) limit-s)
+                (setq limit-s (+ (* (nth 2 b-r) 1000.0) chk-edge 150.0))
+              )
+            )
+          )
+          (if is-brace-e
+            (foreach b-r (cadr next-brace)
+              (setq chk-b-h (nth 0 (cadr b-r)))
+              (setq chk-edge (if (wcmatch (strcase (nth 0 b-r)) "2H*") (* chk-b-h 2.1213) (* chk-b-h 0.7071)))
+              (if (> (+ (* (nth 2 b-r) 1000.0) chk-edge 150.0) limit-e)
+                (setq limit-e (+ (* (nth 2 b-r) 1000.0) chk-edge 150.0))
+              )
+            )
+          )
+
+          ;; 상향 띠장이 스냅되는 다음 H-Pile 위치까지 앵커 차단 범위(limit-s, limit-e) 확장
+          (setq snap-ctc (* cip-ctc cur-interval))
+          (if (> limit-s 0.0)
+            (setq limit-s (+ limit-s snap-ctc (/ cur-b 2.0)))
+          )
+          (if (> limit-e 0.0)
+            (setq limit-e (+ limit-e snap-ctc (/ cur-b 2.0)))
+          )
+          (if manual-L-start
+            (setq limit-s (max limit-s (+ manual-L-start (/ cur-b 2.0) 100.0)))
+            (if (and has-upg-s (<= limit-s 0.0))
+              (setq limit-s (+ snap-ctc (/ cur-b 2.0) 100.0))
+            )
+          )
+          (if manual-L-end
+            (setq limit-e (max limit-e (+ manual-L-end (/ cur-b 2.0) 100.0)))
+            (if (and has-upg-e (<= limit-e 0.0))
+              (setq limit-e (+ snap-ctc (/ cur-b 2.0) 100.0))
+            )
+          )
+          ;; 양단 상향 띠장 사이 잔여 구간이 1.5 * H-Pile 간격 미만이면 세그먼트 전체 상향 구간으로 간주하여 앵커 차단
+          (if (and (or (and has-upg-s (> limit-s 0.0)) (and has-upg-e (> limit-e 0.0)))
+                   (< (- seg-len-anch (+ (if has-upg-s limit-s 0.0) (if has-upg-e limit-e 0.0))) (* snap-ctc 1.5)))
+            (setq limit-s seg-len-anch limit-e seg-len-anch)
+          )
+
+          ;; 코너에서 파생되어 시프트된 앵커라도 실제 배치된 위치를 기준으로 일괄 간섭 검사 수행
+          (if (or (<= d-from-start limit-s) (<= d-from-end limit-e))
+            (setq brace-blocked T)
+          )
+
+          (setq anchor-blocked brace-blocked)
+
+          ;; 앵커 정착부 인접 벽체/띠장 파묻힘(간섭) 기하 검사
+          (if (and has-anchor (not anchor-blocked))
+            (progn
+              ;; inward-dir(코너 이등분각) 대신 앞서 계산된 anchor-inward-dir(실제 법선) 사용
+              (setq pt-base-temp (polar anchor-pt anchor-inward-dir (+ (/ d 2.0) cip-wale-h)))
+              (setq anchor-half-width 150.0)
+
+              ;; 1. 시작점 코너 방향 간섭 확인
+              (setq prev-seg-real-idx (if is-closed (if (= target-index-anch 0) (- n-verts 1) (- target-index-anch 1)) (- target-index-anch 1)))
+              (if (and p-start (>= prev-seg-real-idx 0) (< d-from-start 2000.0))
+                (progn
+                  (setq seg-prev-v (nth prev-seg-real-idx orig-vertices))
+                  (if seg-prev-v
+                    (progn
+                      (setq adj-ang-start (angle seg-start-v seg-prev-v))
+                      (setq dist-to-adj-start (abs (* (sin (- (angle seg-start-v pt-base-temp) adj-ang-start)) (distance seg-start-v pt-base-temp))))
+
+                      ;; 이전 세그먼트 벽체 두께 동적 추정
+                      (setq prev-wall-thick 150.0)
+                      (setq prev-seg-data (nth prev-seg-real-idx *segment-list*))
+                      (if (= (cdr (assoc 'WALL-TYPE prev-seg-data)) "CIP")
+                        (setq prev-wall-thick (/ (atof (if (assoc 'CIP-DIA prev-seg-data) (cdr (assoc 'CIP-DIA prev-seg-data)) "400")) 2.0))
+                        (progn
+                          (setq prev-timber-thick (cdr (assoc 'TIMBER-THICKNESS prev-seg-data)))
+                          (if (null prev-timber-thick) (setq prev-timber-thick 60))
+                          (setq prev-spec (cdr (assoc 'WALL-SPEC prev-seg-data)))
+                          (if (= prev-spec "User-defined") (setq prev-vals (cdr (assoc 'WALL-CUSTOM prev-seg-data))) (setq prev-vals (parse-h-spec prev-spec)))
+                          (if prev-vals (setq prev-wall-thick (+ (nth 3 prev-vals) (/ prev-timber-thick 2.0))))
+                        )
+                      )
+                      (setq prev-wale-spec (cdr (assoc 'WALE-SPEC prev-seg-data)))
+                      (if (= prev-wale-spec "User-defined") (setq prev-wale-vals (cdr (assoc 'WALE-CUSTOM prev-seg-data))) (setq prev-wale-vals (parse-h-spec prev-wale-spec)))
+                      (if (null prev-wale-vals) (setq prev-wale-vals '(300 300 10 15)))
+
+                      ;; 내적으로 볼록 코너 판별 (pt-base-temp가 이전 세그먼트의 굴착면 안쪽을 향하는지)
+                      (setq prev-inward-norm (+ (angle seg-prev-v seg-start-v) (* boundary-orient (/ pi 2.0))))
+                      (setq vec-p-x (- (car pt-base-temp) (car seg-start-v)))
+                      (setq vec-p-y (- (cadr pt-base-temp) (cadr seg-start-v)))
+                      (setq dot-val (+ (* vec-p-x (cos prev-inward-norm)) (* vec-p-y (sin prev-inward-norm))))
+
+                      ;; 종방향 투영 검사: 무한 연장선 오류 방지
+                      (setq prev-long-dir (angle seg-start-v seg-prev-v))
+                      (setq long-proj-start (+ (* vec-p-x (cos prev-long-dir)) (* vec-p-y (sin prev-long-dir))))
+
+                      (if (and (> dot-val 0)
+                               (> long-proj-start (- anchor-half-width)) ; 투영점이 코너 밖 허공으로 완전히 벗어나지 않았을 때만 검사
+                               (< dist-to-adj-start (+ prev-wall-thick (nth 0 prev-wale-vals) anchor-half-width)))
+                        (setq anchor-blocked T)
+                      )
+                    )
+                  )
+                )
+              )
+
+              ;; 2. 끝점 코너 방향 간섭 확인
+              (if (and p-end next-seg-real-idx (< next-seg-real-idx n-verts) (< d-from-end 2000.0) (not anchor-blocked))
+                (progn
+                  (setq seg-next-v (nth next-seg-real-idx orig-vertices))
+                  (if seg-next-v
+                    (progn
+                      (setq adj-ang-end (angle seg-end-v seg-next-v))
+                      (setq dist-to-adj-end (abs (* (sin (- (angle seg-end-v pt-base-temp) adj-ang-end)) (distance seg-end-v pt-base-temp))))
+
+                      ;; 다음 세그먼트 벽체 두께 동적 추정
+                      (setq next-wall-thick 150.0)
+                      (setq next-seg-data (nth next-seg-real-idx *segment-list*))
+                      (if (= (cdr (assoc 'WALL-TYPE next-seg-data)) "CIP")
+                        (setq next-wall-thick (/ (atof (if (assoc 'CIP-DIA next-seg-data) (cdr (assoc 'CIP-DIA next-seg-data)) "400")) 2.0))
+                        (progn
+                          (setq next-timber-thick (cdr (assoc 'TIMBER-THICKNESS next-seg-data)))
+                          (if (null next-timber-thick) (setq next-timber-thick 60))
+                          (setq next-spec (cdr (assoc 'WALL-SPEC next-seg-data)))
+                          (if (= next-spec "User-defined") (setq next-vals (cdr (assoc 'WALL-CUSTOM next-seg-data))) (setq next-vals (parse-h-spec next-spec)))
+                          (if next-vals (setq next-wall-thick (+ (nth 3 next-vals) (/ next-timber-thick 2.0))))
+                        )
+                      )
+                      (setq next-wale-spec (cdr (assoc 'WALE-SPEC next-seg-data)))
+                      (if (= next-wale-spec "User-defined") (setq next-wale-vals (cdr (assoc 'WALE-CUSTOM next-seg-data))) (setq next-wale-vals (parse-h-spec next-wale-spec)))
+                      (if (null next-wale-vals) (setq next-wale-vals '(300 300 10 15)))
+
+                      ;; 내적으로 볼록 코너 판별 (pt-base-temp가 다음 세그먼트의 굴착면 안쪽을 향하는지)
+                      (setq next-inward-norm (+ (angle seg-end-v seg-next-v) (* boundary-orient (/ pi 2.0))))
+                      (setq vec-p-x2 (- (car pt-base-temp) (car seg-end-v)))
+                      (setq vec-p-y2 (- (cadr pt-base-temp) (cadr seg-end-v)))
+                      (setq dot-val2 (+ (* vec-p-x2 (cos next-inward-norm)) (* vec-p-y2 (sin next-inward-norm))))
+
+                      ;; 종방향 투영 검사: 무한 연장선 오류 방지
+                      (setq next-long-dir (angle seg-end-v seg-next-v))
+                      (setq long-proj-end (+ (* vec-p-x2 (cos next-long-dir)) (* vec-p-y2 (sin next-long-dir))))
+
+                      (if (and (> dot-val2 0)
+                               (> long-proj-end (- anchor-half-width)) ; 투영점이 코너 밖 허공으로 완전히 벗어나지 않았을 때만 검사
+                               (< dist-to-adj-end (+ next-wall-thick (nth 0 next-wale-vals) anchor-half-width)))
+                        (setq anchor-blocked T)
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+
+          (if (and has-anchor (not anchor-blocked))
+            (progn
+              (create-layer-if-not-exists "_앵커(Anchor)" "6")
+              (setq cos-val (cos (* max-anchor-ang (/ pi 180.0))))
+              (setq proj-free (* max-anchor-free 1000.0 cos-val) proj-bond (* max-anchor-bond 1000.0 cos-val) proj-prot (* 150.0 cos-val))
+
+              ;; 앵커 시작점(베이스) 방향 anchor-inward-dir(실제 법선)
+              (setq pt-base (polar anchor-pt anchor-inward-dir (+ (/ d 2.0) cip-wale-h)))
+
+              ;; 편심각 계산 및 앵커 방향(바깥쪽: anchor-earth-dir) 설정
+              (setq cur-plan-offset 0.0)
+              (foreach s-item cur-support-list
+                (if (wcmatch (car s-item) "*앵커*")
+                  (progn
+                    (setq anchor-manual-angles (if (> (length s-item) 9) (nth 9 s-item) '()))
+                    (foreach m-ang anchor-manual-angles
+                      (if (< (distance (list (car pt-base) (cadr pt-base)) (list (car (car m-ang)) (cadr (car m-ang)))) 50.0)
+                        (setq cur-plan-offset (cdr m-ang))
+                      )
+                    )
+                  )
+                )
+              )
+              ;; earth-dir(코너 이등분각) 대신 anchor-earth-dir(실제 법선) 사용
+              (setq anchor-final-outward (+ anchor-earth-dir (* cur-plan-offset (/ pi 180.0))))
+
+              ;; 앵커는 바깥쪽으로 파고듦
+              (setq pt-free-end (polar pt-base anchor-final-outward proj-free))
+              (setq pt-bond-end (polar pt-free-end anchor-final-outward proj-bond))
+
+              (setq pt-h1 (polar pt-base (+ anchor-final-outward (/ pi 2.0)) 100.0) pt-h2 (polar pt-base (- anchor-final-outward (/ pi 2.0)) 100.0))
+              (setq pt-h3 (polar pt-h2 (+ anchor-final-outward pi) 60.0) pt-h4 (polar pt-h1 (+ anchor-final-outward pi) 60.0))
+
+              (entmake (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") (cons 8 "_앵커(Anchor)") (cons 62 6) '(90 . 4) '(70 . 1) (list 10 (car pt-h1) (cadr pt-h1)) (list 10 (car pt-h2) (cadr pt-h2)) (list 10 (car pt-h3) (cadr pt-h3)) (list 10 (car pt-h4) (cadr pt-h4))))
+              (setq pt-anchor-start (polar pt-base (+ anchor-final-outward pi) (+ 60.0 proj-prot)))
+
+              (entmake (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") (cons 8 "_앵커(Anchor)") (cons 62 6) '(90 . 2) '(70 . 0) (list 10 (car pt-anchor-start) (cadr pt-anchor-start)) (list 10 (car pt-base) (cadr pt-base))))
+              (entmake (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") (cons 8 "_앵커(Anchor)") (cons 62 6) '(90 . 2) '(70 . 0) (list 10 (car pt-base) (cadr pt-base)) (list 10 (car pt-free-end) (cadr pt-free-end))))
+              (entmake (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") (cons 8 "_앵커(Anchor)") (cons 62 6) '(90 . 2) '(70 . 0) '(43 . 400.0) (list 10 (car pt-free-end) (cadr pt-free-end)) (list 10 (car pt-bond-end) (cadr pt-bond-end))))
+            )
+          )
+          (setq last-anchor-i i)
+        )
+      )
+
+      (setq local-i (1+ local-i))
+      (setq local-anchor-i (1+ local-anchor-i))
+
+      (setq i (1+ i))
+    )
+
+    ;; ========================================================================
+    ;; [STEP 3] 세그먼트별 동적 감지를 통한 독립 간격 그라우팅 작도
+    ;; ========================================================================
+            (setq old-offsetgap (getvar "OFFSETGAPTYPE"))
+            (setvar "OFFSETGAPTYPE" 1)
+
+            ;; 사용자 지정 그라우팅 오프셋 거리 산출
+            (setq cur-grouting-offset-idx (if (assoc 'CIP-GROUTING-OFFSET-IDX seg-data) (cdr (assoc 'CIP-GROUTING-OFFSET-IDX seg-data)) "0"))
+            (setq cur-grouting-offset-custom (if (assoc 'CIP-GROUTING-OFFSET-CUSTOM seg-data) (cdr (assoc 'CIP-GROUTING-OFFSET-CUSTOM seg-data)) ""))
+            (setq actual-grout-offset
+              (if (= cur-grouting-offset-idx "1")
+                (if (and cur-grouting-offset-custom (/= cur-grouting-offset-custom "")) (atof cur-grouting-offset-custom) d)
+                d ; 기본값은 CIP 직경(D)과 동일 (+ wall-dist (/ d 2.0))
+              )
+            )
+            ;; [자동(접점)] D200 전용 모드 판정 : 간격 = CIP 중심간격, 기준선 = 접점 오프셋 자동 산출
+            (setq cur-grouting-space-idx (if (assoc 'CIP-GROUTING-SPACE-IDX seg-data) (cdr (assoc 'CIP-GROUTING-SPACE-IDX seg-data)) "0"))
+            (setq auto-grout-mode (and (= grouting-dia 200.0) (= cur-grouting-space-idx "4")))
+
+(setq vla-grout-offset-list (vl-catch-all-apply 'vla-offset (list vla-pl actual-grout-offset)))
+(if (not (vl-catch-all-error-p vla-grout-offset-list))
+  (progn
+    (setq vla-grout-path (vlax-safearray-get-element (vlax-variant-value vla-grout-offset-list) 0))
+
+    ;; 폐합 여부에 따른 차등 검증 분기
+    (if is-closed
+      (progn
+        ;; 닫힌 경계: 25%, 50%, 75% 다중 샘플링을 통한 안정적 안팎 판정
+        (setq grout-total-len (vlax-curve-getDistAtParam vla-grout-path (vlax-curve-getEndParam vla-grout-path)))
+        (setq grout-sample-inside-count 0)
+        (foreach ratio '(0.25 0.5 0.75)
+          (setq grout-sample-pt (vlax-curve-getPointAtDist vla-grout-path (* grout-total-len ratio)))
+          (if (and grout-sample-pt (tsp-is-point-inside grout-sample-pt orig-vertices))
+            (setq grout-sample-inside-count (1+ grout-sample-inside-count))
+          )
+        )
+        (if (>= grout-sample-inside-count 2)
+          (progn
+            (setq tmp-off (tsp-safe-vla-offset vla-pl (- actual-grout-offset)))
+            (if tmp-off
+              (progn
+                (princ "\n[경고] 그라우팅 오프셋 재생성 실패 - 기존 오프셋 경로로 대체합니다.")
+                (vla-delete vla-grout-path)
+                (setq vla-grout-path tmp-off)
+              )
+            )
+          )
+        )
+      )
+      (progn
+        ;; 개방 경계(Open polyline): 다중 샘플링 및 내적(Dot Product) 기반 방향 검증
+        (setq grout-total-len (vlax-curve-getDistAtParam vla-grout-path (vlax-curve-getEndParam vla-grout-path)))
+        (setq grout-sample-fail-count 0)
+        (foreach ratio '(0.25 0.5 0.75)
+          (setq pt-off (vlax-curve-getPointAtDist vla-grout-path (* grout-total-len ratio)))
+          (if pt-off
+            (progn
+              (setq pt-orig (vlax-curve-getClosestPointTo vla-pl pt-off))
+              (setq orig-param-test (vlax-curve-getParamAtPoint vla-pl pt-orig))
+
+              ;; 정점(코너) 특이점 회피 미세 조정
+              (setq param-safe orig-param-test)
+              (if (equal param-safe (fix param-safe) 1e-4)
+                (if (>= param-safe (vlax-curve-getEndParam vla-pl))
+                  (setq param-safe (- param-safe 1e-3))
+                  (setq param-safe (+ param-safe 1e-3))
+                )
+              )
+
+              (setq orig-deriv (vlax-curve-getFirstDeriv vla-pl param-safe))
+              (setq orig-tangent (angle '(0 0 0) orig-deriv))
+
+              ;; 기대하는 법선 단위 벡터 (E)
+              (setq expected-offset-norm (- orig-tangent (* boundary-orient (/ pi 2.0))))
+              (setq vec-expect-x (cos expected-offset-norm))
+              (setq vec-expect-y (sin expected-offset-norm))
+
+              ;; 실제 오프셋 벡터 (A)
+              (setq vec-actual-x (- (car pt-off) (car pt-orig)))
+              (setq vec-actual-y (- (cadr pt-off) (cadr pt-orig)))
+
+              ;; 내적 연산 (Dot Product)
+              (setq dot-prod (+ (* vec-actual-x vec-expect-x) (* vec-actual-y vec-expect-y)))
+
+              (if (< dot-prod 0.0)
+                (setq grout-sample-fail-count (1+ grout-sample-fail-count))
+              )
+            )
+          )
+        )
+        (if (>= grout-sample-fail-count 2)
+          (progn
+            (setq tmp-off (tsp-safe-vla-offset vla-pl (- actual-grout-offset)))
+            (if tmp-off
+              (progn
+                (princ "\n[경고] 그라우팅 오프셋 재생성 실패 - 기존 오프셋 경로로 대체합니다.")
+                (vla-delete vla-grout-path)
+                (setq vla-grout-path tmp-off)
+              )
+            )
+          )
+        )
+      )
+    )
+                ;; 오프셋 완료 후 원래 상태로 복구
+                (setvar "OFFSETGAPTYPE" old-offsetgap)
+
+                (setq max-grout-len (vlax-curve-getdistatparam vla-grout-path (vlax-curve-getendparam vla-grout-path)))
+                (setq grout-dist 0.0)
+                (create-layer-if-not-exists "_그라우팅" "5")
+
+                ;; 실제로 작도된 그라우팅 중심점을 누적 저장할 리스트 초기화
+                (setq drawn-grout-pts '())
+
+                (if auto-grout-mode
+                  ;; ================================================================
+                  ;; [자동(접점)] D200 그라우팅 : CIP 두 공 사이 중점 기준 배치
+                  ;;   맞닿음/겹침 모두 -> 두 CIP원에 외접하는 높이(y)로 배면 이격 (겹침량 자동 반영)
+                  ;; ================================================================
+                  (progn
+                    (setq cip-chain-pts cip-center-list)
+                    (if (and is-closed (> (length cip-chain-pts) 1)
+                             (< (distance (car cip-chain-pts) (last cip-chain-pts)) 1.0))
+                      (setq cip-chain-pts (reverse (cdr (reverse cip-chain-pts))))
+                    )
+                    (setq cip-gap-total (if is-closed (length cip-chain-pts) (1- (length cip-chain-pts))))
+                    (if (< cip-gap-total 0) (setq cip-gap-total 0))
+                    (setq cip-gap-i 0)
+                    (while (< cip-gap-i cip-gap-total)
+                      (setq cip-gap-p1 (nth cip-gap-i cip-chain-pts))
+                      (setq cip-gap-p2
+                        (if (and is-closed (= cip-gap-i (1- (length cip-chain-pts))))
+                          (nth 0 cip-chain-pts)
+                          (nth (1+ cip-gap-i) cip-chain-pts)
+                        )
+                      )
+                      (if (and cip-gap-p1 cip-gap-p2 (> (distance cip-gap-p1 cip-gap-p2) 0.001))
+                        (progn
+                          (setq cip-gap-mid (list (/ (+ (car cip-gap-p1) (car cip-gap-p2)) 2.0)
+                                                  (/ (+ (cadr cip-gap-p1) (cadr cip-gap-p2)) 2.0)
+                                                  0.0
+                                            )
+                          )
+                          (setq cip-gap-s (distance cip-gap-p1 cip-gap-p2))
+                          ;; [외접 배치] 배열모드(맞닿음/겹침) 및 겹침량과 무관하게
+                          ;;   두 CIP원에 동시에 접하는 위치를 기하학적으로 산출한다.
+                          ;;   y = sqrt((R + r)^2 - (s/2)^2),  R = CIP 반경, r = 그라우팅 반경, s = 실제 중심간격
+                          ;;   (겹침 모드에서 중점에 두면 두 CIP가 원 전체를 덮어 작도가 사라지므로 외접으로 통일)
+                          (setq cip-gap-ang (angle cip-gap-p1 cip-gap-p2))
+                          (setq cip-gap-y
+                            (sqrt (max 0.0
+                                    (- (expt (+ (/ d 2.0) (/ grouting-dia 2.0)) 2.0)
+                                       (expt (/ cip-gap-s 2.0) 2.0)
+                                    )
+                                  )
+                            )
+                          )
+                          ;; 중심선 양쪽 후보 중 배면(그라우팅 기준선 경로)에 가까운 쪽을 채택
+                          (setq cip-gap-ptA (polar cip-gap-mid (+ cip-gap-ang (/ pi 2.0)) cip-gap-y))
+                          (setq cip-gap-ptB (polar cip-gap-mid (- cip-gap-ang (/ pi 2.0)) cip-gap-y))
+                          (setq cip-gap-near (vlax-curve-getClosestPointTo vla-grout-path cip-gap-ptA))
+                          (setq cip-gap-dA (if cip-gap-near (distance cip-gap-ptA cip-gap-near) 0.0))
+                          (setq cip-gap-near (vlax-curve-getClosestPointTo vla-grout-path cip-gap-ptB))
+                          (setq cip-gap-dB (if cip-gap-near (distance cip-gap-ptB cip-gap-near) 0.0))
+                          (setq cip-gap-pt (if (<= cip-gap-dA cip-gap-dB) cip-gap-ptA cip-gap-ptB))
+                          (tsp-draw-advanced-grouting cip-gap-pt grouting-dia cip-center-list d)
+                          (setq drawn-grout-pts (cons cip-gap-pt drawn-grout-pts))
+                        )
+                      )
+                      (setq cip-gap-i (1+ cip-gap-i))
+                    )
+                  )
+                  (progn
+                (while (<= grout-dist max-grout-len)
+                  (setq grout-pt (vlax-curve-getpointatdist vla-grout-path grout-dist))
+
+                  ;; 그라우팅 중심이 현재 어느 세그먼트에 속해 있는지 동적 추적하여 개별 설정값을 꺼내옴
+                  (setq p-on-orig (vlax-curve-getClosestPointTo vla-pl grout-pt))
+                  (setq p-param (vlax-curve-getParamAtPoint vla-pl p-on-orig))
+                  (setq target-k-grout (fix p-param))
+                  (if (>= target-k-grout (1- (length chain-pts))) (setq target-k-grout (- (length chain-pts) 2)))
+
+                  (setq target-index-grout (nth target-k-grout chain-seg-indices))
+                  (if (null target-index-grout) (setq target-index-grout seg-idx)) ;; 오류 방어용 폴백
+
+                  (setq cur-seg-data (nth target-index-grout *segment-list*))
+
+                  ;; 실시간 세그먼트 데이터 파싱
+                  (setq cur-grouting-space-idx (if (assoc 'CIP-GROUTING-SPACE-IDX cur-seg-data) (cdr (assoc 'CIP-GROUTING-SPACE-IDX cur-seg-data)) "0"))
+                  (setq cur-grouting-custom (if (assoc 'CIP-GROUTING-SPACE-CUSTOM cur-seg-data) (cdr (assoc 'CIP-GROUTING-SPACE-CUSTOM cur-seg-data)) ""))
+                  (setq cur-grouting-dia-idx (if (assoc 'CIP-GROUTING-IDX cur-seg-data) (cdr (assoc 'CIP-GROUTING-IDX cur-seg-data)) "0"))
+                  (setq cur-grouting-dia (if (= cur-grouting-dia-idx "1") 600.0 200.0))
+
+                  (setq grout-space-val
+                    (cond
+                      ((= cur-grouting-space-idx "0") 200.0)
+                      ((= cur-grouting-space-idx "1") 400.0)
+                      ((= cur-grouting-space-idx "2") 600.0)
+                      (t (if (and cur-grouting-custom (/= cur-grouting-custom "")) (atof cur-grouting-custom) 200.0))
+                    )
+                  )
+
+                  (setq skip-grout (= cur-grouting-dia-idx "2"))
+                  ;; 시작점과 사실상 동일 위치(0.15배 미만)일 때만 중복 스킵
+                  (if (and (not skip-grout) full-loop drawn-grout-pts)
+                    (progn
+                      (if (< (distance grout-pt (last drawn-grout-pts)) (* grout-space-val 0.15))
+                        (setq skip-grout T)
+                      )
+                    )
+                  )
+
+                  ;; 간섭 조건을 통과했을 때만 연산 엔진 호출 및 리스트 등록
+                  (if (not skip-grout)
+                    (progn
+                      (tsp-draw-advanced-grouting grout-pt cur-grouting-dia cip-center-list d)
+                      (setq drawn-grout-pts (cons grout-pt drawn-grout-pts))
+                    )
+                  )
+
+                  ;; 종단 이음매(1번 모서리 등) 마지막 2칸 구간 균등 2등분 배분
+                  (setq rem-grout-len (- max-grout-len grout-dist))
+                  (if full-loop
+                    (cond
+                      ((<= rem-grout-len (* grout-space-val 1.05))
+                       (setq grout-dist (+ max-grout-len 10.0)))
+                      ((<= rem-grout-len (* grout-space-val 2.0))
+                       (setq grout-dist (+ grout-dist (/ rem-grout-len 2.0))))
+                      (t
+                       (setq grout-dist (+ grout-dist grout-space-val)))
+                    )
+                    (cond
+                      ((<= rem-grout-len 1.0)
+                       (setq grout-dist (+ max-grout-len 10.0)))
+                      ((<= rem-grout-len (* grout-space-val 1.05))
+                       (setq grout-dist max-grout-len))
+                      ((<= rem-grout-len (* grout-space-val 2.0))
+                       (setq grout-dist (+ grout-dist (/ rem-grout-len 2.0))))
+                      (t
+                       (setq grout-dist (+ grout-dist grout-space-val)))
+                    )
+                  )
+                )
+                  )
+                )
+                (vla-delete vla-grout-path)
+              )
+            )
+            (vla-delete vla-path)
+          )
+        )
+        (if temp-pl (entdel temp-pl))
+
+        ;; 5. 복구 및 점프
+        (setq *tsp-cip-dia* save-dia
+              *tsp-cip-mode-idx* save-mode
+              *tsp-cip-overlap* save-overlap
+              *tsp-cip-equal-divide* save-equal-divide
+              *tsp-cip-interval-idx* save-interval
+              *tsp-cip-hpile-idx* save-hpile-idx
+              *tsp-cip-grouting-idx* save-grouting)
+      )
+    )
+    (setq seg-idx (1+ seg-idx))
+  )
+
+  ;; 검증(Validation) 단계
+  (setq total-counted-in-list 0 v-idx 0)
+  (while (< v-idx (length *segment-list*))
+    (if (= (cdr (assoc 'WALL-TYPE (nth v-idx *segment-list*))) "CIP")
+      (setq total-counted-in-list (+ total-counted-in-list (nth v-idx *tsp-segment-pile-counts*)))
+    )
+    (setq v-idx (1+ v-idx))
+  )
+
+  (if (= total-counted-in-list *tsp-actual-drawn-hpiles*)
+    (princ (strcat "\n[시스템 검증 성공] C.I.P 누적 캡슐 총합(" (itoa total-counted-in-list) ")과 실제 도면 생성 개수(" (itoa *tsp-actual-drawn-hpiles*) ")가 완벽히 일치합니다."))
+    (princ (strcat "\n[시스템 검증 경고] C.I.P 개수 불일치 발생! 누적 총합: " (itoa total-counted-in-list) " / 실제 생성 개수: " (itoa *tsp-actual-drawn-hpiles*)))
+  )
+)

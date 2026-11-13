@@ -1,0 +1,227 @@
+;;; ==========================================================================
+;;; 파일명: TSP_4L_Plan.lsp
+;;; 구  분: 평면도 벽체(H-Pile/CIP/띠장/그라우팅), 사보강재 및 번호표 작도 (Part L)
+;;; 역  할: 삼각형 내부 판별 및 세그먼트별 수동 중간말뚝 삭제/복원 [tsp-is-point-in-triangle, sign-func, tsp-delete-manual-post-by-segment, process-and-delete, process-deleted-pts]
+;;; 포함 함수: tsp-is-point-in-triangle, sign-func, tsp-delete-manual-post-by-segment, process-and-delete, process-deleted-pts
+;;; --------------------------------------------------------------------------
+;;; [안내] 이 파일은 TSP.lsp(메인 로더)에 의해 자동으로 로드되는 하위 모듈입니다.
+;;;        코드 수정 시 전체 파일을 합칠 필요 없이 이 파일만 단독 패치하면 됩니다.
+;;; ==========================================================================
+
+;;;;==========================================================================
+;;;; defun tsp-is-point-in-triangle : 한 점이 세 꼭짓점으로 이루어진 삼각형 내부에 있는지 판별
+;;;;==========================================================================
+(defun tsp-is-point-in-triangle (pt p1 p2 p3 / sign-func d1 d2 d3 has_neg has_pos)
+  (defun sign-func (pt1 pt2 pt3)
+    (- (* (- (car pt1) (car pt3)) (- (cadr pt2) (cadr pt3)))
+       (* (- (car pt2) (car pt3)) (- (cadr pt1) (cadr pt3))))
+  )
+  (setq d1 (sign-func pt p1 p2))
+  (setq d2 (sign-func pt p2 p3))
+  (setq d3 (sign-func pt p3 p1))
+  (setq has_neg (or (< d1 0.0) (< d2 0.0) (< d3 0.0)))
+  (setq has_pos (or (> d1 0.0) (> d2 0.0) (> d3 0.0)))
+  (not (and has_neg has_pos))
+)
+
+;;;;==========================================================================
+;;;; defun tsp-delete-manual-post-by-segment : 중간말뚝 수동 추가/삭제/초기화
+;;;;==========================================================================
+(defun tsp-delete-manual-post-by-segment (target-id target-category / new-list added-list del-list new-del-list post-record ins_pt ss i ent ent-data pt process-and-delete process-deleted-pts ss-struts valid-triangles j e-data xdata x-vals t-p1 t-p2 t-p3 tri)
+  (setq new-list '() new-del-list '())
+
+  (setq valid-triangles '())
+  (setq ss-struts (ssget "X" '((0 . "LWPOLYLINE") (8 . "_사보강재(Corner_Strut),_버팀보(Strut)"))))
+  (if ss-struts
+    (progn
+      (setq j 0)
+      (while (< j (sslength ss-struts))
+        (setq e-data (entget (ssname ss-struts j) '("TSP_STRUT_SPEC")))
+        (setq cur-layer (cdr (assoc 8 e-data)))
+        (setq xdata (assoc -3 e-data))
+        (if xdata
+          (progn
+            (setq x-vals (cdr (car (cdr xdata))))
+            (if (>= (length x-vals) 8)
+              (progn
+                (if (= (cdr (nth 0 x-vals)) target-id)
+                  (progn
+                    ;; ALL 이거나 해당 카테고리일 때만 영역 수집
+                    (if (and (or (= target-category "ALL") (= target-category "BRACE")) (= cur-layer "_사보강재(Corner_Strut)"))
+                      (progn
+                        (setq t-p1 (cdr (nth 5 x-vals)))
+                        (setq t-p2 (cdr (nth 6 x-vals)))
+                        (setq t-p3 (cdr (nth 7 x-vals)))
+                        (setq valid-triangles (append valid-triangles (list (list "TRI" t-p1 t-p2 t-p3))))
+                      )
+                    )
+                    (if (and (or (= target-category "ALL") (= target-category "STRUT")) (= cur-layer "_버팀보(Strut)"))
+                      (progn
+                        (setq s-p1 (cdr (nth 2 x-vals)))
+                        (setq s-p2 (cdr (nth 3 x-vals)))
+                        (setq s-width (cdr (nth 1 x-vals)))
+                        (setq valid-triangles (append valid-triangles (list (list "RECT" s-p1 s-p2 s-width))))
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+        (setq j (1+ j))
+      )
+    )
+  )
+
+  (setq ss (ssget "X" '((0 . "INSERT") (8 . "_중간말뚝(Post pile)"))))
+
+  (defun process-and-delete (record target / should-del s-ang d-proj d-perp rec-cat e-xdata is-correct-cat post-tag)
+    (setq ins_pt (nth 0 record))
+    (setq should-del nil)
+    (setq rec-cat (if (> (length record) 8) (nth 8 record) nil))
+
+    ;; 레코드의 카테고리가 다르면 무조건 보호
+    (if (and rec-cat (/= target-category "ALL") (/= rec-cat target-category))
+      (setq should-del nil)
+      (progn
+        (if (>= (length record) 8)
+          (if (= (nth 7 record) target) (setq should-del T))
+          (progn
+            (foreach zone valid-triangles
+              (if (= (car zone) "TRI")
+                (if (tsp-is-point-in-triangle ins_pt (nth 1 zone) (nth 2 zone) (nth 3 zone))
+                  (setq should-del T)
+                )
+                (progn
+                  (setq s-ang (angle (nth 1 zone) (nth 2 zone)))
+                  (setq d-proj (tsp-project-dist (nth 1 zone) s-ang ins_pt))
+                  (setq d-perp (abs (- (* (- (car ins_pt) (car (nth 1 zone))) (sin s-ang))
+                                       (* (- (cadr ins_pt) (cadr (nth 1 zone))) (cos s-ang)))))
+                  (if (and (>= d-proj -10.0)
+                           (<= d-proj (+ (distance (nth 1 zone) (nth 2 zone)) 10.0))
+                           (<= d-perp (+ (nth 3 zone) 100.0)))
+                    (setq should-del T)
+                  )
+                )
+              )
+            )
+          )
+        )
+
+        (if should-del
+          (progn
+            (if ss
+              (progn
+                (setq i 0)
+                (while (< i (sslength ss))
+                  (setq ent (ssname ss i))
+                  (if (entget ent)
+                    (progn
+                      (setq ent-data (entget ent))
+                      (setq pt (cdr (assoc 10 ent-data)))
+                      (if (< (distance (list (car pt) (cadr pt) 0.0) (list (car ins_pt) (cadr ins_pt) 0.0)) 1.0)
+                        (progn
+                          ;; XDATA 카테고리 교차 검증 추가
+                          (setq e-xdata (assoc -3 (entget ent '("TSP_LISP_POST"))))
+                          (setq is-correct-cat T)
+                          (if (and e-xdata (/= target-category "ALL"))
+                            (progn
+                              (setq post-tag (cdr (nth 0 (cdr (car (cdr e-xdata))))))
+                              (if (and post-tag (wcmatch post-tag "MANUAL_POST_*"))
+                                (if (/= post-tag (strcat "MANUAL_POST_" target-category))
+                                  (setq is-correct-cat nil)
+                                )
+                              )
+                            )
+                          )
+                          (if is-correct-cat (entdel ent))
+                        )
+                      )
+                    )
+                  )
+                  (setq i (1+ i))
+                )
+              )
+            )
+            nil
+          )
+          T
+        )
+      )
+    )
+  )
+
+  (defun process-deleted-pts (pt-record / should-restore s-ang d-proj d-perp)
+    (setq should-restore nil)
+    (foreach zone valid-triangles
+      (if (= (car zone) "TRI")
+        (if (tsp-is-point-in-triangle pt-record (nth 1 zone) (nth 2 zone) (nth 3 zone))
+          (setq should-restore T)
+        )
+        (progn
+          (setq s-ang (angle (nth 1 zone) (nth 2 zone)))
+          (setq d-proj (tsp-project-dist (nth 1 zone) s-ang pt-record))
+          (setq d-perp (abs (- (* (- (car pt-record) (car (nth 1 zone))) (sin s-ang))
+                               (* (- (cadr pt-record) (cadr (nth 1 zone))) (cos s-ang)))))
+          (if (and (>= d-proj -10.0)
+                   (<= d-proj (+ (distance (nth 1 zone) (nth 2 zone)) 10.0))
+                   (<= d-perp (+ (nth 3 zone) 100.0)))
+            (setq should-restore T)
+          )
+        )
+      )
+    )
+    (if should-restore nil T)
+  )
+
+  (if *tsp-use-temp-posts*
+    (progn
+      (if *tsp-temp-added-posts*
+        (progn
+          (foreach post-record *tsp-temp-added-posts*
+            (if (process-and-delete post-record target-id)
+              (setq new-list (append new-list (list post-record)))
+            )
+          )
+          (setq *tsp-temp-added-posts* new-list)
+        )
+      )
+      (if *tsp-temp-deleted-posts*
+        (progn
+          (foreach pt-record *tsp-temp-deleted-posts*
+            (if (process-deleted-pts pt-record)
+              (setq new-del-list (append new-del-list (list pt-record)))
+            )
+          )
+          (setq *tsp-temp-deleted-posts* new-del-list)
+        )
+      )
+    )
+    (progn
+      (setq added-list (vlax-ldata-get "TSP_DICT" "ADDED_POSTS"))
+      (if added-list
+        (progn
+          (foreach post-record added-list
+            (if (process-and-delete post-record target-id)
+              (setq new-list (append new-list (list post-record)))
+            )
+          )
+          (vlax-ldata-put "TSP_DICT" "ADDED_POSTS" new-list)
+        )
+      )
+      (setq del-list (vlax-ldata-get "TSP_DICT" "DELETED_POSTS"))
+      (if del-list
+        (progn
+          (foreach pt-record del-list
+            (if (process-deleted-pts pt-record)
+              (setq new-del-list (append new-del-list (list pt-record)))
+            )
+          )
+          (vlax-ldata-put "TSP_DICT" "DELETED_POSTS" new-del-list)
+        )
+      )
+    )
+  )
+  (setq *tsp-data-dirty* T)
+)

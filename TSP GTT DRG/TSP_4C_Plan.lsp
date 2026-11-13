@@ -1,0 +1,901 @@
+;;; ==========================================================================
+;;; 파일명: TSP_4C_Plan.lsp
+;;; 구  분: 평면도 벽체(H-Pile/CIP/띠장/그라우팅), 사보강재 및 번호표 작도 (Part C)
+;;; 역  할: 평면 띠장 오프셋/상향, H-Pile/토류판 배치, 사보강재/화타쐐기, 차수그라우팅, 연속 CIP 평면 배열, 세그먼트/모서리 번호표 및 수동말뚝 삭제 [place-hpile-timber-along-boundary, make-lw-line]
+;;; 포함 함수: place-hpile-timber-along-boundary, make-lw-line
+;;; --------------------------------------------------------------------------
+;;; [안내] 이 파일은 TSP.lsp(메인 로더)에 의해 자동으로 로드되는 하위 모듈입니다.
+;;;        코드 수정 시 전체 파일을 합칠 필요 없이 이 파일만 단독 패치하면 됩니다.
+;;; ==========================================================================
+
+;;;;==========================================================================
+;;;; defun tsp-hatch-timber-panel : 토류판 폴리라인에 표준 해치를 적용
+;;;;==========================================================================
+;;;; defun tsp-draw-timber-bent : [경계선 추종] 토류판을 경계선 형상대로 분할 작도
+;;;;   하나의 평평한 판으로 꺾임점을 가로지르면 양쪽 H-Pile과 각도가 틀어지므로,
+;;;;   경계선 방향이 바뀌는 지점에서 판을 분할하고 각 조각을 국소 방향에 정렬한다.
+;;;;   (모서리는 두 오프셋 선의 교점으로 마이터 처리)
+;;;;   반환: (첫 폴리라인 시점측 이면점 종점측 이면점)  또는 nil
+;;;;==========================================================================
+;;;; defun place-hpile-timber-along-boundary : 평면도 H-Pile/토류판 통합 작도
+;;;;==========================================================================
+(defun place-hpile-timber-along-boundary (boundary-ent boundary-orient / make-lw-line h b tw tf hpile-values hpile-block geo-info geo-vobj geo-total geo-closed geo-d1 geo-d2 geo-plen geo-res geo-rot geo-dl geo-pan-a geo-pan-b geo-tim-ang timber-width timber-offset corner-gap boundary-data orig-vertices is-closed num-vertices i prev-idx next-idx prev-vertex curr-vertex next-vertex angle1 angle2 angle-diff turn-direction bisector-angle corner-rotation seg-idx max-segments n-verts pt1 pt2 seg-length seg-angle mid-pt ctc-mm outward-normal start-idx start-prev start-next start-vertex end-idx end-prev end-next end-vertex start-hpile-info end-hpile-info start-limit end-limit safe-start safe-end final-width final-center-dist timber-pt timber-pt-offset dist new-pt hpile-rotation timber-result timber-pline top-left top-right edge-gap left-hpile-pt right-hpile-pt left-offset-pt right-offset-pt timber-idx total-timbers d-start piles-A piles-B timbers-A timbers-B count-A count-B use-method-B final-piles final-timbers temp-dist center start-pile-placed end-pile-placed start-pile-pt end-pile-pt start-is-corner end-is-corner range new-start new-end raw-start raw-end valid-timbers potential-start potential-end seg-data is-def current-spec current-ctc prev-seg-idx next-seg-idx prev-spec next-spec prev-vals next-vals h-prev b-prev h-next b-next current-thick target-seg-data theory-count-A theory-count-B h-start b-start h-end b-end tf-start tf-end wale-spec wale-vals wale-h max-anchor-L max-anchor-ang max-anchor-free max-anchor-bond has-anchor cur-free cur-bond cur-ang cur-L proj-free proj-bond pt-base pt-free-end pt-bond-end pt-h1 pt-h2 pt-h3 pt-h4 cos-val proj-prot pt-anchor-start mid-pile-count prev-def next-def next-seg-real-idx cur-brace prev-brace dist-to-start dist-to-end brace-blocked p-brace b-spec b-custom b-dist-m b-dist b-h dir-A dir-B norm-A norm-B pt-A-base pt-B-base pt-A-inner pt-B-inner brace-dir half-w L1-A L1-B L2-A L2-B pA1 pB1 pA2 pB2 wA1 wA2 wB1 wB2 brace-b-rows b-row chk-last-b-row chk-b-custom chk-b-dist chk-b-h chk-margin next-brace idx w-h-prev w-h-next draw-closed-poly vW-A dot-A pBaseExt-A pBaseOth-A isExtA2 p1_foot-A p1_14-A p1-A l2_p2-A p2-A p2_foot-A p2_14-A p3-A p2_end-A p3_end-A brace_A1 brace_A2 brace-dir-B vW-B dot-B pBaseExt-B pBaseOth-B isExtB2 p1_foot-B p1_14-B p1-B l2_p2-B p2-B p2_foot-B p2_14-B p3-B p2_end-B p3_end-B brace_B1 brace_B2 brace_A1_in brace_A2_in brace_B1_in brace_B2_in b-tw half-tw mid_A_in mid_B_in web1_A web1_B web2_A web2_B b-row-idx b-jack jack-side jack-len pt-jack-ins jack-rot in-continuous-chain carry-over-rem angle-tolerance next-is-continuous next-pt1 next-pt2 angle-next ang-diff use-directional pos t-start t-center skip-this-corner tw-start tw-end start-pile-rot end-pile-rot sorted-pile-dists mid-pile-infos start-corner-mode end-corner-mode c-turn-s c-turn-e use-s-pocket use-e-pocket left-mode left-data right-mode right-data pocket-res tsp-local-to-world tsp-world-to-local tsp-refine-corner-adj tsp-calc-pocket-ext tsp-solve-convex-timber)
+
+;;;;==========================================================================
+;;;; defun make-lw-line : 선분 생성 보조
+;;;;==========================================================================
+  (defun make-lw-line (p1 p2 layer color)
+    (entmake (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline")
+                   (cons 8 layer) (cons 62 color) '(90 . 2) '(70 . 0)
+                   (list 10 (car p1) (cadr p1)) (list 10 (car p2) (cadr p2))))
+  )
+
+  ;; [보조] H-Pile 로컬 좌표(lx, ly) -> 월드 좌표 변환
+  (defun tsp-local-to-world (ins-pt rot lx ly / ca sa)
+    (setq ca (cos rot) sa (sin rot))
+    (list (+ (car ins-pt) (- (* lx ca) (* ly sa)))
+          (+ (cadr ins-pt) (+ (* lx sa) (* ly ca)))
+          0.0)
+  )
+
+  ;; [보조] 월드 좌표 -> H-Pile 로컬 좌표(lx, ly) 변환
+  (defun tsp-world-to-local (ins-pt rot wx wy / ca sa dx dy)
+    (setq ca (cos rot) sa (sin rot))
+    (setq dx (- wx (car ins-pt)) dy (- wy (cadr ins-pt)))
+    (list (+ (* dx ca) (* dy sa))
+          (+ (- (* dx sa)) (* dy ca)))
+  )
+
+  ;; [보조] 경계선 중간 꺾임점 존재 시 코너 인접 국소 방향점(±10mm) 추출 (코너 H-Pile 회전각과 100% 동기화)
+  (defun tsp-refine-corner-adj (c-vert p-vert n-vert / d-curr-c d-prev-c d-next-c dir-sign d-arr d-dep p-arr p-dep out-p out-n)
+    (setq out-p p-vert out-n n-vert)
+    (if (and geo-info geo-vobj)
+      (progn
+        (setq d-curr-c (tsp-dist-of-near-vertex (nth 0 geo-info) (nth 1 geo-info) c-vert))
+        (setq d-prev-c (tsp-dist-of-near-vertex (nth 0 geo-info) (nth 1 geo-info) p-vert))
+        (setq d-next-c (tsp-dist-of-near-vertex (nth 0 geo-info) (nth 1 geo-info) n-vert))
+        (if (and d-curr-c d-prev-c d-next-c)
+          (progn
+            (setq dir-sign (if (and (not geo-closed) (< d-curr-c d-prev-c)) -1.0 1.0))
+            (setq d-arr (- d-curr-c (* dir-sign 10.0)))
+            (setq d-dep (+ d-curr-c (* dir-sign 10.0)))
+            (if geo-closed
+              (progn
+                (while (< d-arr 0.0) (setq d-arr (+ d-arr geo-total)))
+                (while (>= d-arr geo-total) (setq d-arr (- d-arr geo-total)))
+                (while (< d-dep 0.0) (setq d-dep (+ d-dep geo-total)))
+                (while (>= d-dep geo-total) (setq d-dep (- d-dep geo-total)))
+              )
+              (progn
+                (setq d-arr (max 0.0 (min geo-total d-arr)))
+                (setq d-dep (max 0.0 (min geo-total d-dep)))
+              )
+            )
+            (setq p-arr (vl-catch-all-apply 'vlax-curve-getPointAtDist (list geo-vobj d-arr)))
+            (setq p-dep (vl-catch-all-apply 'vlax-curve-getPointAtDist (list geo-vobj d-dep)))
+            (if (and p-arr (not (vl-catch-all-error-p p-arr)) (> (distance p-arr c-vert) 0.1))
+              (setq out-p (list (car p-arr) (cadr p-arr) 0.0))
+            )
+            (if (and p-dep (not (vl-catch-all-error-p p-dep)) (> (distance c-vert p-dep) 0.1))
+              (setq out-n (list (car p-dep) (cadr p-dep) 0.0))
+            )
+          )
+        )
+      )
+    )
+    (list out-p out-n)
+  )
+
+  ;; [보조] 볼록 코너 H-Pile 플랜지 포켓 내부로의 토류판 안전 삽입 깊이 계산 (웨브/필렛 및 배면 플랜지 간섭 방지)
+  (defun tsp-calc-pocket-ext (ux uy nx ny c-side c-rot c-h c-b c-tw c-tf thick / ca sa ulx uly nlx nly max-s web-lim flange-clear x0 y0 s-web s-bf)
+    (setq ca (cos c-rot) sa (sin c-rot))
+    (setq ulx (+ (* ux ca) (* uy sa)))
+    (setq uly (+ (- (* ux sa)) (* uy ca)))
+    (setq nlx (+ (* nx ca) (* ny sa)))
+    (setq nly (+ (- (* nx sa)) (* ny ca)))
+    (setq max-s 75.0)
+    (setq web-lim (+ (/ c-tw 2.0) (* c-tw 2.0) 5.0)) ;; 웨브 반두께 + 필렛 반경(2*tw) + 여유 5mm
+    (setq flange-clear 10.0)
+    (foreach corner-pt (list (list (* c-side (/ c-b 2.0)) c-tf)
+                             (list (+ (* c-side (/ c-b 2.0)) (* thick nlx)) (+ c-tf (* thick nly))))
+      (setq x0 (car corner-pt) y0 (cadr corner-pt))
+      (if (< (* c-side ulx) -1e-6)
+        (progn
+          (setq s-web (/ (- web-lim (* c-side x0)) (* c-side ulx)))
+          (if (< s-web max-s) (setq max-s s-web))
+        )
+      )
+      (if (> uly 1e-6)
+        (progn
+          (setq s-bf (/ (- c-h c-tf flange-clear y0) uly))
+          (if (< s-bf max-s) (setq max-s s-bf))
+        )
+      )
+    )
+    (max 0.0 max-s)
+  )
+
+  ;; [보조] 볼록/오목 코너 인접 토류판의 중심점/길이/회전각 정밀 산출
+  ;;   - CONVEX(볼록): 인접 말뚝 홈 -> 코너 말뚝 전면 플랜지 내측 끝단(±b/2, tf) 경유 포켓 내부 삽입
+  ;;   - CONCAVE(오목): 인접 말뚝 홈 -> 코너 말뚝 전면 플랜지 내측 필렛 시작점(±(tw/2 + 2*tw), tf) 직결 (급격한 오목각에서 배면 모서리의 웨브 침범 자동 방지)
+  (defun tsp-solve-convex-timber (s-mode s-data e-mode e-data thick b-orient s-ang gap / ref-s ref-e earth-ang earth-x earth-y p-pt p-rot p-tf g1 g2 pA pB c-pt c-rot c-h c-b c-tw c-tf tL tR c-side-s c-side-e lx-mag-s lx-mag-e iter-k dx dy base-d ux uy n1x n1y nx ny p-back loc-back pen ext-s ext-e p-fs p-fe total-w mid-fx mid-fy cpt r-ang ly-x ly-y)
+    (setq ref-s (car s-data) ref-e (car e-data))
+    (setq earth-ang (+ s-ang (* b-orient (/ pi 2.0)) pi))
+    (setq earth-x (cos earth-ang) earth-y (sin earth-ang))
+    (cond
+      ((= s-mode "NORMAL")
+       (setq p-pt (nth 0 s-data) p-rot (nth 1 s-data) p-tf (nth 2 s-data))
+       (setq g1 (tsp-local-to-world p-pt p-rot gap p-tf))
+       (setq g2 (tsp-local-to-world p-pt p-rot (- gap) p-tf))
+       (setq pA (if (<= (distance g1 ref-e) (distance g2 ref-e)) g1 g2))
+      )
+      ((= s-mode "CONCAVE")
+       (setq c-pt (nth 0 s-data) c-rot (nth 1 s-data) c-h (nth 2 s-data) c-b (nth 3 s-data) c-tw (nth 4 s-data) c-tf (nth 5 s-data))
+       (setq lx-mag-s (+ (/ c-tw 2.0) (* 2.0 c-tw))) ;; 필렛 시작 정점 (예: 250H -> 22.5, 300H -> 25.0)
+       (setq tL (tsp-local-to-world c-pt c-rot (- lx-mag-s) c-tf))
+       (setq tR (tsp-local-to-world c-pt c-rot lx-mag-s c-tf))
+       (if (<= (distance tL ref-e) (distance tR ref-e))
+         (setq pA tL c-side-s -1.0)
+         (setq pA tR c-side-s 1.0)
+       )
+      )
+      (t
+       (setq c-pt (nth 0 s-data) c-rot (nth 1 s-data) c-h (nth 2 s-data) c-b (nth 3 s-data) c-tw (nth 4 s-data) c-tf (nth 5 s-data))
+       (setq tL (tsp-local-to-world c-pt c-rot (- (/ c-b 2.0)) c-tf))
+       (setq tR (tsp-local-to-world c-pt c-rot (/ c-b 2.0) c-tf))
+       (if (<= (distance tL ref-e) (distance tR ref-e))
+         (setq pA tL c-side-s -1.0)
+         (setq pA tR c-side-s 1.0)
+       )
+      )
+    )
+    (cond
+      ((= e-mode "NORMAL")
+       (setq p-pt (nth 0 e-data) p-rot (nth 1 e-data) p-tf (nth 2 e-data))
+       (setq g1 (tsp-local-to-world p-pt p-rot gap p-tf))
+       (setq g2 (tsp-local-to-world p-pt p-rot (- gap) p-tf))
+       (setq pB (if (<= (distance g1 ref-s) (distance g2 ref-s)) g1 g2))
+      )
+      ((= e-mode "CONCAVE")
+       (setq c-pt (nth 0 e-data) c-rot (nth 1 e-data) c-h (nth 2 e-data) c-b (nth 3 e-data) c-tw (nth 4 e-data) c-tf (nth 5 e-data))
+       (setq lx-mag-e (+ (/ c-tw 2.0) (* 2.0 c-tw))) ;; 필렛 시작 정점 (pt10a / pt9b)
+       (setq tL (tsp-local-to-world c-pt c-rot (- lx-mag-e) c-tf))
+       (setq tR (tsp-local-to-world c-pt c-rot lx-mag-e c-tf))
+       (if (<= (distance tL ref-s) (distance tR ref-s))
+         (setq pB tL c-side-e -1.0)
+         (setq pB tR c-side-e 1.0)
+       )
+      )
+      (t
+       (setq c-pt (nth 0 e-data) c-rot (nth 1 e-data) c-h (nth 2 e-data) c-b (nth 3 e-data) c-tw (nth 4 e-data) c-tf (nth 5 e-data))
+       (setq tL (tsp-local-to-world c-pt c-rot (- (/ c-b 2.0)) c-tf))
+       (setq tR (tsp-local-to-world c-pt c-rot (/ c-b 2.0) c-tf))
+       (if (<= (distance tL ref-s) (distance tR ref-s))
+         (setq pB tL c-side-e -1.0)
+         (setq pB tR c-side-e 1.0)
+       )
+      )
+    )
+    ;; 오목 코너가 급격할 때(예: 45도 이상 꺾임) 토류판 배면 모서리가 코너 H-Pile 웨브를 침범하지 않도록 플랜지 내측면 따라 외측 보정
+    (setq iter-k 0)
+    (while (< iter-k 3)
+      (setq dx (- (car pB) (car pA)) dy (- (cadr pB) (cadr pA)))
+      (setq base-d (sqrt (+ (* dx dx) (* dy dy))))
+      (if (> base-d 1.0)
+        (progn
+          (setq ux (/ dx base-d) uy (/ dy base-d))
+          (setq n1x (- uy) n1y ux)
+          (if (> (+ (* n1x earth-x) (* n1y earth-y)) 0.0)
+            (setq nx n1x ny n1y)
+            (setq nx uy ny (- ux))
+          )
+          (if (= s-mode "CONCAVE")
+            (progn
+              (setq p-back (list (+ (car pA) (* thick nx)) (+ (cadr pA) (* thick ny))))
+              (setq loc-back (tsp-world-to-local (nth 0 s-data) (nth 1 s-data) (car p-back) (cadr p-back)))
+              (setq pen (- (+ (/ (nth 4 s-data) 2.0) 2.0) (* c-side-s (car loc-back))))
+              (if (> pen 0.01)
+                (progn
+                  (setq lx-mag-s (min (/ (nth 3 s-data) 2.0) (+ lx-mag-s pen)))
+                  (setq pA (tsp-local-to-world (nth 0 s-data) (nth 1 s-data) (* c-side-s lx-mag-s) (nth 5 s-data)))
+                )
+              )
+            )
+          )
+          (if (= e-mode "CONCAVE")
+            (progn
+              (setq p-back (list (+ (car pB) (* thick nx)) (+ (cadr pB) (* thick ny))))
+              (setq loc-back (tsp-world-to-local (nth 0 e-data) (nth 1 e-data) (car p-back) (cadr p-back)))
+              (setq pen (- (+ (/ (nth 4 e-data) 2.0) 2.0) (* c-side-e (car loc-back))))
+              (if (> pen 0.01)
+                (progn
+                  (setq lx-mag-e (min (/ (nth 3 e-data) 2.0) (+ lx-mag-e pen)))
+                  (setq pB (tsp-local-to-world (nth 0 e-data) (nth 1 e-data) (* c-side-e lx-mag-e) (nth 5 e-data)))
+                )
+              )
+            )
+          )
+        )
+      )
+      (setq iter-k (1+ iter-k))
+    )
+    (setq dx (- (car pB) (car pA)) dy (- (cadr pB) (cadr pA)))
+    (setq base-d (sqrt (+ (* dx dx) (* dy dy))))
+    (if (> base-d 1.0)
+      (progn
+        (setq ux (/ dx base-d) uy (/ dy base-d))
+        (setq n1x (- uy) n1y ux)
+        (if (> (+ (* n1x earth-x) (* n1y earth-y)) 0.0)
+          (setq nx n1x ny n1y)
+          (setq nx uy ny (- ux))
+        )
+        (setq ext-s 0.0 ext-e 0.0)
+        (if (= s-mode "CONVEX")
+          (setq ext-s (tsp-calc-pocket-ext (- ux) (- uy) nx ny c-side-s (nth 1 s-data) (nth 2 s-data) (nth 3 s-data) (nth 4 s-data) (nth 5 s-data) thick))
+        )
+        (if (= e-mode "CONVEX")
+          (setq ext-e (tsp-calc-pocket-ext ux uy nx ny c-side-e (nth 1 e-data) (nth 2 e-data) (nth 3 e-data) (nth 4 e-data) (nth 5 e-data) thick))
+        )
+        (setq p-fs (list (- (car pA) (* ext-s ux)) (- (cadr pA) (* ext-s uy))))
+        (setq p-fe (list (+ (car pB) (* ext-e ux)) (+ (cadr pB) (* ext-e uy))))
+        (setq total-w (+ base-d ext-s ext-e))
+        (setq mid-fx (/ (+ (car p-fs) (car p-fe)) 2.0))
+        (setq mid-fy (/ (+ (cadr p-fs) (cadr p-fe)) 2.0))
+        (setq cpt (list (+ mid-fx (* (/ thick 2.0) nx)) (+ mid-fy (* (/ thick 2.0) ny)) 0.0))
+        (setq r-ang (atan uy ux))
+        ;; create-timber-panel-object의 로컬 +Y축(-sin r, cos r)이 배면(토사측 nx, ny)을 향하도록 보정
+        (setq ly-x (- (sin r-ang)) ly-y (cos r-ang))
+        (if (< (+ (* ly-x nx) (* ly-y ny)) 0.0)
+          (setq r-ang (+ r-ang pi))
+        )
+        (list cpt total-w r-ang)
+      )
+      nil
+    )
+  )
+  (setq corner-gap 50.0)
+  (setq edge-gap 25.0)
+  ;; [경계선 추종] 경계선 실제 형상 정보 초기화 (설계 정점에 없는 '삭제된 모서리'를 포함)
+  (setq geo-info (tsp-boundary-path-info boundary-ent))
+  (setq geo-vobj (if geo-info (vl-catch-all-apply 'vlax-ename->vla-object (list boundary-ent)) nil))
+  (if (or (null geo-vobj) (vl-catch-all-error-p geo-vobj)) (setq geo-vobj nil))
+  (if geo-info
+    (progn
+      (setq geo-total (nth 2 geo-info) geo-closed (nth 3 geo-info))
+      (princ "\n[경계선 추종] 말뚝/토류판을 경계선 실제 형상에 정렬합니다.")
+    )
+    (princ "\n[경계선 추종] 경계선 형상 해석 실패 - 기존(현 기준) 방식으로 작도합니다.")
+  )
+
+  ;; (setq *tsp-segment-pile-counts* '())
+  (setq is-closed (is-closed-polyline boundary-ent))
+  (setq orig-vertices (mapcar '(lambda (item) (cdr (assoc 'V-START item))) *segment-list*))
+  (if (not is-closed) (setq orig-vertices (append orig-vertices (list (cdr (assoc 'V-END (last *segment-list*)))))))
+  (setq num-vertices (length orig-vertices))
+  (setq seg-idx 0 n-verts num-vertices)
+  (setq max-segments (if is-closed n-verts (- n-verts 1)))
+  (while (< seg-idx max-segments)
+    (setq seg-data (nth seg-idx *segment-list*))
+    (setq is-def (cdr (assoc 'IS-DEFINED seg-data)))
+    (setq mid-pile-count 0)
+    ;; [7단계] CIP 세그먼트는 place-hpile-timber에서 건너뜀
+    ;; (CIP는 tsp-draw-cip-plan-per-segment에서 별도 처리)
+    (if (= (cdr (assoc 'WALL-TYPE seg-data)) "CIP")
+      (setq is-def nil)
+    )
+    (if is-def
+      (progn
+        (setq current-spec (cdr (assoc 'WALL-SPEC seg-data)))
+        (if (= current-spec "User-defined") (setq hpile-values (cdr (assoc 'WALL-CUSTOM seg-data))) (setq hpile-values (parse-h-spec current-spec)))
+        (setq h (nth 0 hpile-values) b (nth 1 hpile-values) tw (nth 2 hpile-values) tf (nth 3 hpile-values))
+        (setq current-ctc (cdr (assoc 'CTC seg-data)))
+        (setq ctc-mm (* current-ctc 1000.0))
+        (setq current-thick (cdr (assoc 'TIMBER-THICKNESS seg-data)))
+        (if (null current-thick) (setq current-thick 60))
+        (setq timber-offset (+ tf (/ current-thick 2.0)))
+        (setq timber-width (- (* current-ctc 1000) 50))
+        (setq hpile-block (create-hpile-section-block h b tw tf))
+        (setq pt1 (nth seg-idx orig-vertices))
+        (setq pt2 (nth (if is-closed (rem (+ seg-idx 1) n-verts) (+ seg-idx 1)) orig-vertices))
+        (setq seg-length (distance pt1 pt2) seg-angle (angle pt1 pt2))
+        (setq geo-d1 (if geo-info (tsp-dist-of-near-vertex (nth 0 geo-info) (nth 1 geo-info) pt1)))
+        (setq geo-d2 (if geo-info (tsp-dist-of-near-vertex (nth 0 geo-info) (nth 1 geo-info) pt2)))
+        ;; [패치] 개방형 경계선에서 역방향(geo-d2 < geo-d1)일 때 geo-d1을 nil로 죽이지 않고
+        ;; 음수 호장 길이(- (geo-d1 - geo-d2))를 전달하여 경계선 추종이 100% 작동하도록 수정
+        (setq geo-plen
+          (if (and geo-d1 geo-d2)
+            (cond
+              ((>= geo-d2 geo-d1) (- geo-d2 geo-d1))
+              ((not geo-closed)   (- geo-d2 geo-d1)) ;; 음수값으로 역방향 표시
+              (t                  (+ (- geo-total geo-d1) geo-d2))
+            )
+            (if (and geo-d1 geo-closed) (- geo-total geo-d1) nil)
+          )
+        )
+        (setq mid-pt (list (/ (+ (car pt1) (car pt2)) 2.0) (/ (+ (cadr pt1) (cadr pt2)) 2.0) 0.0))
+        (setq outward-normal (+ seg-angle (* boundary-orient (/ pi 2.0))))
+        (setq hpile-rotation (+ outward-normal (/ pi 2.0)))
+        (setq wale-spec (cdr (assoc 'WALE-SPEC seg-data)))
+        (if (= wale-spec "User-defined") (setq wale-vals (cdr (assoc 'WALE-CUSTOM seg-data))) (setq wale-vals (parse-h-spec wale-spec)))
+        (if (null wale-vals) (setq wale-vals '(300 300 10 15)))
+        (setq wale-h (nth 0 wale-vals))
+        (setq max-anchor-L 0.0 max-anchor-ang 0.0 max-anchor-free 0.0 max-anchor-bond 0.0 has-anchor nil)
+        (foreach s-item (cdr (assoc 'SUPPORT-LIST seg-data))
+          (if (wcmatch (car s-item) "앵커*")
+            (progn
+              (setq cur-free (nth 5 s-item) cur-bond (nth 6 s-item) cur-ang (nth 4 s-item))
+              (setq cur-L (+ cur-free cur-bond))
+              (if (> cur-L max-anchor-L) (progn (setq max-anchor-L cur-L max-anchor-ang cur-ang max-anchor-free cur-free max-anchor-bond cur-bond has-anchor T)))
+            )
+          )
+        )
+        (setq start-pile-placed nil end-pile-placed nil start-is-corner nil end-is-corner nil)
+        (setq start-idx seg-idx end-idx (if is-closed (rem (+ seg-idx 1) n-verts) (+ seg-idx 1)))
+        (setq h-start h b-start b tw-start tw tf-start tf)
+        (setq prev-idx (if is-closed (if (= start-idx 0) (- n-verts 1) (- start-idx 1)) (- start-idx 1)))
+        (setq prev-def (if (>= prev-idx 0) (cdr (assoc 'IS-DEFINED (nth prev-idx *segment-list*))) nil))
+        (if prev-def
+          (progn
+            (if (= (cdr (assoc 'WALL-TYPE (nth prev-idx *segment-list*))) "CIP")
+              (setq prev-spec (nth (atoi (if (assoc 'CIP-HPILE-IDX (nth prev-idx *segment-list*)) (cdr (assoc 'CIP-HPILE-IDX (nth prev-idx *segment-list*))) "2")) *tsp-std-wall-list*)
+                    prev-vals (parse-h-spec prev-spec))
+              (progn
+                (setq prev-spec (cdr (assoc 'WALL-SPEC (nth prev-idx *segment-list*))))
+                (if (= prev-spec "User-defined") (setq prev-vals (cdr (assoc 'WALL-CUSTOM (nth prev-idx *segment-list*)))) (setq prev-vals (parse-h-spec prev-spec)))
+              )
+            )
+            (setq h-prev (nth 0 prev-vals) b-prev (nth 1 prev-vals))
+            (if (or (> h-prev h) (and (= h-prev h) (> b-prev b)))
+              (setq h-start h-prev b-start b-prev tw-start (nth 2 prev-vals) tf-start (nth 3 prev-vals))
+            )
+          )
+        )
+        (setq h-end h b-end b tw-end tw tf-end tf)
+        (setq next-seg-real-idx (if is-closed (rem (+ seg-idx 1) n-verts) (+ seg-idx 1)))
+        (setq next-def (if (< next-seg-real-idx max-segments) (cdr (assoc 'IS-DEFINED (nth next-seg-real-idx *segment-list*))) nil))
+        (if next-def
+          (progn
+             (if (= (cdr (assoc 'WALL-TYPE (nth next-seg-real-idx *segment-list*))) "CIP")
+               (setq next-spec (nth (atoi (if (assoc 'CIP-HPILE-IDX (nth next-seg-real-idx *segment-list*)) (cdr (assoc 'CIP-HPILE-IDX (nth next-seg-real-idx *segment-list*))) "2")) *tsp-std-wall-list*)
+                     next-vals (parse-h-spec next-spec))
+               (progn
+                 (setq next-spec (cdr (assoc 'WALL-SPEC (nth next-seg-real-idx *segment-list*))))
+                 (if (= next-spec "User-defined") (setq next-vals (cdr (assoc 'WALL-CUSTOM (nth next-seg-real-idx *segment-list*)))) (setq next-vals (parse-h-spec next-spec)))
+               )
+             )
+             (setq h-next (nth 0 next-vals) b-next (nth 1 next-vals))
+             (if (or (> h-next h) (and (= h-next h) (> b-next b)))
+               (setq h-end h-next b-end b-next tw-end (nth 2 next-vals) tf-end (nth 3 next-vals))
+             )
+          )
+        )
+        ;; [패치] 세그먼트 편집으로 생성된 직선상 모서리 및 이종 벽체(H-Pile <-> CIP) 모서리에서도
+        ;; 모서리 정점 위에 코너 H-Pile이 1개만 공유 배치되도록 is-collinear 예외를 해제합니다.
+        (setq is-collinear-start nil)
+        (setq is-collinear-end nil)
+        (setq start-corner-mode nil end-corner-mode nil)
+        (setq start-pile-rot hpile-rotation end-pile-rot hpile-rotation)
+        (if prev-def
+          (progn
+            (setq start-is-corner T start-vertex (nth start-idx orig-vertices) start-prev (nth (if is-closed (if (= start-idx 0) (- n-verts 1) (- start-idx 1)) (- start-idx 1)) orig-vertices) start-next (nth (if is-closed (if (= start-idx (- n-verts 1)) 0 (+ start-idx 1)) (+ start-idx 1)) orig-vertices))
+            (setq pocket-res (tsp-refine-corner-adj start-vertex start-prev start-next))
+            (setq start-prev (car pocket-res) start-next (cadr pocket-res))
+            (setq start-hpile-info (calculate-corner-params start-vertex start-prev start-next h-start b-start timber-offset boundary-orient))
+            (setq start-limit (get-hpile-limit-offset (car start-hpile-info) h-start b-start tf-start (cadr start-hpile-info) pt1 seg-angle T (nth 2 start-hpile-info)))
+            (setq c-turn-s (abs (- (angle start-vertex start-next) (angle start-prev start-vertex))))
+            (while (> c-turn-s pi) (setq c-turn-s (abs (- c-turn-s (* 2.0 pi)))))
+            (if (>= c-turn-s (* 5.0 (/ pi 180.0)))
+              (setq start-corner-mode (if (nth 2 start-hpile-info) "CONVEX" "CONCAVE"))
+            )
+          )
+          (progn
+            (setq start-pile-pt (polar pt1 seg-angle (/ b 2.0)))
+            (setq geo-rot hpile-rotation)
+            (setq geo-res (tsp-geo-station (/ b 2.0) geo-d1 seg-length geo-plen geo-total geo-closed geo-vobj))
+            (if geo-res
+              (progn
+                (setq start-pile-pt (car geo-res))
+                (if (cadr geo-res) (setq geo-rot (+ (cadr geo-res) (* boundary-orient (/ pi 2.0)) (/ pi 2.0))))
+              )
+            )
+            (setq start-pile-rot geo-rot)
+            (entmake (list '(0 . "INSERT") (cons 2 hpile-block) '(8 . "_측면말뚝") (cons 10 start-pile-pt) '(41 . 1.0) '(42 . 1.0) '(43 . 1.0) (cons 50 geo-rot)))
+            (setq *tsp-hpile-points* (append *tsp-hpile-points* (list start-pile-pt)))
+            (setq start-limit (+ (/ b 2.0) 25.0) start-pile-placed T start-is-corner nil)
+          )
+        )
+        (if next-def
+          (progn
+            (setq end-is-corner T end-vertex (nth end-idx orig-vertices) end-prev (nth (if is-closed (if (= end-idx 0) (- n-verts 1) (- end-idx 1)) (- end-idx 1)) orig-vertices) end-next (nth (if is-closed (if (= end-idx (- n-verts 1)) 0 (+ end-idx 1)) (+ end-idx 1)) orig-vertices))
+            (setq pocket-res (tsp-refine-corner-adj end-vertex end-prev end-next))
+            (setq end-prev (car pocket-res) end-next (cadr pocket-res))
+            (setq end-hpile-info (calculate-corner-params end-vertex end-prev end-next h-end b-end timber-offset boundary-orient))
+            (setq end-limit (get-hpile-limit-offset (car end-hpile-info) h-end b-end tf-end (cadr end-hpile-info) pt1 seg-angle nil (nth 2 end-hpile-info)))
+            (setq c-turn-e (abs (- (angle end-vertex end-next) (angle end-prev end-vertex))))
+            (while (> c-turn-e pi) (setq c-turn-e (abs (- c-turn-e (* 2.0 pi)))))
+            (if (>= c-turn-e (* 5.0 (/ pi 180.0)))
+              (setq end-corner-mode (if (nth 2 end-hpile-info) "CONVEX" "CONCAVE"))
+            )
+          )
+          (progn
+            (setq end-pile-pt (polar pt2 (+ seg-angle pi) (/ b 2.0)))
+            (setq geo-rot hpile-rotation)
+            (setq geo-res (tsp-geo-station (- seg-length (/ b 2.0)) geo-d1 seg-length geo-plen geo-total geo-closed geo-vobj))
+            (if geo-res
+              (progn
+                (setq end-pile-pt (car geo-res))
+                (if (cadr geo-res) (setq geo-rot (+ (cadr geo-res) (* boundary-orient (/ pi 2.0)) (/ pi 2.0))))
+              )
+            )
+            (setq end-pile-rot geo-rot)
+            (entmake (list '(0 . "INSERT") (cons 2 hpile-block) '(8 . "_측면말뚝") (cons 10 end-pile-pt) '(41 . 1.0) '(42 . 1.0) '(43 . 1.0) (cons 50 geo-rot)))
+            (setq *tsp-hpile-points* (append *tsp-hpile-points* (list end-pile-pt)))
+            (setq end-limit (- seg-length (+ (/ b 2.0) 25.0)) end-pile-placed T end-is-corner nil)
+          )
+        )
+
+        (if (<= start-limit end-limit)
+          (progn
+            (setq final-piles '())
+            (setq final-timbers '())
+
+            ;; [독립 벽체 모드] 기존 방식대로 중앙(Mid-pt) 기준 양쪽 대칭 배열
+            (setq piles-A '() count-A 0 theory-count-A 0 i 0) (while (<= (* (+ i 0.5) ctc-mm) (/ seg-length 2.0)) (foreach dir '(1.0 -1.0) (setq theory-count-A (1+ theory-count-A) temp-dist (* (+ i 0.5) ctc-mm dir) center (+ (/ seg-length 2.0) temp-dist)) (if (and (> center (+ start-limit (/ b 2.0))) (< center (- end-limit (/ b 2.0)))) (progn (setq piles-A (append piles-A (list (polar mid-pt seg-angle temp-dist))) count-A (1+ count-A))))) (setq i (1+ i)))
+            (setq piles-B '() count-B 0 theory-count-B 1 center (/ seg-length 2.0)) (if (and (> center (+ start-limit (/ b 2.0))) (< center (- end-limit (/ b 2.0)))) (progn (setq piles-B (list mid-pt) count-B 1))) (setq i 1) (while (<= (* i ctc-mm) (/ seg-length 2.0)) (foreach dir '(1.0 -1.0) (setq theory-count-B (1+ theory-count-B) temp-dist (* i ctc-mm dir) center (+ (/ seg-length 2.0) temp-dist)) (if (and (> center (+ start-limit (/ b 2.0))) (< center (- end-limit (/ b 2.0)))) (progn (setq piles-B (append piles-B (list (polar mid-pt seg-angle temp-dist))) count-B (1+ count-B))))) (setq i (1+ i)))
+            (cond ((< count-B count-A) (setq use-method-B T)) ((> count-B count-A) (setq use-method-B nil)) (t (setq use-method-B nil)))
+            (if use-method-B (setq final-piles piles-B) (setq final-piles piles-A))
+            ;; 1. 실제 배치된 H-Pile을 기준점(pt1)으로부터의 거리순으로 정렬 및 경계선 추종 좌표/회전각 선산출
+            (setq sorted-pile-dists
+              (vl-sort
+                (mapcar (function (lambda (p) (distance pt1 p))) final-piles)
+                '<
+              )
+            )
+            (setq mid-pile-infos '())
+            (foreach p-dist sorted-pile-dists
+              (setq new-pt (polar pt1 seg-angle p-dist))
+              (setq geo-rot hpile-rotation)
+              (setq geo-res (tsp-geo-station p-dist geo-d1 seg-length geo-plen geo-total geo-closed geo-vobj))
+              (if geo-res
+                (progn
+                  (setq new-pt (car geo-res))
+                  (if (cadr geo-res) (setq geo-rot (+ (cadr geo-res) (* boundary-orient (/ pi 2.0)) (/ pi 2.0))))
+                )
+              )
+              (setq mid-pile-infos (append mid-pile-infos (list (list p-dist new-pt geo-rot))))
+            )
+
+            ;; 2. 실제 H-Pile 간격을 계산하여 토류판(timber) 구간을 동적으로 생성
+            (setq final-timbers '())
+            (setq current-start start-limit)
+            (setq timber-gap 25.0) ;; H-Pile 중심 기준 토류판 여유 간격 (50mm의 절반)
+
+            (foreach p-dist sorted-pile-dists
+              (setq potential-end (- p-dist timber-gap))
+              ;; 유효 길이(100.0 이상) 확인 후 토류판 리스트에 추가
+              (if (> (- potential-end current-start) 100.0)
+                (setq final-timbers (append final-timbers (list (cons current-start potential-end))))
+              )
+              ;; 다음 토류판의 시작점을 현재 H-Pile의 반대편 플랜지 끝으로 갱신
+              (setq current-start (+ p-dist timber-gap))
+            )
+
+            ;; 3. 마지막 H-Pile부터 코너 한계선(end-limit)까지의 남은 구간 처리
+            (if (> (- end-limit current-start) 100.0)
+              (setq final-timbers (append final-timbers (list (cons current-start end-limit))))
+            )
+
+            (setq mid-pile-count (length final-piles))
+            (setq valid-timbers final-timbers)
+            (setq timber-idx 0 total-timbers (length final-timbers))
+            (foreach range final-timbers
+              (setq safe-start (car range) safe-end (cdr range) final-width (- safe-end safe-start) final-center-dist (/ (+ safe-start safe-end) 2.0))
+              ;; [경계선 추종] 토류판은 시공상 꺾지 않는다.
+              ;;   인접 H-Pile 사이를 잇는 한 장의 평판으로 작도하고,
+              ;;   판 위치는 경계선에서 timber-offset(tf + 두께/2)만큼 벽체 바깥으로 띄운다.
+              (setq geo-res (tsp-geo-station safe-start geo-d1 seg-length geo-plen geo-total geo-closed geo-vobj))
+              (setq geo-pan-a (if geo-res (car geo-res) (polar pt1 seg-angle safe-start)))
+              (setq geo-res (tsp-geo-station safe-end geo-d1 seg-length geo-plen geo-total geo-closed geo-vobj))
+              (setq geo-pan-b (if geo-res (car geo-res) (polar pt1 seg-angle safe-end)))
+              (setq geo-tim-ang seg-angle)
+              (if (> (distance geo-pan-a geo-pan-b) 1.0)
+                (progn
+                  (setq geo-tim-ang (angle geo-pan-a geo-pan-b))
+                  (setq final-width (distance geo-pan-a geo-pan-b))
+                )
+              )
+              (setq timber-pt (list (/ (+ (car geo-pan-a) (car geo-pan-b)) 2.0)
+                                    (/ (+ (cadr geo-pan-a) (cadr geo-pan-b)) 2.0) 0.0))
+              (setq timber-pt-offset (polar timber-pt (+ geo-tim-ang (* boundary-orient (/ pi 2.0)) pi) timber-offset))
+
+              ;; [볼록/오목 코너 포켓 결합] 시작/끝 모서리(5도 이상 꺾임)에 접하는 첫/마지막 토류판은
+              ;; 볼록 코너 시 전면 플랜지 내측 끝단 경유 포켓 삽입, 오목 코너 시 전면 플랜지 내측 필렛 시작점(pt10a/pt9b)에 정밀 결합
+              (setq use-s-pocket (and start-corner-mode (equal safe-start start-limit 1.0)))
+              (setq use-e-pocket (and end-corner-mode (equal safe-end end-limit 1.0)))
+              (if (or use-s-pocket use-e-pocket)
+                (progn
+                  (setq left-mode nil left-data nil right-mode nil right-data nil)
+                  (cond
+                    (use-s-pocket
+                     (setq left-mode start-corner-mode
+                           left-data (list (car start-hpile-info) (cadr start-hpile-info) h-start b-start tw-start tf-start)))
+                    ((and (not start-is-corner) start-pile-placed (equal safe-start start-limit 1.0))
+                     (setq left-mode "NORMAL"
+                           left-data (list start-pile-pt start-pile-rot tf)))
+                    ((and start-is-corner (equal safe-start start-limit 1.0))
+                     (setq left-mode "NORMAL"
+                           left-data (list (car start-hpile-info) (cadr start-hpile-info) tf-start)))
+                    (t
+                     (foreach mp mid-pile-infos
+                       (if (equal (+ (car mp) timber-gap) safe-start 1.0)
+                         (setq left-mode "NORMAL" left-data (list (cadr mp) (caddr mp) tf))
+                       )
+                     ))
+                  )
+                  (cond
+                    (use-e-pocket
+                     (setq right-mode end-corner-mode
+                           right-data (list (car end-hpile-info) (cadr end-hpile-info) h-end b-end tw-end tf-end)))
+                    ((and (not end-is-corner) end-pile-placed (equal safe-end end-limit 1.0))
+                     (setq right-mode "NORMAL"
+                           right-data (list end-pile-pt end-pile-rot tf)))
+                    ((and end-is-corner (equal safe-end end-limit 1.0))
+                     (setq right-mode "NORMAL"
+                           right-data (list (car end-hpile-info) (cadr end-hpile-info) tf-end)))
+                    (t
+                     (foreach mp mid-pile-infos
+                       (if (equal (- (car mp) timber-gap) safe-end 1.0)
+                         (setq right-mode "NORMAL" right-data (list (cadr mp) (caddr mp) tf))
+                       )
+                     ))
+                  )
+                  (if (and left-mode left-data right-mode right-data)
+                    (progn
+                      (setq pocket-res (tsp-solve-convex-timber left-mode left-data right-mode right-data current-thick boundary-orient seg-angle timber-gap))
+                      (if pocket-res
+                        (setq timber-pt-offset (nth 0 pocket-res)
+                              final-width      (nth 1 pocket-res)
+                              geo-tim-ang      (nth 2 pocket-res))
+                      )
+                    )
+                  )
+                )
+              )
+              (setq timber-result (create-timber-panel-object timber-pt-offset final-width current-thick geo-tim-ang))
+              (setq top-left (nth 1 timber-result) top-right (nth 2 timber-result))
+              (setq cur-brace (cdr (assoc 'CORNER-BRACE seg-data)))
+              (setq next-brace nil)
+              (if (and next-seg-real-idx (< next-seg-real-idx (length *segment-list*)))
+                (setq next-brace (cdr (assoc 'CORNER-BRACE (nth next-seg-real-idx *segment-list*))))
+              )
+              (setq dist-to-start final-center-dist dist-to-end (- seg-length final-center-dist) brace-blocked nil)
+              ;; 상향 띠장(Upgraded Wale) 구역을 포함한 사보강재/앵커 간섭 정밀 체크
+              (setq c-upg-s (cdr (assoc 'UPGRADE-WALE (nth start-idx *segment-list*))))
+              (setq has-upg-s (and c-upg-s (= (car c-upg-s) "Y")))
+              (setq c-upg-e (cdr (assoc 'UPGRADE-WALE (nth next-seg-real-idx *segment-list*))))
+              (setq has-upg-e (and c-upg-e (= (car c-upg-e) "Y")))
+
+              ;; 수동으로 선택된 상향 띠장 범위 절대좌표에서 벡터 내적으로 거리(L) 추출
+              (setq manual-L-start nil manual-L-end nil)
+              (if (and has-upg-s (> (length c-upg-s) 2))
+                (foreach pt-data (nth 2 c-upg-s)
+                  (setq pt (cadr pt-data) dx (- (car pt) (car pt1)) dy (- (cadr pt) (cadr pt1)))
+                  (setq pt-d (+ (* dx (cos seg-angle)) (* dy (sin seg-angle))))
+                  (setq pt-perp (abs (- (* dy (cos seg-angle)) (* dx (sin seg-angle)))))
+                  (if (and (> pt-d 0) (< pt-perp 1000.0)) (setq manual-L-start pt-d))
+                )
+              )
+              (if (and has-upg-e (> (length c-upg-e) 2))
+                (foreach pt-data (nth 2 c-upg-e)
+                  (setq pt (cadr pt-data) dx (- (car pt) (car pt2)) dy (- (cadr pt) (cadr pt2)))
+                  (setq pt-d (+ (* dx (cos (+ seg-angle pi))) (* dy (sin (+ seg-angle pi)))))
+                  (setq pt-perp (abs (- (* dy (cos (+ seg-angle pi))) (* dx (sin (+ seg-angle pi))))))
+                  (if (and (> pt-d 0) (< pt-perp 1000.0)) (setq manual-L-end pt-d))
+                )
+              )
+
+              (setq exact-L-start 0.0 exact-L-end 0.0)
+              (setq min-limit-s 0.0 min-limit-e 0.0)
+              (setq upg-center-s 0.0 upg-center-e 0.0)
+
+              ;; 1. 시작점(pt1) 사보강재 물리적 간섭 및 상향 띠장 기준점 계산
+              (setq is-brace-s (and cur-brace (= (car cur-brace) "Y") (cadr cur-brace)))
+              (if is-brace-s
+                (progn
+                  (setq chk-last-b-row (last (cadr cur-brace)))
+                  (setq chk-b-h (nth 0 (cadr chk-last-b-row)))
+                  (setq chk-edge (if (wcmatch (strcase (nth 0 chk-last-b-row)) "2H*") (* chk-b-h 1.5) (/ chk-b-h 2.0)))
+                  (setq min-limit-s (+ (* (nth 2 chk-last-b-row) 1000.0) chk-edge 150.0))
+                  (setq exact-L-start min-limit-s)
+                )
+              )
+              ;; 수동 범위가 있으면 강제 적용, 없으면 기존대로 H-Pile 스냅(Snap) 적용
+              (if manual-L-start
+                (progn
+                  (setq exact-L-start manual-L-start)
+                  (if has-upg-s (setq upg-center-s manual-L-start))
+                )
+                (progn
+                  (if (or has-upg-s is-brace-s)
+                    (progn
+                      (setq best-d 1e99)
+                      (if final-piles
+                        (foreach p final-piles
+                          (setq d-dist (distance pt1 p))
+                          (if (> (+ d-dist 150.0) min-limit-s)
+                            (if (< d-dist best-d) (setq best-d d-dist))
+                          )
+                        )
+                      )
+                      (if (< best-d 1e90)
+                        (progn
+                          (if has-upg-s (setq upg-center-s best-d))
+                          (setq exact-L-start (+ best-d 150.0))
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+
+              ;; 2. 끝점(pt2) 사보강재 물리적 간섭 및 상향 띠장 기준점 계산
+              (setq is-brace-e (and next-brace (= (car next-brace) "Y") (cadr next-brace)))
+              (if is-brace-e
+                (progn
+                  (setq chk-last-b-row (last (cadr next-brace)))
+                  (setq chk-b-h (nth 0 (cadr chk-last-b-row)))
+                  (setq chk-edge (if (wcmatch (strcase (nth 0 chk-last-b-row)) "2H*") (* chk-b-h 1.5) (/ chk-b-h 2.0)))
+                  (setq min-limit-e (+ (* (nth 2 chk-last-b-row) 1000.0) chk-edge 150.0))
+                  (setq exact-L-end min-limit-e)
+                )
+              )
+              ;; 수동 범위가 있으면 강제 적용, 없으면 자동 스냅 적용
+              (if manual-L-end
+                (progn
+                  (setq exact-L-end manual-L-end)
+                  (if has-upg-e (setq upg-center-e manual-L-end))
+                )
+                (progn
+                  (if (or has-upg-e is-brace-e)
+                    (progn
+                      (setq best-d 1e99)
+                      (if final-piles
+                        (foreach p final-piles
+                          (setq d-dist (distance pt2 p))
+                          (if (> (+ d-dist 150.0) min-limit-e)
+                            (if (< d-dist best-d) (setq best-d d-dist))
+                          )
+                        )
+                      )
+                      (if (< best-d 1e90)
+                        (progn
+                          (if has-upg-e (setq upg-center-e best-d))
+                          (setq exact-L-end (+ best-d 150.0))
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+
+              ;; 3. CTC 기준 전체 상향(Full Upgrade) 검사 - 띠장 로직과 완벽 동기화 (중심점 기준)
+              (setq check-L-s (if has-upg-s upg-center-s 0.0))
+              (setq check-L-e (if has-upg-e upg-center-e 0.0))
+
+              (if (and (or (> check-L-s 0.0) (> check-L-e 0.0))
+                       (< (- seg-length (+ check-L-s check-L-e)) (* ctc-mm 1.5)))
+                (setq exact-L-start seg-length exact-L-end seg-length)
+              )
+
+              ;; 4. 최종 간섭 판별 (상향 띠장 구간 내에는 앵커 배치 불가 및 띠장 물리적 간섭 동적 판별)
+              (if (or (<= dist-to-start exact-L-start) (<= dist-to-end exact-L-end))
+                (setq brace-blocked T)
+              )
+
+              (setq anchor-blocked brace-blocked)
+
+              ;; [지보재 띠장 최우선 연동] 현재 패널 위치(final-center-dist)에서 활성화된 '앵커 자체의 띠장 폭(wale-h)'으로 정착구 위치 산출
+              (if has-anchor
+                (progn
+                  (setq max-anchor-L 0.0 active-anc-found nil local-anc-wale-h 0)
+                  (foreach s-item (cdr (assoc 'SUPPORT-LIST seg-data))
+                    (if (wcmatch (car s-item) "앵커*")
+                      (progn
+                        (setq s-iv (tsp-get-support-item-dist-interval s-item pt1 seg-angle seg-length))
+                        (if (and (>= final-center-dist (- (car s-iv) (/ b 2.0) 10.0))
+                                 (<= final-center-dist (+ (cdr s-iv) (/ b 2.0) 10.0)))
+                          (progn
+                            (setq active-anc-found T)
+                            (setq s-w-vals (tsp-get-support-item-wale-vals s-item wale-spec (cdr (assoc 'WALE-CUSTOM seg-data))))
+                            (if (> (nth 0 s-w-vals) local-anc-wale-h) (setq local-anc-wale-h (nth 0 s-w-vals)))
+                            (setq cur-free (nth 5 s-item) cur-bond (nth 6 s-item) cur-ang (nth 4 s-item))
+                            (setq cur-L (+ cur-free cur-bond))
+                            (if (> cur-L max-anchor-L)
+                              (setq max-anchor-L cur-L max-anchor-ang cur-ang max-anchor-free cur-free max-anchor-bond cur-bond)
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+                  (if (> local-anc-wale-h 0) (setq wale-h local-anc-wale-h))
+                  (if (not active-anc-found) (setq anchor-blocked T))
+                )
+              )
+
+              (if has-anchor
+                (progn
+                  ;; 간섭 계산을 위해 앵커 정착구의 중심(pt-base) 임시 계산
+                  (setq pt-base-temp (polar timber-pt outward-normal wale-h))
+                  ;; 정착구 절반 폭(약 100mm) + 최소 시공 여유(50mm)
+                  (setq anchor-half-width 150.0)
+
+                  ;; 시작점 볼록 코너(굴착면 기준 내부 간섭 발생 구간) 간섭 확인
+                  (if (and start-is-corner (nth 2 start-hpile-info))
+                    (progn
+                      (setq adj-ang (angle start-vertex start-prev))
+                      ;; 앵커 중심에서 반대편 세그먼트 경계선까지의 수직 거리 계산
+                      (setq dist-to-adj (abs (* (sin (- (angle start-vertex pt-base-temp) adj-ang)) (distance start-vertex pt-base-temp))))
+                      ;; 수직 거리가 '인접 띠장 두께 + 정착구 폭' 보다 작으면 간섭 발생
+                      (if (< dist-to-adj (+ timber-offset wale-h anchor-half-width))
+                        (setq anchor-blocked T)
+                      )
+                    )
+                  )
+
+                  ;; 끝점 볼록 코너 간섭 확인
+                  (if (and end-is-corner (nth 2 end-hpile-info))
+                    (progn
+                      (setq adj-ang (angle end-vertex end-next))
+                      (setq dist-to-adj (abs (* (sin (- (angle end-vertex pt-base-temp) adj-ang)) (distance end-vertex pt-base-temp))))
+                      (if (< dist-to-adj (+ timber-offset wale-h anchor-half-width))
+                        (setq anchor-blocked T)
+                      )
+                    )
+                  )
+                )
+              )
+
+              (if (and has-anchor (not anchor-blocked))
+                (progn
+                  (create-layer-if-not-exists "_앵커(Anchor)" "6")
+                  (setq cos-val (cos (* max-anchor-ang (/ pi 180.0))))
+                  (setq proj-free (* max-anchor-free 1000.0 cos-val) proj-bond (* max-anchor-bond 1000.0 cos-val) proj-prot (* 150.0 cos-val))
+                  (setq pt-base (polar timber-pt outward-normal wale-h))
+
+                  ;; 저장된 개별 편심각 찾기 (반경 50mm 탐색)
+                  (setq cur-plan-offset 0.0)
+                  (foreach s-item (cdr (assoc 'SUPPORT-LIST seg-data))
+                    (if (wcmatch (car s-item) "앵커*")
+                      (progn
+                        (setq anchor-manual-angles (if (> (length s-item) 9) (nth 9 s-item) '()))
+                        (foreach m-ang anchor-manual-angles
+                          (if (< (distance (list (car pt-base) (cadr pt-base)) (list (car (car m-ang)) (cadr (car m-ang)))) 50.0)
+                            (setq cur-plan-offset (cdr m-ang))
+                          )
+                        )
+                      )
+                    )
+                  )
+                  (setq anchor-final-outward (+ outward-normal (* cur-plan-offset (/ pi 180.0))))
+
+                  (setq pt-free-end (polar pt-base (+ anchor-final-outward pi) proj-free) pt-bond-end (polar pt-free-end (+ anchor-final-outward pi) proj-bond))
+                  (setq pt-h1 (polar pt-base (+ anchor-final-outward (/ pi 2.0)) 100.0) pt-h2 (polar pt-base (- anchor-final-outward (/ pi 2.0)) 100.0))
+                  (setq pt-h3 (polar pt-h2 anchor-final-outward 60.0) pt-h4 (polar pt-h1 anchor-final-outward 60.0))
+                  (entmake (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") (cons 8 "_앵커(Anchor)") (cons 62 6) '(90 . 4) '(70 . 1) (list 10 (car pt-h1) (cadr pt-h1)) (list 10 (car pt-h2) (cadr pt-h2)) (list 10 (car pt-h3) (cadr pt-h3)) (list 10 (car pt-h4) (cadr pt-h4))))
+                  (setq pt-anchor-start (polar pt-base anchor-final-outward (+ 60.0 proj-prot)))
+                  (make-lw-line pt-anchor-start pt-base "_앵커(Anchor)" 6)
+                  (make-lw-line pt-base pt-free-end "_앵커(Anchor)" 6)
+                  (entmake (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") (cons 8 "_앵커(Anchor)") (cons 62 6) '(90 . 2) '(70 . 0) '(43 . 400.0) (list 10 (car pt-free-end) (cadr pt-free-end)) (list 10 (car pt-bond-end) (cadr pt-bond-end))))
+                )
+              )
+              (if (and (= timber-idx 0) (not start-is-corner) (not start-pile-placed)) (progn (setq left-offset-pt (polar top-left (+ seg-angle pi) edge-gap) left-hpile-pt (list (car left-offset-pt) (cadr timber-pt) 0.0)) (entmake (list '(0 . "INSERT") (cons 2 hpile-block) '(8 . "_측면말뚝") (cons 10 left-hpile-pt) '(41 . 1.0) '(42 . 1.0) '(43 . 1.0) (cons 50 hpile-rotation))) (setq *tsp-hpile-points* (append *tsp-hpile-points* (list left-hpile-pt)))))
+              (if (and (= timber-idx (- total-timbers 1)) (not end-is-corner) (not end-pile-placed)) (progn (setq right-offset-pt (polar top-right seg-angle edge-gap) right-hpile-pt (list (car right-offset-pt) (cadr timber-pt) 0.0)) (entmake (list '(0 . "INSERT") (cons 2 hpile-block) '(8 . "_측면말뚝") (cons 10 right-hpile-pt) '(41 . 1.0) '(42 . 1.0) '(43 . 1.0) (cons 50 hpile-rotation))) (setq *tsp-hpile-points* (append *tsp-hpile-points* (list right-hpile-pt)))))
+              (setq timber-idx (1+ timber-idx))
+            )
+            (foreach pt final-piles
+              (setq geo-rot hpile-rotation)
+              (setq geo-res (tsp-geo-station (distance pt1 pt) geo-d1 seg-length geo-plen geo-total geo-closed geo-vobj))
+              (if geo-res
+                (progn
+                  (setq pt (car geo-res))
+                  (if (cadr geo-res) (setq geo-rot (+ (cadr geo-res) (* boundary-orient (/ pi 2.0)) (/ pi 2.0))))
+                )
+              )
+              (entmake (list '(0 . "INSERT") (cons 2 hpile-block) '(8 . "_측면말뚝") (cons 10 pt) '(41 . 1.0) '(42 . 1.0) '(43 . 1.0) (cons 50 geo-rot)))
+              (setq *tsp-hpile-points* (append *tsp-hpile-points* (list pt)))
+            )
+          )
+        )
+      )
+    )
+    (setq *tsp-segment-pile-counts* (update-list-item *tsp-segment-pile-counts* seg-idx mid-pile-count))
+    (setq seg-idx (1+ seg-idx))
+  )
+  ;; [코너 파일 작도]
+      (setq idx 0)
+      (while (< idx num-vertices)
+        (setq prev-seg-idx (if (= idx 0) (if is-closed (1- num-vertices) -1) (1- idx)))
+        (setq next-seg-idx (if (>= idx max-segments) -1 idx))
+        (setq prev-def (if (>= prev-seg-idx 0) (cdr (assoc 'IS-DEFINED (nth prev-seg-idx *segment-list*))) nil))
+        (setq next-def (if (>= next-seg-idx 0) (cdr (assoc 'IS-DEFINED (nth next-seg-idx *segment-list*))) nil))
+
+        ;; 혼합 프로젝트에서 CIP와 CIP가 만나는 모서리에 불필요한 H-Pile 코너말뚝이 생성되는 것을 원천 차단
+        (setq prev-type (if prev-def (cdr (assoc 'WALL-TYPE (nth prev-seg-idx *segment-list*))) "NONE"))
+        (setq next-type (if next-def (cdr (assoc 'WALL-TYPE (nth next-seg-idx *segment-list*))) "NONE"))
+
+        (if (and prev-def next-def)
+          (progn
+            (setq prev-vertex (nth prev-seg-idx orig-vertices) curr-vertex (nth idx orig-vertices) next-vertex (nth (if is-closed (if (= idx (1- num-vertices)) 0 (1+ idx)) (1+ idx)) orig-vertices))
+            ;; [분기 1] 코너 말뚝 작도 (양쪽 세그먼트 중 하나라도 H-Pile이면 직선 분할 모서리 및 CIP 접합 모서리 모두 코너 말뚝 1개 배치)
+            (if (or (= prev-type "HPILE") (= next-type "HPILE"))
+              (progn
+                ;; 경계선 중간에 자동삭제된 꺾임 정점이 있는 경우 실제 경계선 국소 방향(Local Tangent)을 추출하여 코너 말뚝 회전각 정렬
+                (if (and geo-info geo-vobj)
+                  (progn
+                    (setq d-curr-c (tsp-dist-of-near-vertex (nth 0 geo-info) (nth 1 geo-info) curr-vertex))
+                    (setq d-prev-c (tsp-dist-of-near-vertex (nth 0 geo-info) (nth 1 geo-info) prev-vertex))
+                    (setq d-next-c (tsp-dist-of-near-vertex (nth 0 geo-info) (nth 1 geo-info) next-vertex))
+                    (if (and d-curr-c d-prev-c d-next-c)
+                      (progn
+                        (setq dir-sign (if (and (not geo-closed) (< d-curr-c d-prev-c)) -1.0 1.0))
+                        (setq d-arr (- d-curr-c (* dir-sign 10.0)))
+                        (setq d-dep (+ d-curr-c (* dir-sign 10.0)))
+                        (if geo-closed
+                          (progn
+                            (while (< d-arr 0.0) (setq d-arr (+ d-arr geo-total)))
+                            (while (>= d-arr geo-total) (setq d-arr (- d-arr geo-total)))
+                            (while (< d-dep 0.0) (setq d-dep (+ d-dep geo-total)))
+                            (while (>= d-dep geo-total) (setq d-dep (- d-dep geo-total)))
+                          )
+                          (progn
+                            (setq d-arr (max 0.0 (min geo-total d-arr)))
+                            (setq d-dep (max 0.0 (min geo-total d-dep)))
+                          )
+                        )
+                        (setq p-arr (vl-catch-all-apply 'vlax-curve-getPointAtDist (list geo-vobj d-arr)))
+                        (setq p-dep (vl-catch-all-apply 'vlax-curve-getPointAtDist (list geo-vobj d-dep)))
+                        (if (and p-arr (not (vl-catch-all-error-p p-arr)) (> (distance p-arr curr-vertex) 0.1))
+                          (setq prev-vertex (list (car p-arr) (cadr p-arr) 0.0))
+                        )
+                        (if (and p-dep (not (vl-catch-all-error-p p-dep)) (> (distance curr-vertex p-dep) 0.1))
+                          (setq next-vertex (list (car p-dep) (cadr p-dep) 0.0))
+                        )
+                      )
+                    )
+                  )
+                )
+                (setq seg-data (nth prev-seg-idx *segment-list*))
+                (if (= prev-type "CIP")
+                  (setq prev-spec (nth (atoi (if (assoc 'CIP-HPILE-IDX seg-data) (cdr (assoc 'CIP-HPILE-IDX seg-data)) "2")) *tsp-std-wall-list*)
+                        prev-vals (parse-h-spec prev-spec))
+                  (progn
+                    (setq prev-spec (cdr (assoc 'WALL-SPEC seg-data)))
+                    (if (= prev-spec "User-defined") (setq prev-vals (cdr (assoc 'WALL-CUSTOM seg-data))) (setq prev-vals (parse-h-spec prev-spec)))
+                  )
+                )
+                (setq h-prev (nth 0 prev-vals) b-prev (nth 1 prev-vals))
+                (setq target-seg-data (nth next-seg-idx *segment-list*))
+                (if (= next-type "CIP")
+                  (setq next-spec (nth (atoi (if (assoc 'CIP-HPILE-IDX target-seg-data) (cdr (assoc 'CIP-HPILE-IDX target-seg-data)) "2")) *tsp-std-wall-list*)
+                        next-vals (parse-h-spec next-spec))
+                  (progn
+                    (setq next-spec (cdr (assoc 'WALL-SPEC target-seg-data)))
+                    (if (= next-spec "User-defined") (setq next-vals (cdr (assoc 'WALL-CUSTOM target-seg-data))) (setq next-vals (parse-h-spec next-spec)))
+                  )
+                )
+                (setq h-next (nth 0 next-vals) b-next (nth 1 next-vals))
+                (if (or (> h-next h-prev) (and (= h-next h-prev) (> b-next b-prev)))
+                  (setq h h-next b b-next tw (nth 2 next-vals) tf (nth 3 next-vals) target-seg-data (nth next-seg-idx *segment-list*))
+                  (setq h h-prev b b-prev tw (nth 2 prev-vals) tf (nth 3 prev-vals) target-seg-data (nth prev-seg-idx *segment-list*))
+                )
+                (setq current-thick (cdr (assoc 'TIMBER-THICKNESS target-seg-data))) (if (null current-thick) (setq current-thick 60)) (setq hpile-block (create-hpile-section-block h b tw tf)) (setq timber-offset (+ tf (/ current-thick 2.0)))
+                (place-hpile-at-corner-simple curr-vertex (angle prev-vertex curr-vertex) (angle curr-vertex next-vertex) h b tw tf hpile-block timber-offset boundary-orient prev-vertex next-vertex)
+              )
+            )
+          )
+        )
+        (setq idx (1+ idx))
+      )
+      (princ "\nH-Pile 및 토류판 작도 완료!")
+    )

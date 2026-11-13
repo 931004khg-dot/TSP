@@ -1,0 +1,459 @@
+;;; ==========================================================================
+;;; 파일명: TSP_5F_DCL_and_Strut.lsp
+;;; 구  분: DCL 다이얼로그 UI, 세그먼트 매니저 및 버팀보/앵커/까치발 수동 작도 (Part F)
+;;; 역  할: 전체 DCL 생성, 세그먼트 매니저/마법사/대시보드, 지반/범례/벽체/사보강재/지보재 콜백, 수동 버팀보/까치발/연속보강재/앵커편심각/중간말뚝 작도 및 제어 [manager-dialog-callback]
+;;; 포함 함수: manager-dialog-callback
+;;; --------------------------------------------------------------------------
+;;; [안내] 이 파일은 TSP.lsp(메인 로더)에 의해 자동으로 로드되는 하위 모듈입니다.
+;;;        코드 수정 시 전체 파일을 합칠 필요 없이 이 파일만 단독 패치하면 됩니다.
+;;; ==========================================================================
+
+;;;;==========================================================================
+;;;; defun manager-dialog-callback : [메인] 다중 선택(Multi-Select) 설정 및 부분 복사 로직 적용
+;;;;==========================================================================
+(defun manager-dialog-callback (dcl-path / dcl-id result paste-mode apply-all-mode apply-soil-mode apply-support-mode apply-wall-mode apply-brace-mode source-idx target-idx source-data target-data loop-active status-msg-text is-def max-idx check-data new-target load-result saved-list clicked-idx save-opt new-name selected-indices target-indices target-id t-idx val)
+  (setq selected-idx 0)
+  (setq selected-indices '(0))
+
+  (setq paste-mode nil)
+  (setq apply-all-mode nil)
+  (setq apply-soil-mode nil)
+  (setq apply-support-mode nil)
+  (setq apply-wall-mode nil)
+  (setq apply-brace-mode nil)
+  (setq loop-active T)
+  (setq status-msg-text "Shift 또는 Ctrl 키를 이용해 여러 개를 동시에 선택할 수 있습니다.")
+
+  (while loop-active
+    (setq dcl-id (load_dialog dcl-path))
+    (if (new_dialog "tsp_manager" dcl-id "" '(50 50))
+      (progn
+        (setq saved-list (tsp-get-project-list))
+        (if (or (null *tsp-current-project-name*) (= *tsp-current-project-name* ""))
+          (setq *tsp-current-project-name* (tsp-generate-default-project-name))
+        )
+        (set_tile "manager_title" (strcat "세그먼트 설정 (Segment Manager) - " *tsp-current-project-name*))
+        (set_tile "project_name" *tsp-current-project-name*)
+        (update-segment-manager-list)
+        (set_tile "seg_list" (tsp-join-space-string selected-indices))
+        (set_tile "status_msg" status-msg-text)
+
+        (action_tile "project_name" "(set_tile \"manager_title\" (strcat \"세그먼트 설정 (Segment Manager) - \" $value))")
+        (action_tile "btn_save_proj"
+          "(progn
+              (setq save-opt (save-prompt-dialog-callback dcl-path))
+              (setq new-name (get_tile \"project_name\"))
+              (if (or (= new-name \"\") (= new-name nil)) (setq new-name (tsp-generate-default-project-name)))
+
+              (cond
+                ((= save-opt 1)
+                 (tsp-save-project-data new-name)
+                 (tsp-pm-tag-boundary *tsp-boundary-ent* *tsp-current-project-name*)
+                 (set_tile \"project_name\" *tsp-current-project-name*)
+                 (set_tile \"manager_title\" (strcat \"세그먼트 설정 (Segment Manager) - \" *tsp-current-project-name*))
+                 (setq *tsp-data-dirty* nil)
+                 (alert (strcat \"'\" *tsp-current-project-name* \"' (으)로 새로 저장되었습니다.\"))
+                )
+                ((= save-opt 2)
+                 (tsp-save-project-data new-name)
+                 (tsp-pm-tag-boundary *tsp-boundary-ent* *tsp-current-project-name*)
+                 (set_tile \"project_name\" *tsp-current-project-name*)
+                 (set_tile \"manager_title\" (strcat \"세그먼트 설정 (Segment Manager) - \" *tsp-current-project-name*))
+                 (setq *tsp-data-dirty* nil)
+                 (alert (strcat \"'\" *tsp-current-project-name* \"' 에 저장이 완료되었습니다.\"))
+                )
+                (t (princ \"\\n저장이 취소되었습니다.\") )
+              )
+            )"
+        )
+        (action_tile "btn_load_proj"
+          "(progn
+             (setq load-result (project-list-callback dcl-path))
+             (if load-result
+               (progn
+               (tsp-pm-tag-boundary *tsp-boundary-ent* *tsp-current-project-name*)
+                 (set_tile \"project_name\" *tsp-current-project-name*)
+                 (set_tile \"manager_title\" (strcat \"세그먼트 설정 (Segment Manager) - \" *tsp-current-project-name*))
+                 (update-segment-manager-list)
+                 (alert (strcat \"프로젝트 [\" *tsp-current-project-name* \"] 가 로드되었습니다.\"))
+                 (setq *tsp-data-dirty* nil)
+                 (done_dialog 12)
+               )
+             )
+           )"
+        )
+        (action_tile "btn_load_csv"
+          "(progn
+             (if (tsp-apply-csv-to-current-segments)
+               (progn
+                 (if *tsp-boundary-ent* (tsp-pm-tag-boundary *tsp-boundary-ent* *tsp-current-project-name*))
+                 (set_tile \"project_name\" *tsp-current-project-name*)
+                 (set_tile \"manager_title\" (strcat \"세그먼트 설정 (Segment Manager) - \" *tsp-current-project-name*))
+                 (update-segment-manager-list)
+                 (setq *tsp-data-dirty* T)
+                 (done_dialog 12)
+               )
+             )
+           )"
+        )
+        (action_tile "btn_export_csv"
+          "(progn
+             (if (tsp-save-and-export-current-csv dcl-path (get_tile \"project_name\"))
+               (progn
+                 (set_tile \"project_name\" *tsp-current-project-name*)
+                 (set_tile \"manager_title\" (strcat \"세그먼트 설정 (Segment Manager) - \" *tsp-current-project-name*))
+                 (setq *tsp-data-dirty* nil)
+               )
+             )
+           )"
+        )
+
+        (action_tile "seg_list"
+          "(progn
+             (setq selected-indices (tsp-parse-space-string $value))
+             (if (null selected-indices) (setq selected-indices (list 0)))
+             (setq clicked-idx (car selected-indices))
+             (cond
+               (paste-mode
+                 (setq source-idx clicked-idx)
+                 (if (member source-idx target-indices)
+                   (alert \"대상 세그먼트 자체를 원본으로 지정할 수 없습니다.\\n원본 데이터를 가진 '다른 세그먼트'를 클릭하세요.\")
+                   (done_dialog 3)
+                 )
+               )
+               (apply-all-mode
+                 (setq selected-idx clicked-idx)
+                 (done_dialog 7)
+               )
+               (apply-soil-mode
+                 (setq selected-idx clicked-idx)
+                 (done_dialog 8)
+               )
+               (apply-support-mode
+                 (setq selected-idx clicked-idx)
+                 (done_dialog 11)
+               )
+               (apply-wall-mode
+                 (setq selected-idx clicked-idx)
+                 (done_dialog 14)
+               )
+               (apply-brace-mode
+                 (setq selected-idx clicked-idx)
+                 (done_dialog 15)
+               )
+               (T
+                 (setq selected-idx clicked-idx)
+                 (if (> (length selected-indices) 1)
+                   (set_tile \"status_msg\" (strcat (itoa (length selected-indices)) \"개의 세그먼트가 선택되었습니다. (다중 선택 됨)\"))
+                   (set_tile \"status_msg\" (strcat (itoa (1+ selected-idx)) \"번 목록이 선택되었습니다.\"))
+                 )
+               )
+             )
+           )"
+        )
+
+        (action_tile "btn_input" "(done_dialog 4)")
+        (action_tile "btn_modify"
+          "(progn
+             (setq check-data (nth selected-idx *segment-list*))
+             (if (cdr (assoc 'IS-DEFINED check-data))
+               (done_dialog 2)
+               (alert \"아직 입력되지 않은 목록입니다.\\n먼저 [입력] 버튼을 눌러 초기 설정을 진행하세요.\")))")
+        (action_tile "btn_delete" "(done_dialog 9)")
+        (action_tile "btn_delete_all" "(done_dialog 10)")
+
+        (action_tile "btn_copy_from"
+          "(progn
+             (setq paste-mode T apply-all-mode nil apply-soil-mode nil apply-support-mode nil apply-wall-mode nil apply-brace-mode nil)
+             (setq target-indices selected-indices)
+             (set_tile \"status_msg\" (strcat \"[다중 복사 준비 완료] 복사해 올 '원본' 세그먼트 1개를 위 목록에서 클릭하세요.\")))
+          "
+        )
+        (action_tile "btn_apply_all"
+          "(progn
+             (setq apply-all-mode T paste-mode nil apply-soil-mode nil apply-support-mode nil apply-wall-mode nil apply-brace-mode nil)
+             (set_tile \"status_msg\" \"[전체 일괄적용] 원본 세그먼트를 클릭하세요. (취소: ESC)\"))")
+
+        (action_tile "btn_apply_soil"
+          "(progn
+             (setq apply-soil-mode T paste-mode nil apply-all-mode nil apply-support-mode nil apply-wall-mode nil apply-brace-mode nil)
+             (setq target-indices selected-indices)
+             (set_tile \"status_msg\" \"[지반 정보 복사] 지반 정보를 가져올 원본 세그먼트를 클릭하세요. (취소: ESC)\"))")
+        (action_tile "btn_apply_support"
+          "(progn
+             (setq apply-support-mode T paste-mode nil apply-all-mode nil apply-soil-mode nil apply-wall-mode nil apply-brace-mode nil)
+             (setq target-indices selected-indices)
+             (set_tile \"status_msg\" \"[지보재 정보 복사] 지보재 정보를 가져올 원본 세그먼트를 클릭하세요. (취소: ESC)\"))")
+        (action_tile "btn_apply_wall"
+          "(progn
+             (setq apply-wall-mode T paste-mode nil apply-all-mode nil apply-soil-mode nil apply-support-mode nil apply-brace-mode nil)
+             (setq target-indices selected-indices)
+             (set_tile \"status_msg\" \"[흙막이벽 정보 복사] 흙막이벽 정보를 가져올 원본 세그먼트를 클릭하세요. (취소: ESC)\"))")
+        (action_tile "btn_apply_brace"
+          "(progn
+             (setq apply-brace-mode T paste-mode nil apply-all-mode nil apply-soil-mode nil apply-support-mode nil apply-wall-mode nil)
+             (setq target-indices selected-indices)
+             (set_tile \"status_msg\" \"[사보강재 정보 복사] 사보강재 정보를 가져올 원본 세그먼트를 클릭하세요. (취소: ESC)\"))")
+
+        (action_tile "btn_measure" "(done_dialog 13)")
+
+        (action_tile "btn_draw_section"
+          "(progn
+             (setq check-data (nth selected-idx *segment-list*))
+             (if (cdr (assoc 'IS-DEFINED check-data))
+               (progn
+                 (load-segment-to-globals selected-idx)
+                 (setq *tsp-target-draw-flag* (cdr (assoc 'SECTION-DRAW check-data)))
+                 (done_dialog 5))
+               (alert \"입력되지 않은 목록입니다.\")))")
+        (action_tile "btn_draw_plan"
+          "(progn
+             (if (null *tsp-boundary-ent*)
+               (alert \"현재 [단면도 전용 모드]로 실행 중입니다.\\n평면도를 생성하려면 경계선(Polyline)을 선택하여 실행하세요.\")
+               (progn
+                 (setq check-data (nth selected-idx *segment-list*))
+                 (if (cdr (assoc 'IS-DEFINED check-data))
+                   (progn (load-segment-to-globals selected-idx) (done_dialog 6))
+                   (alert \"입력되지 않은 목록입니다.\")
+                 )
+               )
+             )
+           )")
+        (action_tile "cancel" "(done_dialog 0)")
+
+        (setq result (start_dialog))
+      )
+      (setq result 0)
+    )
+    (unload_dialog dcl-id)
+
+    (cond
+      ((= result 0)
+       (if (or paste-mode apply-all-mode apply-soil-mode apply-support-mode apply-wall-mode apply-brace-mode)
+         (progn
+           (setq paste-mode nil apply-all-mode nil apply-soil-mode nil apply-support-mode nil apply-wall-mode nil apply-brace-mode nil)
+           (setq status-msg-text "작업이 취소되었습니다.")
+           (setq loop-active T)
+         )
+         (setq loop-active nil)
+       )
+      )
+      ((= result 5) (setq loop-active nil))
+      ((= result 6) (setq loop-active nil))
+      ((= result 4)
+       (reset-globals-to-defaults)
+       (input-segment-wizard dcl-path selected-idx)
+       (setq max-idx (1- (length *segment-list*)))
+       (if (< selected-idx max-idx) (setq selected-idx (1+ selected-idx)))
+       (setq selected-indices (list selected-idx))
+       (setq status-msg-text (strcat (itoa (1+ selected-idx)) "번 목록이 선택되었습니다."))
+       (setq paste-mode nil apply-all-mode nil apply-soil-mode nil apply-support-mode nil apply-wall-mode nil apply-brace-mode nil)
+       (if (and *tsp-boundary-ent* *tsp-boundary-orient*)
+         (progn
+           (load-segment-to-globals selected-idx)
+           (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*)
+         )
+       )
+      )
+      ((= result 2)
+       (modify-segment-dashboard dcl-path selected-idx)
+       (setq selected-indices (list selected-idx))
+       (setq status-msg-text "수정이 완료되었습니다.")
+       (setq paste-mode nil apply-all-mode nil apply-soil-mode nil apply-support-mode nil apply-wall-mode nil apply-brace-mode nil)
+       (if (and *tsp-boundary-ent* *tsp-boundary-orient*)
+         (progn
+           (load-segment-to-globals selected-idx)
+           (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*)
+         )
+       )
+      )
+
+      ((= result 3)
+       (setq source-data (nth source-idx *segment-list*))
+       (if (cdr (assoc 'IS-DEFINED source-data))
+         (progn
+           (foreach t-idx target-indices
+             (setq target-data (nth t-idx *segment-list*))
+             (setq new-target (list
+               (cons 'ID (cdr (assoc 'ID target-data)))
+               (cons 'NAME (cdr (assoc 'NAME target-data)))
+               (cons 'IS-DEFINED (cdr (assoc 'IS-DEFINED source-data)))
+               (cons 'WALL-TYPE (if (assoc 'WALL-TYPE source-data) (cdr (assoc 'WALL-TYPE source-data)) "HPILE"))
+               (cons 'SECTION-DRAW (cdr (assoc 'SECTION-DRAW source-data)))
+               (cons 'SOIL-DATA (cdr (assoc 'SOIL-DATA source-data)))
+               (cons 'N-VALUES (cdr (assoc 'N-VALUES source-data)))
+               (cons 'HOLE-NO (if (assoc 'HOLE-NO source-data) (cdr (assoc 'HOLE-NO source-data)) "BH-"))
+               (cons 'WALL-SPEC (cdr (assoc 'WALL-SPEC source-data)))
+               (cons 'WALL-CUSTOM (cdr (assoc 'WALL-CUSTOM source-data)))
+               (cons 'WALE-SPEC (cdr (assoc 'WALE-SPEC source-data)))
+               (cons 'WALE-CUSTOM (cdr (assoc 'WALE-CUSTOM source-data)))
+               (cons 'CTC (cdr (assoc 'CTC source-data)))
+               (cons 'TIMBER-THICKNESS (cdr (assoc 'TIMBER-THICKNESS source-data)))
+               (cons 'MAX-DEPTH (cdr (assoc 'MAX-DEPTH source-data)))
+               (cons 'EMBED-DEPTH (cdr (assoc 'EMBED-DEPTH source-data)))
+               (cons 'ROCK-EMBED (cdr (assoc 'ROCK-EMBED source-data)))
+               (cons 'CIP-MAX-DEPTH (if (assoc 'CIP-MAX-DEPTH source-data) (cdr (assoc 'CIP-MAX-DEPTH source-data)) "10.0"))
+               (cons 'CIP-EMBED-DEPTH (if (assoc 'CIP-EMBED-DEPTH source-data) (cdr (assoc 'CIP-EMBED-DEPTH source-data)) "3.0"))
+               (cons 'CIP-HPILE-IDX (if (assoc 'CIP-HPILE-IDX source-data) (cdr (assoc 'CIP-HPILE-IDX source-data)) "2"))
+               (cons 'CIP-WALE-IDX (if (assoc 'CIP-WALE-IDX source-data) (cdr (assoc 'CIP-WALE-IDX source-data)) "2"))
+               (cons 'CIP-DIA (if (assoc 'CIP-DIA source-data) (cdr (assoc 'CIP-DIA source-data)) "500"))
+               (cons 'CIP-MODE-IDX (if (assoc 'CIP-MODE-IDX source-data) (cdr (assoc 'CIP-MODE-IDX source-data)) "0"))
+               (cons 'CIP-OVERLAP (if (assoc 'CIP-OVERLAP source-data) (cdr (assoc 'CIP-OVERLAP source-data)) "0"))
+               (cons 'CIP-EQUAL-DIVIDE (if (assoc 'CIP-EQUAL-DIVIDE source-data) (cdr (assoc 'CIP-EQUAL-DIVIDE source-data)) "1")) ;; 누락 데이터 완벽 추가
+               (cons 'CIP-INTERVAL-IDX (if (assoc 'CIP-INTERVAL-IDX source-data) (cdr (assoc 'CIP-INTERVAL-IDX source-data)) "2"))
+               (cons 'CIP-ANCHOR-N (if (assoc 'CIP-ANCHOR-N source-data) (cdr (assoc 'CIP-ANCHOR-N source-data)) "1")) ;; 누락 데이터 완벽 추가
+               (cons 'CIP-GROUTING-IDX (if (assoc 'CIP-GROUTING-IDX source-data) (cdr (assoc 'CIP-GROUTING-IDX source-data)) "0"))
+               (cons 'CIP-GROUTING-SPACE-IDX (if (assoc 'CIP-GROUTING-SPACE-IDX source-data) (cdr (assoc 'CIP-GROUTING-SPACE-IDX source-data)) "0"))
+               (cons 'CIP-GROUTING-SPACE-CUSTOM (if (assoc 'CIP-GROUTING-SPACE-CUSTOM source-data) (cdr (assoc 'CIP-GROUTING-SPACE-CUSTOM source-data)) ""))
+               (cons 'CIP-GROUTING-OFFSET-IDX (if (assoc 'CIP-GROUTING-OFFSET-IDX source-data) (cdr (assoc 'CIP-GROUTING-OFFSET-IDX source-data)) "0"))
+               (cons 'CIP-GROUTING-OFFSET-CUSTOM (if (assoc 'CIP-GROUTING-OFFSET-CUSTOM source-data) (cdr (assoc 'CIP-GROUTING-OFFSET-CUSTOM source-data)) ""))
+               (cons 'WATER-CHK (cdr (assoc 'WATER-CHK source-data)))
+               (cons 'WATER-DEPTH (cdr (assoc 'WATER-DEPTH source-data)))
+               (cons 'SHOTCRETE-ENABLE (if (assoc 'SHOTCRETE-ENABLE source-data) (cdr (assoc 'SHOTCRETE-ENABLE source-data)) "1"))
+               (cons 'SHOTCRETE-CHK (if (assoc 'SHOTCRETE-CHK source-data) (cdr (assoc 'SHOTCRETE-CHK source-data)) "0"))
+               (cons 'SHOTCRETE-LAYER (if (assoc 'SHOTCRETE-LAYER source-data) (cdr (assoc 'SHOTCRETE-LAYER source-data)) ""))
+               (cons 'SHOTCRETE-THICK (if (assoc 'SHOTCRETE-THICK source-data) (cdr (assoc 'SHOTCRETE-THICK source-data)) 0.0))
+               (cons 'SUPPORT-LIST (cdr (assoc 'SUPPORT-LIST source-data)))
+               (cons 'CORNER-BRACE
+                 (if (and (cdr (assoc 'CORNER-BRACE target-data)) (= (car (cdr (assoc 'CORNER-BRACE target-data))) "Y"))
+                   (cdr (assoc 'CORNER-BRACE source-data))
+                   (cdr (assoc 'CORNER-BRACE target-data))
+                 )
+               )
+               (cons 'UPGRADE-WALE (cdr (assoc 'UPGRADE-WALE target-data)))
+               (cons 'V-START (cdr (assoc 'V-START target-data)))
+               (cons 'V-END (cdr (assoc 'V-END target-data)))
+               (cons 'ANGLE (cdr (assoc 'ANGLE target-data)))
+               (cons 'LENGTH (cdr (assoc 'LENGTH target-data)))
+             ))
+             (setq *segment-list* (update-list-item *segment-list* t-idx new-target))
+           )
+           (setq paste-mode nil)
+           (setq *tsp-data-dirty* T)
+           (setq status-msg-text (strcat (itoa (length target-indices)) "개의 세그먼트에 데이터가 한 번에 복사되었습니다!"))
+           (if (and *tsp-boundary-ent* *tsp-boundary-orient*) (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*))
+         )
+         (progn
+           (alert "데이터가 텅 비어있는 세그먼트는 원본이 될 수 없습니다.")
+           (setq paste-mode nil))
+       )
+      )
+      ((= result 7)
+       (setq check-data (nth selected-idx *segment-list*))
+       (if (cdr (assoc 'IS-DEFINED check-data))
+         (progn
+           (tsp-apply-settings-to-all selected-idx)
+           (setq status-msg-text "모든 세그먼트에 설정이 일괄 적용되었습니다.")
+           (alert (strcat "No." (itoa (1+ selected-idx)) " 설정값이 나머지 전체 목록에 적용되었습니다."))
+           (if (and *tsp-boundary-ent* *tsp-boundary-orient*) (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*))
+         )
+         (alert "복사할 원본이 정의되지 않았습니다.\\n먼저 [입력]을 완료하세요.")
+       )
+       (setq apply-all-mode nil)
+      )
+
+      ((= result 8)
+       (setq check-data (nth selected-idx *segment-list*))
+       (if (and (cdr (assoc 'SOIL-DATA check-data)) (/= (cdr (assoc 'SOIL-DATA check-data)) '()))
+         (progn
+           (tsp-apply-soil-to-selected selected-idx target-indices)
+           (setq status-msg-text (strcat (itoa (length target-indices)) "개의 세그먼트에 지반 정보가 복사되었습니다."))
+           (alert (strcat "No." (itoa (1+ selected-idx)) " 지반 정보가 선택한 " (itoa (length target-indices)) "개 목록에 복사되었습니다."))
+           (if (and *tsp-boundary-ent* *tsp-boundary-orient*) (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*))
+         )
+         (alert "복사할 지반 정보가 없습니다.")
+       )
+       (setq apply-soil-mode nil)
+      )
+      ((= result 11)
+       (setq check-data (nth selected-idx *segment-list*))
+       (if (and (cdr (assoc 'SUPPORT-LIST check-data)) (/= (cdr (assoc 'SUPPORT-LIST check-data)) '()))
+         (progn
+           (tsp-apply-support-to-selected selected-idx target-indices)
+           (setq status-msg-text (strcat (itoa (length target-indices)) "개의 세그먼트에 지보재 정보가 복사되었습니다."))
+           (alert (strcat "No." (itoa (1+ selected-idx)) " 지보재 정보가 선택한 " (itoa (length target-indices)) "개 목록에 복사되었습니다."))
+           (if (and *tsp-boundary-ent* *tsp-boundary-orient*) (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*))
+         )
+         (alert "복사할 지보재 정보가 없습니다.\\n먼저 지보재를 정의해 주세요.")
+       )
+       (setq apply-support-mode nil)
+      )
+      ((= result 14)
+       (setq check-data (nth selected-idx *segment-list*))
+       (if (cdr (assoc 'IS-DEFINED check-data))
+         (progn
+           (tsp-apply-wall-to-selected selected-idx target-indices)
+           (setq status-msg-text (strcat (itoa (length target-indices)) "개의 세그먼트에 흙막이벽 정보가 복사되었습니다."))
+           (alert (strcat "No." (itoa (1+ selected-idx)) " 흙막이벽 정보가 선택한 " (itoa (length target-indices)) "개 목록에 복사되었습니다."))
+           (if (and *tsp-boundary-ent* *tsp-boundary-orient*) (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*))
+         )
+         (alert "복사할 흙막이벽 정보가 없습니다.\n먼저 원본 세그먼트의 [입력]을 완료해 주세요.")
+       )
+       (setq apply-wall-mode nil)
+      )
+      ((= result 15)
+       (setq check-data (nth selected-idx *segment-list*))
+       (if (and (cdr (assoc 'CORNER-BRACE check-data))
+                (= (car (cdr (assoc 'CORNER-BRACE check-data))) "Y")
+                (cadr (cdr (assoc 'CORNER-BRACE check-data))))
+         (progn
+           (setq copy-res (tsp-apply-brace-to-selected selected-idx target-indices))
+           (setq copied-cnt (car copy-res))
+           (setq skipped-lst (cadr copy-res))
+           (setq skipped-str "")
+           (foreach s-name skipped-lst
+             (setq skipped-str (if (= skipped-str "") s-name (strcat skipped-str ", " s-name)))
+           )
+           (cond
+             ((and (> copied-cnt 0) (null skipped-lst))
+              (setq status-msg-text (strcat (itoa copied-cnt) "개의 세그먼트에 사보강재 정보가 복사되었습니다."))
+              (alert (strcat "No." (itoa (1+ selected-idx)) " 사보강재 정보가 선택한 " (itoa copied-cnt) "개 목록에 복사되었습니다."))
+             )
+             ((and (> copied-cnt 0) skipped-lst)
+              (setq status-msg-text (strcat (itoa copied-cnt) "개 복사 완료 (설치불가 제외: " skipped-str ")"))
+              (alert (strcat "No." (itoa (1+ selected-idx)) " 사보강재 정보 복사 완료\n\n- 복사 성공: " (itoa copied-cnt) "개\n- 제외 대상(사보강재 미적용 코너): " skipped-str))
+             )
+             (t
+              (setq status-msg-text "사보강재를 복사할 수 있는 유효한 코너가 없습니다.")
+              (alert (strcat "선택한 대상(" (if (/= skipped-str "") skipped-str "본인 포함") ")은 사보강재가 설치되지 않는 코너이거나 원본과 동일하여 복사되지 않았습니다."))
+             )
+           )
+           (if (and (> copied-cnt 0) *tsp-boundary-ent* *tsp-boundary-orient*)
+             (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*)
+           )
+         )
+         (alert "선택한 원본 세그먼트에 입력된 사보강재(Corner Strut) 데이터가 없습니다.\n사보강재가 입력된 세그먼트를 원본으로 클릭해 주세요.")
+       )
+       (setq apply-brace-mode nil)
+      )
+
+      ((= result 9)
+       (foreach t-idx selected-indices
+         (setq target-id (cdr (assoc 'ID (nth t-idx *segment-list*))))
+         (tsp-reset-segment-data t-idx)
+         (tsp-delete-manual-post-by-segment target-id "ALL")
+       )
+       (setq status-msg-text (strcat (itoa (length selected-indices)) "개의 설정이 성공적으로 초기화되었습니다."))
+       (if (and *tsp-boundary-ent* *tsp-boundary-orient*) (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*))
+      )
+      ((= result 10)
+       (tsp-reset-all-segments)
+       (tsp-reset-post-manual)
+       (setq status-msg-text "모든 목록의 설정이 초기화되었습니다.")
+       (alert "모든 세그먼트 데이터가 초기 상태로 되돌려졌습니다.")
+       (if (and *tsp-boundary-ent* *tsp-boundary-orient*) (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*))
+      )
+      ((= result 12)
+       (if (and *tsp-boundary-ent* *tsp-boundary-orient*) (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*))
+      )
+      ((= result 13)
+       (if tsp-pause-for-measurement
+         (tsp-pause-for-measurement)
+         (alert "TSP - 도면 제어 모듈이 로드되지 않았습니다.\n(코드가 정상적으로 병합되었는지 확인해주세요.)")
+       )
+       (setq status-msg-text "도면 확인을 마치고 복귀했습니다. 작업을 계속 진행하세요.")
+      )
+    )
+  )
+  result
+)

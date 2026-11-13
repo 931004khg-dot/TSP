@@ -1,0 +1,841 @@
+;;; ==========================================================================
+;;; 파일명: TSP_6B_Main_and_CSV.lsp
+;;; 구  분: 메인 명령어(C:TSP), 실시간 리드로우, CSV 입출력 및 파이썬 연동 (Part B)
+;;; 역  할: C:TSP 메인 상태 머신, 실시간 평면 갱신(tsp-redraw-realtime-plan), 도면 N치 드래그 추출, CSV 내보내기/불러오기/매칭, 파이썬(GeoX) 다이렉트 연동, SUB-ZONES 전개 [tsp-write-project-csv, tsp-save-and-export-current-csv, tsp-export-to-csv, tsp-rebuild-boundary, tsp-merge-csv-seg-into-curr 외 6개]
+;;; 포함 함수: tsp-write-project-csv, tsp-save-and-export-current-csv, tsp-export-to-csv, tsp-rebuild-boundary, tsp-merge-csv-seg-into-curr, tsp-init-dummy-segments, tsp-parse-csv-file-data, tsp-csv-mapping-dialog, update-map-list, tsp-apply-csv-to-current-segments, tsp-has-real-boundary-coords-p
+;;; --------------------------------------------------------------------------
+;;; [안내] 이 파일은 TSP.lsp(메인 로더)에 의해 자동으로 로드되는 하위 모듈입니다.
+;;;        코드 수정 시 전체 파일을 합칠 필요 없이 이 파일만 단독 패치하면 됩니다.
+;;; ==========================================================================
+
+;;;;==========================================================================
+;;;; defun tsp-prin1-prec : 리스트/원소 내 모든 실수(REAL)를 소수점 8자리까지 손실 없이 문자열로 직렬화
+;;;;   (AutoLISP 기본 vl-prin1-to-string의 유효숫자 6자리 절삭으로 인한 CSV 좌표 반올림 오차 원천 차단)
+;;;;==========================================================================
+(defun tsp-prin1-prec (expr / out is-first cur s)
+  (cond
+    ((null expr) "nil")
+    ((= (type expr) 'REAL)
+     (setq s (rtos expr 2 8))
+     (while (and (> (strlen s) 2)
+                 (vl-string-search "." s)
+                 (= (substr s (strlen s) 1) "0")
+                 (/= (substr s (1- (strlen s)) 1) "."))
+       (setq s (substr s 1 (1- (strlen s))))
+     )
+     (if (not (vl-string-search "." s)) (setq s (strcat s ".0")))
+     s
+    )
+    ((= (type expr) 'LIST)
+     (setq out "(" is-first T cur expr)
+     (while (and cur (listp cur))
+       (if (not is-first) (setq out (strcat out " ")))
+       (setq out (strcat out (tsp-prin1-prec (car cur))))
+       (setq is-first nil)
+       (setq cur (cdr cur))
+     )
+     (if cur
+       (setq out (strcat out " . " (tsp-prin1-prec cur)))
+     )
+     (strcat out ")")
+    )
+    (t (vl-prin1-to-string expr))
+  )
+)
+
+;;;;==========================================================================
+;;;; defun tsp-write-project-csv : 지정된 프로젝트명(proj-name)의 데이터를 CSV 파일로 저장
+;;;;==========================================================================
+(defun tsp-write-project-csv (proj-name / file-path file-desc seg-str data-pack safe-filename cur-orient seg-list scale-s scale-p soil-layers anc-seg-pos anc-supp anc-idx anc-item anc-rec bnd-ent bnd-verts bnd-closed bnd-str)
+  (setq data-pack (vlax-ldata-get "TSP_DATA_DICT" proj-name))
+  (if (not data-pack)
+    (progn
+      (alert "프로젝트 데이터를 읽을 수 없습니다.")
+      nil
+    )
+    (progn
+      (setq seg-list (nth 0 data-pack))
+      (setq scale-s (nth 13 data-pack))
+      (setq scale-p (nth 14 data-pack))
+            (setq soil-layers (nth 9 data-pack))
+      ;; [A안] 경계선 원본 정점 캡처 - #BOUNDARY 레코드 기록용
+      ;; (자동 모서리 삭제/수동 모서리 편집은 작업용 정점 리스트만 건드리며 도면 폴리라인
+      ;;  원본을 유지하므로, 내보내기 시점의 경계선 정점이 곧 완전한 원본 형상임.
+      ;;  도면에 경계선이 없으면 기록을 생략하여 구버전 CSV와 동일하게 동작)
+      (setq bnd-ent (if (and (boundp '*tsp-boundary-ent*) *tsp-boundary-ent* (entget *tsp-boundary-ent*)) *tsp-boundary-ent* nil))
+      (setq bnd-verts (if bnd-ent (extract-vertices bnd-ent) nil))
+
+      ;; 파일명 생성 시 특수문자 필터링 안전망 적용
+      (setq safe-filename (tsp-sanitize-project-name proj-name))
+      (setq file-path (getfiled "EXCEL(CSV)로 내보내기" (strcat safe-filename ".csv") "csv" 1))
+
+      (if file-path
+        (progn
+          (setq file-desc (open file-path "w"))
+          (if (not file-desc)
+            (progn
+              (alert (strcat "파일을 열 수 없습니다 (엑셀 등에서 열려 있는지 확인하세요):\n" file-path))
+              nil
+            )
+            (progn
+              ;; 글로벌 데이터 기록
+              (setq cur-orient (if (> (length data-pack) 17) (nth 17 data-pack) 1))
+              (write-line (strcat "#GLOBAL,PROJECT_NAME," safe-filename ",SCALE_S," (itoa scale-s) ",SCALE_P," (itoa scale-p) ",ORIENT," (itoa cur-orient)) file-desc)
+
+                            ;; 프로젝트 전역 설정(Global Settings) 100% 백업용 RAW 데이터 기록 (실수 좌표 8자리 보존)
+              (write-line (strcat "#GLOBAL_RAW," (tsp-prin1-prec data-pack)) file-desc)
+
+              ;; 지반 지층 정보 기록
+              (foreach soil soil-layers
+                (write-line (strcat "#SOIL," (tsp-prin1-prec soil)) file-desc)
+              )
+
+                            ;; [A안] 경계선 원본 정점 기록 - 자동삭제(180도 근접) 모서리 포함
+              ;; 형식: #BOUNDARY,폐합여부(1/0),(x1 y1) (x2 y2) ...
+              (if (and bnd-verts (> (length bnd-verts) 1))
+                (progn
+                  (setq bnd-closed (if (is-closed-polyline bnd-ent) 1 0))
+                  (setq bnd-str
+                    (strcat "#BOUNDARY," (itoa bnd-closed) ","
+                      (apply 'strcat
+                        (mapcar '(lambda (v) (strcat "(" (rtos (car v) 2 8) " " (rtos (cadr v) 2 8) ") ")) bnd-verts))))
+                  (write-line bnd-str file-desc)
+                )
+              )
+              ;; 세그먼트 데이터 기록 (13번째 열에 원본 리스트 통째로 직렬화하여 백업)
+              (write-line "#HEADER,ID,TYPE,V-START,V-END,ANGLE,LENGTH,WALL-SPEC,CTC,MAX-DEPTH,SUPPORT-LIST,CORNER-BRACE,RAW-DATA" file-desc)
+              (setq anc-seg-pos 0)
+              (foreach seg seg-list
+                (setq seg-str (strcat "SEGMENT,"
+                  (if (cdr (assoc 'ID seg)) (itoa (cdr (assoc 'ID seg))) "0") ","
+
+                  ;; 1. 최신 이름표(WALL-TYPE)가 있는지 먼저 확인
+                  (cond
+                    ((and (cdr (assoc 'WALL-TYPE seg)) (/= (cdr (assoc 'WALL-TYPE seg)) "")) (cdr (assoc 'WALL-TYPE seg)))
+                    ((= (cdr (assoc 'HPILE-OR-CIP seg)) 0) "HPILE")
+                    ((= (cdr (assoc 'HPILE-OR-CIP seg)) 1) "CIP")
+                    (t "HPILE")
+                  ) ","
+
+                  ;; 좌표(V-START, V-END) 및 형태(ANGLE, LENGTH)의 정밀도를 소수점 12자리로 극대화
+                  (if (cdr (assoc 'V-START seg))
+                    (strcat "(" (rtos (car (cdr (assoc 'V-START seg))) 2 12) " " (rtos (cadr (cdr (assoc 'V-START seg))) 2 12) " " (rtos (if (caddr (cdr (assoc 'V-START seg))) (caddr (cdr (assoc 'V-START seg))) 0.0) 2 12) ")")
+                    "nil"
+                  ) ","
+                  (if (cdr (assoc 'V-END seg))
+                    (strcat "(" (rtos (car (cdr (assoc 'V-END seg))) 2 12) " " (rtos (cadr (cdr (assoc 'V-END seg))) 2 12) " " (rtos (if (caddr (cdr (assoc 'V-END seg))) (caddr (cdr (assoc 'V-END seg))) 0.0) 2 12) ")")
+                    "nil"
+                  ) ","
+                  (if (cdr (assoc 'ANGLE seg)) (rtos (cdr (assoc 'ANGLE seg)) 2 12) "0.000000000000") ","
+                  (if (cdr (assoc 'LENGTH seg)) (rtos (cdr (assoc 'LENGTH seg)) 2 12) "0.000000000000") ","
+
+                                    ;; 의도적으로 비워둔 구간에서 WALL-SPEC 등이 nil일 때 strcat이 터지는 것을 방지하는 안전장치 추가
+                  (if (cdr (assoc 'WALL-SPEC seg)) (cdr (assoc 'WALL-SPEC seg)) "") ","
+                  (if (cdr (assoc 'CTC seg)) (rtos (cdr (assoc 'CTC seg)) 2 3) "") ","
+                  (if (cdr (assoc 'MAX-DEPTH seg)) (rtos (cdr (assoc 'MAX-DEPTH seg)) 2 3) "") ","
+
+                  (tsp-prin1-prec (cdr (assoc 'SUPPORT-LIST seg))) ","
+                  (tsp-prin1-prec (cdr (assoc 'CORNER-BRACE seg))) ","
+                  (tsp-prin1-prec seg)
+                ))
+                (write-line seg-str file-desc)
+                ;; 앵커 평면각 기록 정밀 출력 (#ANCHOR_ANG,세그먼트순번,지보재순번,X,Y,각도)
+                (setq anc-supp (tsp-sanitize-support-list (cdr (assoc 'SUPPORT-LIST seg))) anc-idx 0)
+                (foreach anc-item anc-supp
+                  (if (and (wcmatch (car anc-item) "*앵커*") (> (length anc-item) 9) (listp (nth 9 anc-item)))
+                    (foreach anc-rec (nth 9 anc-item)
+                      (if (and (listp anc-rec) (listp (car anc-rec)) (numberp (car (car anc-rec))) (numberp (cadr (car anc-rec))) (numberp (cdr anc-rec)))
+                        (write-line (strcat "#ANCHOR_ANG," (itoa anc-seg-pos) "," (itoa anc-idx) ","
+                                            (rtos (car (car anc-rec)) 2 8) "," (rtos (cadr (car anc-rec)) 2 8) "," (rtos (cdr anc-rec) 2 8))
+                                    file-desc)
+                      )
+                    )
+                  )
+                  (setq anc-idx (1+ anc-idx))
+                )
+                (setq anc-seg-pos (1+ anc-seg-pos))
+              )
+              (close file-desc)
+              (alert (strcat "[" proj-name "] 프로젝트 저장 및 CSV 내보내기가 완료되었습니다.\n파일을 확인해 주세요."))
+              T
+            )
+          )
+        )
+        nil
+      )
+    )
+  )
+)
+
+;;;;==========================================================================
+;;;; defun tsp-save-and-export-current-csv : 세그먼트 설정창에서 현재 프로젝트 저장(이름 변경 시 기존 프로젝트 덮어쓰기) 후 CSV 내보내기
+;;;;==========================================================================
+(defun tsp-save-and-export-current-csv (dcl-path ui-proj-name / old-proj-name base-name target-name sanitized-name saved-name)
+  (setq old-proj-name *tsp-current-project-name*)
+  (setq base-name (if (and ui-proj-name (/= (vl-string-trim " \t" ui-proj-name) ""))
+                    (vl-string-trim " \t" ui-proj-name)
+                    (if (and old-proj-name (/= old-proj-name ""))
+                      old-proj-name
+                      (tsp-generate-default-project-name))))
+  ;; 1. DCL 팝업창에 현재 프로젝트 이름을 띄워 확인 또는 수정 입력받음
+  (setq target-name (tsp-export-name-prompt-callback dcl-path base-name))
+  (if target-name
+    (progn
+      (setq sanitized-name (tsp-sanitize-project-name target-name))
+      ;; 2. 프로젝트 이름을 수정하여 저장하는 경우: 기존 프로젝트 데이터를 삭제하고 새 이름으로 덮어쓰기
+      (if (and old-proj-name
+               (/= old-proj-name "")
+               (/= old-proj-name sanitized-name)
+               (vlax-ldata-get "TSP_DATA_DICT" old-proj-name))
+        (tsp-delete-project-data old-proj-name)
+      )
+      ;; 3. 현재 프로젝트 데이터 도면 내 저장 및 경계선 태그 동기화
+      (setq saved-name (tsp-save-project-data sanitized-name))
+      (if (and (boundp '*tsp-boundary-ent*) *tsp-boundary-ent*)
+        (tsp-pm-tag-boundary *tsp-boundary-ent* saved-name)
+      )
+      ;; 4. 저장된 프로젝트명 그대로 CSV 파일 내보내기 실행
+      (tsp-write-project-csv saved-name)
+      T
+    )
+    (progn
+      (princ "\n[취소] 프로젝트 저장 및 CSV 내보내기가 취소되었습니다.")
+      nil
+    )
+  )
+)
+
+;;;;==========================================================================
+;;;; defun tsp-export-to-csv : 메인 메뉴에서 선택된 프로젝트를 CSV 파일로 출력
+;;;;==========================================================================
+(defun tsp-export-to-csv (/ proj-name data-pack)
+  (setq proj-name (tsp-select-project-for-export))
+  (if proj-name
+    (progn
+      (setq data-pack (vlax-ldata-get "TSP_DATA_DICT" proj-name))
+      (if (not data-pack)
+        (alert "프로젝트 데이터를 읽을 수 없습니다.")
+        (progn
+          (setq *segment-list* (nth 0 data-pack))
+          (setq *tsp-current-project-name* proj-name)
+          (setq *tsp-scale-section* (nth 13 data-pack))
+          (setq *tsp-scale-plan* (nth 14 data-pack))
+          (setq *tsp-soil-layers* (nth 9 data-pack))
+          (tsp-write-project-csv proj-name)
+        )
+      )
+    )
+  )
+  (princ)
+)
+
+;;;;==========================================================================
+;;;; defun tsp-rebuild-boundary : V-START 및 V-END 데이터를 분석하여 폴리라인 자동 생성
+;;;;==========================================================================
+(defun tsp-rebuild-boundary (/ first-pt last-pt is-closed pt-list flag ent)
+  ;; 1. 첫 세그먼트의 시작점과 마지막 세그먼트의 끝점을 추출하여 폐합 여부 판단
+  (setq first-pt (cdr (assoc 'V-START (nth 0 *segment-list*))))
+  (setq last-pt (cdr (assoc 'V-END (last *segment-list*))))
+  (setq is-closed (if (and first-pt last-pt (< (distance (list (car first-pt) (cadr first-pt)) (list (car last-pt) (cadr last-pt))) 0.1)) T nil))
+
+  ;; 2. 폴리라인을 구성할 정점(V-START) 리스트 생성
+  (setq pt-list nil)
+  (foreach seg *segment-list*
+    (setq pt-list (append pt-list (list (cdr (assoc 'V-START seg)))))
+  )
+
+  ;; 3. 개방형(Open) 경계선일 경우 마지막 세그먼트의 끝점(V-END)을 마지막 정점으로 추가
+  (if (not is-closed)
+    (setq pt-list (append pt-list (list last-pt)))
+  )
+
+  ;; 4. 폐합 여부에 따른 폴리라인 그룹 코드(70) 동적 할당
+  (setq flag (if is-closed 1 0))
+
+  ;; 5. 폴리라인 엔티티 생성
+  (entmake
+    (append
+      (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline")
+            (cons 90 (length pt-list))
+            (cons 70 flag)
+      )
+      ;; 3D 좌표가 들어올 경우를 대비해 2D(X, Y)로 안전하게 매핑
+      (mapcar '(lambda (pt) (list 10 (car pt) (cadr pt))) pt-list)
+    )
+  )
+  (setq ent (entlast))
+  (vla-put-Color (vlax-ename->vla-object ent) 1) ; 시인성을 위해 빨간색 지정
+  ent
+)
+
+;;;;==========================================================================
+;;;; defun tsp-remap-pt-between-segs : CSV 원본 세그먼트(old-seg) 기준의 점(pt)을
+;;;;   새 도면 세그먼트(new-seg)의 시작점/진행각/내측방향 기준으로 2D 회전+평행이동 변환
+;;;;==========================================================================
+(defun tsp-remap-pt-between-segs (pt old-seg new-seg orient-flip /
+   p0-old p1-old ang-old len-old p0-new p1-new ang-new len-new
+   dx dy u-along v-perp new-u new-v nx ny)
+  (if (and (listp pt) (numberp (car pt)) (numberp (cadr pt)))
+    (progn
+      (setq p0-old (cdr (assoc 'V-START old-seg))
+            p1-old (cdr (assoc 'V-END old-seg))
+            ang-old (cdr (assoc 'ANGLE old-seg))
+            len-old (cdr (assoc 'LENGTH old-seg)))
+      (setq p0-new (cdr (assoc 'V-START new-seg))
+            p1-new (cdr (assoc 'V-END new-seg))
+            ang-new (cdr (assoc 'ANGLE new-seg))
+            len-new (cdr (assoc 'LENGTH new-seg)))
+      (if (and (listp p0-old) (listp p0-new) (numberp ang-old) (numberp ang-new)
+               (numberp len-old) (> len-old 1.0) (numberp len-new) (> len-new 1.0))
+        (progn
+          (setq dx (- (car pt) (car p0-old))
+                dy (- (cadr pt) (cadr p0-old)))
+          ;; 원본 세그먼트 축 방향 거리(u-along)와 좌측 수직 오프셋(v-perp) 분해
+          (setq u-along (+ (* dx (cos ang-old)) (* dy (sin ang-old))))
+          (setq v-perp  (- (* dy (cos ang-old)) (* dx (sin ang-old))))
+          (setq new-u u-along)
+          ;; 만약 새 세그먼트가 원본보다 짧은데 점이 세그먼트 끝을 넘어가면 비율 스케일링 적용
+          (if (and (> u-along len-new) (<= u-along (+ len-old 500.0)))
+            (setq new-u (* (/ u-along len-old) len-new))
+          )
+          (setq new-v (if orient-flip (- v-perp) v-perp))
+          (setq nx (+ (car p0-new) (- (* new-u (cos ang-new)) (* new-v (sin ang-new)))))
+          (setq ny (+ (cadr p0-new) (+ (* new-u (sin ang-new)) (* new-v (cos ang-new)))))
+          (list nx ny (if (numberp (caddr pt)) (caddr pt) 0.0))
+        )
+        pt
+      )
+    )
+    pt
+  )
+)
+
+;;;;==========================================================================
+;;;; defun tsp-remap-support-list-for-merge : 다른 도면에서 CSV 세그먼트 매칭 시
+;;;;   SUPPORT-LIST 내 버팀보 manual-pts(8번), 앵커 평면각(9번), 적용구간 range-pts(11/13번)를
+;;;;   새 세그먼트 기하에 맞게 자동 변환하고 버팀보 상대각도(s-brace-opt 14번)를 보존
+;;;;==========================================================================
+(defun tsp-remap-support-list-for-merge (supp-list old-seg new-seg /
+   orient-old orient-new orient-flip out s-item s-type m-pts new-m-pts
+   a-recs new-a-recs r-pts new-r-pts s-opt idx v new-item)
+  (setq orient-old (if (and (boundp '*tsp-saved-orient*) (numberp *tsp-saved-orient*)) *tsp-saved-orient* nil))
+  (setq orient-new (if (and (boundp '*tsp-boundary-orient*) (numberp *tsp-boundary-orient*)) *tsp-boundary-orient* orient-old))
+  (setq orient-flip (and orient-old orient-new (/= orient-old orient-new)))
+  (setq out '())
+  (foreach s-item (tsp-sanitize-support-list supp-list)
+    (if (and (listp s-item) (> (length s-item) 0))
+      (progn
+        (setq s-type (car s-item))
+        (cond
+                                                  ;; 1) 버팀보(Strut): manual-pts(8번), s-brace-opt(11번 - 14번 버팀보 각도 포함), range-pts(13번) 변환
+          ((wcmatch s-type "버팀보*")
+           (setq m-pts (if (> (length s-item) 8) (nth 8 s-item) nil))
+           (if (and m-pts (listp m-pts))
+             (setq new-m-pts (mapcar '(lambda (p) (tsp-remap-pt-between-segs p old-seg new-seg orient-flip)) m-pts))
+             (setq new-m-pts m-pts)
+           )
+           (setq s-opt (if (> (length s-item) 11) (nth 11 s-item) nil))
+           (if (= (type s-opt) 'STR) (setq s-opt (read s-opt)))
+           ;; 다른 도면에서 굴착 방향(CW/CCW)이 반전된 경우 버팀보 지정 각도(14번 인덱스) 부호도 동기화
+           (if (and orient-flip (listp s-opt) (> (length s-opt) 14) (nth 14 s-opt))
+             (setq s-opt (tsp-brace-opt-set s-opt 14 (rtos (- (atof (nth 14 s-opt))) 2 4)))
+           )
+           (setq r-pts (if (> (length s-item) 13) (nth 13 s-item) nil))
+           (if (and r-pts (listp r-pts) (= (length r-pts) 2))
+             (setq new-r-pts (mapcar '(lambda (p) (tsp-remap-pt-between-segs p old-seg new-seg orient-flip)) r-pts))
+             (setq new-r-pts r-pts)
+           )
+           (setq idx 0 new-item '())
+           (foreach v s-item
+             (cond
+               ((= idx 8)  (setq new-item (append new-item (list new-m-pts))))
+               ((= idx 11) (setq new-item (append new-item (list s-opt))))
+               ((= idx 13) (setq new-item (append new-item (list new-r-pts))))
+               (t          (setq new-item (append new-item (list v))))
+             )
+             (setq idx (1+ idx))
+           )
+           (setq out (append out (list new-item)))
+          )
+          ;; 2) 앵커(Anchor): 평면각 기록(9번), range-pts(11번) 변환
+          ((wcmatch s-type "*앵커*")
+           (setq a-recs (if (> (length s-item) 9) (nth 9 s-item) nil))
+           (if (and a-recs (listp a-recs))
+             (setq new-a-recs
+               (mapcar '(lambda (rec)
+                          (if (and (listp rec) (listp (car rec)))
+                            (cons (tsp-remap-pt-between-segs (car rec) old-seg new-seg orient-flip) (cdr rec))
+                            rec
+                          ))
+                       a-recs))
+             (setq new-a-recs a-recs)
+           )
+           (setq r-pts (if (> (length s-item) 11) (nth 11 s-item) nil))
+           (if (and r-pts (listp r-pts) (= (length r-pts) 2))
+             (setq new-r-pts (mapcar '(lambda (p) (tsp-remap-pt-between-segs p old-seg new-seg orient-flip)) r-pts))
+             (setq new-r-pts r-pts)
+           )
+           (setq idx 0 new-item '())
+           (foreach v s-item
+             (cond
+               ((= idx 9)  (setq new-item (append new-item (list new-a-recs))))
+               ((= idx 11) (setq new-item (append new-item (list new-r-pts))))
+               (t          (setq new-item (append new-item (list v))))
+             )
+             (setq idx (1+ idx))
+           )
+           (setq out (append out (list new-item)))
+          )
+          (t
+           (setq out (append out (list s-item)))
+          )
+        )
+      )
+      (setq out (append out (list s-item)))
+    )
+  )
+  out
+)
+
+;;;;==========================================================================
+;;;; defun tsp-merge-csv-seg-into-curr : 현재 세그먼트의 기하좌표(V-START/V-END/ANGLE/LENGTH)와 코너여부를 보존하며 CSV 단면 제원만 병합
+;;;;==========================================================================
+(defun tsp-merge-csv-seg-into-curr (curr-seg csv-seg / merged-seg curr-brace csv-brace final-brace csv-upg final-upg remapped-upg-pts remapped-supp orient-old orient-new orient-flip key-list k)
+  (setq curr-brace (cdr (assoc 'CORNER-BRACE curr-seg)))
+  (setq csv-brace (cdr (assoc 'CORNER-BRACE csv-seg)))
+  (setq final-brace
+    (if (and csv-brace (= (car csv-brace) "Y") (cadr csv-brace))
+      (if (and curr-brace (= (car curr-brace) "N"))
+        curr-brace
+        csv-brace
+      )
+      curr-brace
+    )
+  )
+  (setq orient-old (if (and (boundp '*tsp-saved-orient*) (numberp *tsp-saved-orient*)) *tsp-saved-orient* nil))
+  (setq orient-new (if (and (boundp '*tsp-boundary-orient*) (numberp *tsp-boundary-orient*)) *tsp-boundary-orient* orient-old))
+  (setq orient-flip (and orient-old orient-new (/= orient-old orient-new)))
+
+  (setq csv-upg (cdr (assoc 'UPGRADE-WALE csv-seg)))
+  (if (and csv-upg (> (length csv-upg) 2) (nth 2 csv-upg))
+    (progn
+      (setq remapped-upg-pts
+        (mapcar '(lambda (pt-data)
+                   (if (and (listp pt-data) (listp (cadr pt-data)))
+                     (list (car pt-data) (tsp-remap-pt-between-segs (cadr pt-data) csv-seg curr-seg orient-flip))
+                     pt-data
+                   ))
+                (nth 2 csv-upg)))
+      (setq csv-upg (list (nth 0 csv-upg) (nth 1 csv-upg) remapped-upg-pts))
+    )
+  )
+  (setq final-upg
+    (if (and final-brace (= (car final-brace) "Y"))
+      csv-upg
+      nil
+    )
+  )
+  ;; SUPPORT-LIST 내 버팀보 manual-pts / 앵커 평면각 / 구간 좌표를 새 도면 세그먼트 기준으로 회전+이동 매핑
+  (setq remapped-supp (tsp-remap-support-list-for-merge (cdr (assoc 'SUPPORT-LIST csv-seg)) csv-seg curr-seg))
+
+  (setq merged-seg csv-seg)
+  (if (assoc 'UPGRADE-WALE merged-seg)
+    (setq merged-seg (subst (cons 'UPGRADE-WALE final-upg) (assoc 'UPGRADE-WALE merged-seg) merged-seg))
+    (setq merged-seg (append merged-seg (list (cons 'UPGRADE-WALE final-upg))))
+  )
+  (if (assoc 'SUPPORT-LIST merged-seg)
+    (setq merged-seg (subst (cons 'SUPPORT-LIST remapped-supp) (assoc 'SUPPORT-LIST merged-seg) merged-seg))
+    (setq merged-seg (append merged-seg (list (cons 'SUPPORT-LIST remapped-supp))))
+  )
+  (foreach pair (list
+                  (cons 'ID (cdr (assoc 'ID curr-seg)))
+                  (cons 'V-START (cdr (assoc 'V-START curr-seg)))
+                  (cons 'V-END (cdr (assoc 'V-END curr-seg)))
+                  (cons 'ANGLE (cdr (assoc 'ANGLE curr-seg)))
+                  (cons 'LENGTH (cdr (assoc 'LENGTH curr-seg)))
+                  (cons 'CORNER-BRACE final-brace)
+                )
+    (if (assoc (car pair) merged-seg)
+      (setq merged-seg (subst pair (assoc (car pair) merged-seg) merged-seg))
+      (setq merged-seg (append merged-seg (list pair)))
+    )
+  )
+  merged-seg
+)
+
+;;;;==========================================================================
+;;;; defun tsp-init-dummy-segments : 평면 경계선 없이 단면도만 작도할 때 사용할 기본 가상 세그먼트 리스트 생성
+;;;;==========================================================================
+(defun tsp-init-dummy-segments (cnt / i res pt1 pt2 seg-data)
+  (if (or (null cnt) (< cnt 1)) (setq cnt 1))
+  (setq i 0 res '())
+  (while (< i cnt)
+    (setq pt1 (list (* i 20000.0) 0.0 0.0))
+    (setq pt2 (list (* (1+ i) 20000.0) 0.0 0.0))
+    (setq seg-data (list
+      (cons 'ID (1+ i))
+      (cons 'NAME (strcat "Seg-" (itoa (1+ i))))
+      (cons 'IS-DEFINED nil)
+      (cons 'SECTION-DRAW T)
+      (cons 'SOIL-DATA nil)
+      (cons 'N-VALUES nil)
+      (cons 'HOLE-NO (strcat "BH-" (itoa (1+ i))))
+      (cons 'WALL-SPEC *tsp-hpile-spec*)
+      (cons 'WALL-CUSTOM '(300 300 10 15))
+      (cons 'WALE-SPEC *tsp-wale-spec*)
+      (cons 'WALE-CUSTOM '(300 300 10 15))
+      (cons 'CTC 2.0)
+      (cons 'TIMBER-THICKNESS 60)
+      (cons 'MAX-DEPTH 10.0)
+      (cons 'EMBED-DEPTH 3.0)
+      (cons 'WATER-CHK "0")
+      (cons 'WATER-DEPTH 0.0)
+      (cons 'SHOTCRETE-ENABLE "1")
+      (cons 'SHOTCRETE-CHK "0")
+      (cons 'SHOTCRETE-LAYER "")
+      (cons 'SHOTCRETE-THICK 0.0)
+      (cons 'SUPPORT-LIST '())
+      (cons 'CORNER-BRACE (list "N" nil))
+      (cons 'UPGRADE-WALE nil)
+      (cons 'WALL-TYPE "HPILE")
+      (cons 'CIP-MAX-DEPTH "10.0")
+      (cons 'CIP-EMBED-DEPTH "3.0")
+      (cons 'CIP-HPILE-IDX "2")
+      (cons 'CIP-WALE-IDX "2")
+      (cons 'CIP-DIA "500")
+      (cons 'CIP-MODE-IDX "0")
+      (cons 'CIP-OVERLAP "0")
+      (cons 'CIP-EQUAL-DIVIDE "0")
+      (cons 'CIP-INTERVAL-IDX "2")
+      (cons 'CIP-ANCHOR-N "3")
+      (cons 'CIP-GROUTING-IDX "0")
+      (cons 'CIP-GROUTING-SPACE-IDX "0")
+      (cons 'CIP-GROUTING-SPACE-CUSTOM "")
+      (cons 'CIP-GROUTING-OFFSET-IDX "0")
+      (cons 'CIP-GROUTING-OFFSET-CUSTOM "")
+      (cons 'V-START pt1)
+      (cons 'V-END pt2)
+      (cons 'ANGLE 0.0)
+      (cons 'LENGTH 20000.0)
+    ))
+    (setq res (append res (list seg-data)))
+    (setq i (1+ i))
+  )
+  res
+)
+
+;;;;==========================================================================
+;;;; defun tsp-parse-csv-file-data : CSV 파일을 파싱하여 new-seg-list를 반환하고 전역 설정을 복원하는 공통 파서
+;;;;==========================================================================
+(defun tsp-parse-csv-file-data (file-path / file-desc line-str data-lst new-seg-list seg-data raw-globals clean-support anc-ang-recs anc-seg-pos anc-new-segs anc-supp anc-idx anc-new-supp anc-item anc-list anc-r anc-k anc-new-item anc-v)
+  (setq file-desc (open file-path "r"))
+  (if (not file-desc)
+    nil
+    (progn
+      (setq new-seg-list nil)
+      (setq anc-ang-recs nil)
+            (setq *tsp-soil-layers* nil)
+      (setq *tsp-csv-boundary-data* nil)  ;; [A안] #BOUNDARY 레코드 초기화
+      (while (setq line-str (read-line file-desc))
+        (setq data-lst (tsp-split-string-by-comma line-str))
+        (cond
+          ((= (nth 0 data-lst) "#GLOBAL")
+           (setq *tsp-current-project-name* (nth 2 data-lst))
+           (setq *tsp-scale-section* (atoi (nth 4 data-lst)))
+           (setq *tsp-scale-plan* (atoi (nth 6 data-lst)))
+           (if (> (length data-lst) 7)
+             (setq *tsp-saved-orient* (atoi (nth 8 data-lst)))
+             (setq *tsp-saved-orient* nil)
+           )
+          )
+          ((= (nth 0 data-lst) "#GLOBAL_RAW")
+           (setq raw-globals (read (nth 1 data-lst)))
+           (if raw-globals
+             (progn
+               (setq *tsp-hpile-spec* (nth 1 raw-globals))
+               (setq *tsp-hpile-custom* (nth 2 raw-globals))
+               (setq *tsp-wale-spec* (nth 3 raw-globals))
+               (setq *tsp-wale-custom* (nth 4 raw-globals))
+               (setq *tsp-ctc* (nth 5 raw-globals))
+               (setq *tsp-timber-thickness* (nth 6 raw-globals))
+               (setq *tsp-max-excavation-depth* (nth 7 raw-globals))
+               (setq *tsp-embedment-depth* (nth 8 raw-globals))
+               (setq *tsp-water-chk* (nth 10 raw-globals))
+               (setq *tsp-water-depth* (nth 11 raw-globals))
+               (setq *tsp-support-list* (tsp-sanitize-support-list (nth 12 raw-globals)))
+               (if (> (length raw-globals) 15)
+                 (progn
+                   (setq *tsp-deleted-post-points* (nth 15 raw-globals))
+                   (setq *tsp-added-post-points* (nth 16 raw-globals))
+                   (vlax-ldata-put "TSP_DICT" "DELETED_CORBELS" (if (> (length raw-globals) 18) (nth 18 raw-globals) '()))
+                   (vlax-ldata-put "TSP_DICT" "DELETED_POSTS" *tsp-deleted-post-points*)
+                   (vlax-ldata-put "TSP_DICT" "ADDED_POSTS" *tsp-added-post-points*)
+                 )
+                 (progn
+                   (setq *tsp-deleted-post-points* '())
+                   (setq *tsp-added-post-points* '())
+                   (if (vlax-ldata-get "TSP_DICT" "DELETED_POSTS") (vlax-ldata-delete "TSP_DICT" "DELETED_POSTS"))
+                   (if (vlax-ldata-get "TSP_DICT" "ADDED_POSTS") (vlax-ldata-delete "TSP_DICT" "ADDED_POSTS"))
+                 )
+               )
+             )
+           )
+          )
+          ((= (nth 0 data-lst) "#ANCHOR_ANG")
+           (if (>= (length data-lst) 6)
+             (setq anc-ang-recs (append anc-ang-recs (list (list (atoi (nth 1 data-lst)) (atoi (nth 2 data-lst))
+                                                                (list (atof (nth 3 data-lst)) (atof (nth 4 data-lst)) 0.0)
+                                                                (atof (nth 5 data-lst))))))
+           )
+          )
+          ((= (nth 0 data-lst) "#SOIL")
+           (setq *tsp-soil-layers* (append *tsp-soil-layers* (list (read (nth 1 data-lst)))))
+          )
+                    ((= (nth 0 data-lst) "#BOUNDARY")
+           ;; [A안] 경계선 원본 정점 레코드 해석 - (폐합여부 ((x y) (x y) ...))
+           ;; 구버전 리습은 이 cond에서 무시하므로 상호 호환됨
+           (if (and (>= (length data-lst) 3) (nth 2 data-lst))
+             (setq *tsp-csv-boundary-data*
+               (list (atoi (nth 1 data-lst)) (read (strcat "(" (nth 2 data-lst) ")"))))
+             (setq *tsp-csv-boundary-data* nil)
+           )
+          )
+          ((= (nth 0 data-lst) "SEGMENT")
+           (setq seg-data (read (nth 12 data-lst)))
+           (setq seg-data (subst (cons 'ID (atoi (nth 1 data-lst))) (assoc 'ID seg-data) seg-data))
+           (setq seg-data (subst (cons 'NAME (strcat "Seg-" (nth 1 data-lst))) (assoc 'NAME seg-data) seg-data))
+           (if (assoc 'WALL-TYPE seg-data)
+             (setq seg-data (subst (cons 'WALL-TYPE (nth 2 data-lst)) (assoc 'WALL-TYPE seg-data) seg-data))
+             (setq seg-data (append seg-data (list (cons 'WALL-TYPE (nth 2 data-lst)))))
+           )
+           (setq seg-data (subst (cons 'V-START (read (nth 3 data-lst))) (assoc 'V-START seg-data) seg-data))
+           (setq seg-data (subst (cons 'V-END (read (nth 4 data-lst))) (assoc 'V-END seg-data) seg-data))
+           (setq seg-data (subst (cons 'ANGLE (atof (nth 5 data-lst))) (assoc 'ANGLE seg-data) seg-data))
+           (setq seg-data (subst (cons 'LENGTH (atof (nth 6 data-lst))) (assoc 'LENGTH seg-data) seg-data))
+           (setq seg-data (subst (cons 'WALL-SPEC (if (= (nth 7 data-lst) "") nil (nth 7 data-lst))) (assoc 'WALL-SPEC seg-data) seg-data))
+           (setq seg-data (subst (cons 'CTC (if (= (nth 8 data-lst) "") nil (atof (nth 8 data-lst)))) (assoc 'CTC seg-data) seg-data))
+           (setq seg-data (subst (cons 'MAX-DEPTH (if (= (nth 9 data-lst) "") nil (atof (nth 9 data-lst)))) (assoc 'MAX-DEPTH seg-data) seg-data))
+           (setq clean-support (tsp-sanitize-support-list (read (nth 10 data-lst))))
+           (setq seg-data (subst (cons 'SUPPORT-LIST clean-support) (assoc 'SUPPORT-LIST seg-data) seg-data))
+           (setq seg-data (subst (cons 'CORNER-BRACE (read (nth 11 data-lst))) (assoc 'CORNER-BRACE seg-data) seg-data))
+           (setq new-seg-list (append new-seg-list (list seg-data)))
+          )
+        )
+      )
+      (close file-desc)
+      (if anc-ang-recs
+        (progn
+          (setq anc-seg-pos 0 anc-new-segs '())
+          (foreach seg new-seg-list
+            (setq anc-supp (cdr (assoc 'SUPPORT-LIST seg)) anc-idx 0 anc-new-supp '())
+            (foreach anc-item anc-supp
+              (setq anc-list '())
+              (foreach anc-r anc-ang-recs
+                (if (and (= (car anc-r) anc-seg-pos) (= (cadr anc-r) anc-idx))
+                  (setq anc-list (append anc-list (list (cons (caddr anc-r) (cadddr anc-r)))))
+                )
+              )
+              (if (and anc-list (listp anc-item) (= (type (car anc-item)) 'STR) (wcmatch (car anc-item) "*앵커*") (> (length anc-item) 9))
+                (progn
+                  (setq anc-k 0 anc-new-item '())
+                  (foreach anc-v anc-item
+                    (setq anc-new-item (append anc-new-item (list (if (= anc-k 9) anc-list anc-v))))
+                    (setq anc-k (1+ anc-k))
+                  )
+                  (setq anc-item anc-new-item)
+                )
+              )
+              (setq anc-new-supp (append anc-new-supp (list anc-item)))
+              (setq anc-idx (1+ anc-idx))
+            )
+            (if (assoc 'SUPPORT-LIST seg)
+              (setq seg (subst (cons 'SUPPORT-LIST anc-new-supp) (assoc 'SUPPORT-LIST seg) seg))
+            )
+            (setq anc-new-segs (append anc-new-segs (list seg)))
+            (setq anc-seg-pos (1+ anc-seg-pos))
+          )
+          (setq new-seg-list anc-new-segs)
+        )
+      )
+      new-seg-list
+    )
+  )
+)
+
+;;;;==========================================================================
+;;;; defun tsp-csv-mapping-dialog : CSV 매칭 다이얼로그 제어
+;;;;==========================================================================
+(defun tsp-csv-mapping-dialog (dcl-path curr-segs csv-segs / dcl-id result mapping curr-len csv-len update-map-list map-idx csv-idx i c-seg csv-seg c-name csv-name max-dep disp base-str)
+  (setq curr-len (length curr-segs))
+  (setq csv-len (length csv-segs))
+  (setq mapping '() i 0)
+  (while (< i curr-len)
+    (setq mapping (append mapping (list (if (< i csv-len) i nil))))
+    (setq i (1+ i))
+  )
+
+  (defun update-map-list (/ i c-seg m-idx csv-seg c-name csv-name disp)
+    (start_list "map_list")
+    (setq i 0)
+    (while (< i curr-len)
+      (setq c-seg (nth i curr-segs))
+      (setq c-name (cdr (assoc 'NAME c-seg)))
+      (setq m-idx (nth i mapping))
+      (if m-idx
+        (progn
+          (setq csv-seg (nth m-idx csv-segs))
+          (setq csv-name (cdr (assoc 'NAME csv-seg)))
+          (if (or (null csv-name) (= csv-name "")) (setq csv-name (strcat "Data-" (itoa (1+ m-idx)))))
+          (setq disp (strcat (itoa (1+ i)) "번: [" c-name "] \t<-- 매칭됨: [" csv-name "]"))
+        )
+        (setq disp (strcat (itoa (1+ i)) "번: [" c-name "] \t<-- (매칭 없음)"))
+      )
+      (add_list disp)
+      (setq i (1+ i))
+    )
+    (end_list)
+  )
+
+  (setq dcl-id (load_dialog dcl-path))
+  (if (new_dialog "tsp_csv_mapping" dcl-id)
+    (progn
+      (start_list "csv_list")
+      (setq i 0)
+      (foreach csv-seg csv-segs
+        (setq max-dep (if (assoc 'MAX-DEPTH csv-seg) (rtos (cdr (assoc 'MAX-DEPTH csv-seg)) 2 1) "-"))
+        ;; 에러 방어: CSV 데이터가 오염되었더라도 다이얼로그는 무조건 열리게 보장
+        (setq base-str (vl-catch-all-apply 'get-segment-display-string (list i csv-seg)))
+        (if (vl-catch-all-error-p base-str)
+          (setq base-str (strcat (itoa (1+ i)) "\t" (if (cdr (assoc 'NAME csv-seg)) (cdr (assoc 'NAME csv-seg)) "Data") "\t-\t알수없음\t-\t-\t-"))
+        )
+        (add_list (strcat base-str "\t" max-dep "m"))
+        (setq i (1+ i))
+      )
+      (end_list)
+
+      (update-map-list)
+      (set_tile "map_list" "0")
+      (set_tile "csv_list" "0")
+
+      (action_tile "btn_match"
+        "(progn
+           (setq map-idx (atoi (get_tile \"map_list\")))
+           (setq csv-idx (atoi (get_tile \"csv_list\")))
+           (if (and (>= map-idx 0) (>= csv-idx 0) (< map-idx curr-len) (< csv-idx csv-len))
+             (progn
+               (setq mapping (update-list-item mapping map-idx csv-idx))
+               (update-map-list)
+               (if (< map-idx (1- curr-len))
+                 (set_tile \"map_list\" (itoa (1+ map-idx)))
+               )
+             )
+           )
+         )"
+      )
+      (action_tile "btn_unmatch"
+        "(progn
+           (setq map-idx (atoi (get_tile \"map_list\")))
+           (if (and (>= map-idx 0) (< map-idx curr-len))
+             (progn
+               (setq mapping (update-list-item mapping map-idx nil))
+               (update-map-list)
+             )
+           )
+         )"
+      )
+      (action_tile "btn_auto"
+        "(progn
+           (setq mapping '() i 0)
+           (while (< i curr-len)
+             (setq mapping (append mapping (list (if (< i csv-len) i nil))))
+             (setq i (1+ i))
+           )
+           (update-map-list)
+           (set_tile \"map_list\" \"0\")
+         )"
+      )
+      (action_tile "accept" "(done_dialog 1)")
+      (action_tile "cancel" "(done_dialog 0)")
+
+      (setq result (start_dialog))
+      (unload_dialog dcl-id)
+      (if (= result 1) mapping nil)
+    )
+    (progn (alert "매칭 다이얼로그를 열 수 없습니다. DCL 코드가 정상적으로 주입되었는지 확인하세요.") nil)
+  )
+)
+
+;;;;==========================================================================
+;;;; defun tsp-apply-csv-to-current-segments : 세그먼트 설정창 내부에서 외부 CSV를 불러와 현재 세그먼트에 즉시 매핑 (방식 2)
+;;;;==========================================================================
+(defun tsp-apply-csv-to-current-segments (/ file-path csv-segs curr-len csv-len i merged-list curr-seg csv-seg mapping map-idx)
+  (setq file-path (getfiled "적용할 TSP / GeoX CSV 파일 선택" "" "csv" 0))
+  (if file-path
+    (progn
+      (setq csv-segs (tsp-parse-csv-file-data file-path))
+      (if (null csv-segs)
+        (progn (alert "CSV 파일에서 유효한 세그먼트 데이터를 찾을 수 없습니다.") nil)
+        (progn
+          ;; 단면도 전용 모드이든 평면도 모드이든 경계선 유무와 상관없이 무조건 매칭 다이얼로그 호출
+          (setq mapping (tsp-csv-mapping-dialog (strcat (getvar "TEMPPREFIX") "tsp.dcl") *segment-list* csv-segs))
+          (if mapping
+            (progn
+              (setq curr-len (length *segment-list*))
+              (setq merged-list '() i 0)
+              (while (< i curr-len)
+                (setq curr-seg (nth i *segment-list*))
+                (setq map-idx (nth i mapping))
+                (if map-idx
+                  (progn
+                    (setq csv-seg (nth map-idx csv-segs))
+                    (setq merged-list (append merged-list (list (tsp-merge-csv-seg-into-curr curr-seg csv-seg))))
+                  )
+                  (setq merged-list (append merged-list (list curr-seg)))
+                )
+                (setq i (1+ i))
+              )
+              (setq *segment-list* merged-list)
+              (alert "CSV 단면 데이터가 지정한 매칭에 따라 성공적으로 적용되었습니다.")
+              T
+            )
+            (progn
+              (princ "\n[취소] CSV 세그먼트 매칭 작업이 취소되었습니다.")
+              nil
+            )
+          )
+        )
+      )
+    )
+    nil
+  )
+)
+
+;;;;==========================================================================
+;;;; defun tsp-has-real-boundary-coords-p : 세그먼트 리스트에 실제 유효한 도면 경계선 좌표가 포함되어 있는지 판별
+;;;;==========================================================================
+(defun tsp-has-real-boundary-coords-p (seg-list / valid all-dummy i seg p1 p2)
+  (if (or (null seg-list) (= (length seg-list) 0))
+    nil
+    (progn
+      (setq valid T all-dummy T i 0)
+      (foreach seg seg-list
+        (setq p1 (cdr (assoc 'V-START seg)))
+        (setq p2 (cdr (assoc 'V-END seg)))
+        (if (not (and (listp p1) (listp p2)
+                      (numberp (car p1)) (numberp (cadr p1))
+                      (numberp (car p2)) (numberp (cadr p2))
+                      (> (distance (list (car p1) (cadr p1)) (list (car p2) (cadr p2))) 1.0)))
+          (setq valid nil)
+          (if (not (and (equal (car p1) (* i 20000.0) 1.0)
+                        (equal (cadr p1) 0.0 1.0)
+                        (equal (car p2) (* (1+ i) 20000.0) 1.0)
+                        (equal (cadr p2) 0.0 1.0)))
+            (setq all-dummy nil)
+          )
+        )
+        (setq i (1+ i))
+      )
+      (and valid (not all-dummy))
+    )
+  )
+)

@@ -1,0 +1,523 @@
+;;; ==========================================================================
+;;; 파일명: TSP_6A_Main_and_CSV.lsp
+;;; 구  분: 메인 명령어(C:TSP), 실시간 리드로우, CSV 입출력 및 파이썬 연동 (Part A)
+;;; 역  할: C:TSP 메인 상태 머신, 실시간 평면 갱신(tsp-redraw-realtime-plan), 도면 N치 드래그 추출, CSV 내보내기/불러오기/매칭, 파이썬(GeoX) 다이렉트 연동, SUB-ZONES 전개 [tsp-zoom-to-right-half, tsp-zoom-legend, tsp-redraw-realtime-plan, tsp-fix-mirrored-polyline, tsp-split-string-by-comma 외 2개]
+;;; 포함 함수: tsp-zoom-to-right-half, tsp-zoom-legend, tsp-redraw-realtime-plan, tsp-fix-mirrored-polyline, tsp-split-string-by-comma, tsp-select-project-for-export, tsp-export-name-prompt-callback
+;;; --------------------------------------------------------------------------
+;;; [안내] 이 파일은 TSP.lsp(메인 로더)에 의해 자동으로 로드되는 하위 모듈입니다.
+;;;        코드 수정 시 전체 파일을 합칠 필요 없이 이 파일만 단독 패치하면 됩니다.
+;;; ==========================================================================
+
+;;; ==========================================================================
+;;; [SECTION 7] 메인 실행 명령어 (Main Commands)
+;;; ==========================================================================
+
+;;;;==========================================================================
+;;;; defun tsp-zoom-to-right-half : 평면도 전용 화면 우측 정렬 줌
+;;;;==========================================================================
+(defun tsp-zoom-to-right-half (vertices / minX maxX minY maxY w h newMinX newMaxX newMinY newMaxY)
+  (setq minX (apply 'min (mapcar 'car vertices)))
+  (setq maxX (apply 'max (mapcar 'car vertices)))
+  (setq minY (apply 'min (mapcar 'cadr vertices)))
+  (setq maxY (apply 'max (mapcar 'cadr vertices)))
+  (setq w (- maxX minX) h (- maxY minY))
+  (setq minX (- minX (* w 0.3)) maxX (+ maxX (* w 0.3)))
+  (setq minY (- minY (* h 0.3)) maxY (+ maxY (* h 0.3)))
+  (setq w (- maxX minX) h (- maxY minY))
+  ;; 평면도는 기본 비율(w) 적용
+  (setq newMinX (- minX w))
+  (setq newMaxX maxX)
+  (setq newMinY minY)
+  (setq newMaxY maxY)
+  (command "_.ZOOM" "_W" (list newMinX newMinY) (list newMaxX newMaxY))
+  (princ)
+)
+
+;;;;==========================================================================
+;;;; defun tsp-zoom-legend : 범례 전용 화면 우측 정렬 줌
+;;;;==========================================================================
+(defun tsp-zoom-legend (vertices / minX maxX minY maxY w h newMinX newMaxX newMinY newMaxY)
+  (setq minX (apply 'min (mapcar 'car vertices)))
+  (setq maxX (apply 'max (mapcar 'car vertices)))
+  (setq minY (apply 'min (mapcar 'cadr vertices)))
+  (setq maxY (apply 'max (mapcar 'cadr vertices)))
+  (setq w (- maxX minX) h (- maxY minY))
+  (setq minX (- minX (* w 0.3)) maxX (+ maxX (* w 0.3)))
+  (setq minY (- minY (* h 0.3)) maxY (+ maxY (* h 0.3)))
+  (setq w (- maxX minX) h (- maxY minY))
+  ;; 범례는 대화상자를 피하기 위해 1.6배(1.6*w) 적용
+  (setq newMinX (- minX (* w 1.6)))
+  (setq newMaxX maxX)
+  (setq newMinY minY)
+  (setq newMaxY maxY)
+  (command "_.ZOOM" "_W" (list newMinX newMinY) (list newMaxX newMaxY))
+  (princ)
+)
+;;; ==========================================================================
+;;; 실시간 중첩 방지 작도 (Real-time Redraw with Clean-up)
+;;; ==========================================================================
+(if (not (boundp '*tsp-realtime-entities*)) (setq *tsp-realtime-entities* '()))
+
+;;;;==========================================================================
+;;;; defun tsp-redraw-realtime-plan : 실시간 작도 시 도면(DWG)에 영구 저장된 중간말뚝 삭제 기록 필터링 유지
+;;;;==========================================================================
+(defun tsp-redraw-realtime-plan (boundary-ent boundary-orient / next-ent ent-data blk-name layer-name pt is-deleted post-data
+                                  orphan-ent xdata-strut xdata-post xdata-brace xdata cur-boundary-handle current-draw-state)
+
+  ;; [안전장치 추가] 경계선이나 방향이 안정적으로 준비되지 않았다면 작도 및 캐싱을 건너뜁니다.
+  (if (or (null boundary-ent) (null boundary-orient))
+    (princ "\n[TSP] 경계선 데이터가 불완전하여 실시간 갱신을 보류합니다.")
+    (progn
+      ;; 1. 캐시(스냅샷)를 생성하기 전, LDATA(영구저장) 또는 임시 데이터에서 최신 중간말뚝 상태를 먼저 전역 변수에 동기화
+      (if *tsp-use-temp-posts*
+        (progn
+          (setq *tsp-deleted-post-points* *tsp-temp-deleted-posts*)
+          (setq *tsp-added-post-points* *tsp-temp-added-posts*)
+        )
+        (progn
+          (setq *tsp-deleted-post-points* (vlax-ldata-get "TSP_DICT" "DELETED_POSTS"))
+          (if (not *tsp-deleted-post-points*) (setq *tsp-deleted-post-points* '()))
+          (setq *tsp-added-post-points* (vlax-ldata-get "TSP_DICT" "ADDED_POSTS"))
+          (if (not *tsp-added-post-points*) (setq *tsp-added-post-points* '()))
+        )
+      )
+
+      ;; 2. 완벽하게 최신화된 전역 변수들을 바탕으로 스냅샷(캐시) 생성
+      (setq current-draw-state (list *segment-list* *tsp-added-post-points* *tsp-deleted-post-points* *tsp-temp-added-posts* *tsp-temp-deleted-posts* *tsp-use-temp-posts*))
+
+      ;; 3. 직전에 그렸던 상태(*tsp-last-draw-state*)와 현재 상태가 완벽히 동일한지 비교
+      (if (and (boundp '*tsp-last-draw-state*) (equal current-draw-state *tsp-last-draw-state*))
+        (princ "\n[TSP] 데이터 변경 사항이 없어 중복 작도를 생략합니다.")
+        (progn
+          ;; 1. ARX가 관리하는 객체 LISP 단에서 물리적 삭제(entdel)금지
+          (setq *tsp-realtime-entities* '())
+
+          (setq cur-boundary-handle (cdr (assoc 5 (entget boundary-ent))))
+          (setq orphan-ent (entnext))
+          (while orphan-ent
+            (setq next-orphan (vl-catch-all-apply 'entnext (list orphan-ent)))
+            (if (vl-catch-all-error-p next-orphan) (setq next-orphan nil))
+
+            (setq is-deleted nil)
+
+            (setq xdata-strut (assoc -3 (vl-catch-all-apply 'entget (list orphan-ent '("TSP_STRUT_SPEC")))))
+            (setq xdata-post  (assoc -3 (vl-catch-all-apply 'entget (list orphan-ent '("TSP_LISP_POST")))))
+            (setq xdata-brace (assoc -3 (vl-catch-all-apply 'entget (list orphan-ent '("TSP_LISP_BRACE")))))
+
+            (if (and (not is-deleted) xdata-strut (listp xdata-strut))
+              (progn
+                (setq xdata (vl-catch-all-apply 'cdadr (list xdata-strut)))
+                (if (and xdata (not (vl-catch-all-error-p xdata)) (listp xdata)
+                         (> (length xdata) 8))
+                  (progn
+                    (setq tag-name (cdr (nth 7 xdata)))
+                    (setq saved-handle (cdr (nth 8 xdata)))
+                    (setq is-ghost (if (and saved-handle (= (type saved-handle) 'STR)) (not (and (handent saved-handle) (entget (handent saved-handle)))) T))
+                    (if (and (= tag-name "CONT_BRACE")
+                             (or (= saved-handle cur-boundary-handle) is-ghost))
+                      (progn
+                        (setq is-deleted T)
+                      )
+                    )
+                  )
+                )
+              )
+            )
+
+            (if (and (not is-deleted) xdata-post (listp xdata-post))
+          (progn
+            (setq xdata (vl-catch-all-apply 'cdadr (list xdata-post)))
+            (if (and xdata (not (vl-catch-all-error-p xdata)) (listp xdata)
+                     (> (length xdata) 0)
+                     ;; 와일드카드 문자(*)를 적용하여 확장된 태그 식별
+                     (wcmatch (cdr (nth 0 xdata)) "MANUAL_POST*"))
+              (progn
+                (setq is-deleted T)
+              )
+            )
+          )
+        )
+
+            (if (and (not is-deleted) xdata-brace (listp xdata-brace))
+              (progn
+                (setq xdata (vl-catch-all-apply 'cdadr (list xdata-brace)))
+                (if (and xdata (not (vl-catch-all-error-p xdata)) (listp xdata)
+                         (> (length xdata) 8))
+                  (progn
+                    (setq tag-name (cdr (nth 7 xdata)))
+                    (setq saved-handle (cdr (nth 8 xdata)))
+                    (setq is-ghost (if (and saved-handle (= (type saved-handle) 'STR)) (not (and (handent saved-handle) (entget (handent saved-handle)))) T))
+                    (if (and (or (= tag-name "CONT_BRACE") (= tag-name "MID_GAP"))
+                             (or (= saved-handle cur-boundary-handle) is-ghost))
+                      (progn
+                        (setq is-deleted T)
+                      )
+                    )
+                  )
+                )
+              )
+            )
+            (if (and is-deleted (entget orphan-ent))
+              (vl-catch-all-apply 'entdel (list orphan-ent))
+            )
+            (setq orphan-ent next-orphan)
+          )
+
+          ;; 2. 도면 새로 그리기 시작 지점 마킹
+          (setq next-ent (entlast))
+          (setq group-start-ent next-ent)
+          (if next-ent
+            (tsp-log "[Redraw] 작도 시작 전 (entlast) 기준점 확보 성공.")
+            (tsp-log "[Redraw] 경고! 작도 시작 전 (entlast)가 nil입니다.")
+          )
+
+          ;; 3. 실제 작도 함수 호출
+          (setq original-segment-list *segment-list*)
+          (setq temp-segment-list '())
+
+          (foreach seg *segment-list*
+            (setq supp-list (tsp-sanitize-support-list (cdr (assoc 'SUPPORT-LIST seg))))
+            (setq new-supp-list '())
+            (if supp-list
+              (foreach supp supp-list
+                (if (wcmatch (car supp) "버팀보*")
+                  (progn
+                    (setq opt (if (> (length supp) 11) (nth 11 supp) nil))
+                    (if (and opt (= (nth 0 opt) "1"))
+                      (progn
+                        (setq new-opt (cons "0" (cdr opt)))
+                        (setq i 0 new-supp '())
+                        (foreach item supp
+                          (if (= i 11)
+                            (setq new-supp (cons new-opt new-supp))
+                            (setq new-supp (cons item new-supp))
+                          )
+                          (setq i (1+ i))
+                        )
+                        (setq new-supp-list (cons (reverse new-supp) new-supp-list))
+                      )
+                      (setq new-supp-list (cons supp new-supp-list))
+                    )
+                  )
+                  (setq new-supp-list (cons supp new-supp-list))
+                )
+              )
+            )
+            (setq temp-segment-list (cons (subst (cons 'SUPPORT-LIST (reverse new-supp-list)) (assoc 'SUPPORT-LIST seg) seg) temp-segment-list))
+          )
+
+          (setq *segment-list* (reverse temp-segment-list))
+          (vl-catch-all-apply 'create-hpile-set-on-boundary (list boundary-ent boundary-orient))
+          (setq *segment-list* original-segment-list)
+
+          ;; create-hpile-set-on-boundary 내부에서 기존 그룹(TSP_GRP) 삭제 직후 확보한 살아있는 기준점으로 동기화
+          (if (boundp '*tsp-last-group-start-ent*)
+            (setq next-ent *tsp-last-group-start-ent*
+                  group-start-ent *tsp-last-group-start-ent*)
+          )
+
+          ;; 3-1. 수동으로 추가된 중간말뚝 작도
+          (if *tsp-added-post-points*
+            (progn
+              (if (not (tblsearch "APPID" "TSP_LISP_POST")) (regapp "TSP_LISP_POST"))
+          (foreach post-data *tsp-added-post-points*
+            (setq y_scale (if (> (length post-data) 2) (nth 2 post-data) 1.0))
+            (setq custom-h  (if (> (length post-data) 3) (nth 3 post-data) 300.0))
+            (setq custom-b  (if (> (length post-data) 4) (nth 4 post-data) 300.0))
+            (setq custom-tw (if (> (length post-data) 5) (nth 5 post-data) 10.0))
+            (setq custom-tf (if (> (length post-data) 6) (nth 6 post-data) 15.0))
+            ;; 레코드에서 카테고리 데이터 추출 (기본값 "STRUT")
+            (setq post-cat  (if (> (length post-data) 8) (nth 8 post-data) "STRUT"))
+
+            (entmake (list '(0 . "INSERT")
+                           (cons 2 (create-post-pile-block custom-h custom-b custom-tw custom-tf))
+                           (cons 8 "_중간말뚝(Post pile)")
+                           (cons 62 256)
+                           (cons 10 (car post-data))
+                           '(41 . 1.0) (cons 42 y_scale) '(43 . 1.0)
+                           (cons 50 (cadr post-data))
+                           ;; MANUAL_POST 뒤에 추출한 카테고리 태그 부착
+                           (list -3 (list "TSP_LISP_POST" (cons 1000 (strcat "MANUAL_POST_" post-cat))))
+                     ))
+          )
+            )
+          )
+
+          ;; 4. 방금 새로 생성된 객체를 추적 리스트에 담으면서 삭제된 말뚝 필터링
+          (setq next-ent (if (and next-ent (entget next-ent)) (entnext next-ent) (entnext)))
+          (while next-ent
+            (setq *tsp-realtime-entities* (cons next-ent *tsp-realtime-entities*))
+            (if (and *tsp-deleted-post-points* (> (length *tsp-deleted-post-points*) 0))
+              (progn
+                (setq ent-data (entget next-ent))
+                (if (= (cdr (assoc 0 ent-data)) "INSERT")
+                  (progn
+                    (setq layer-name (cdr (assoc 8 ent-data)))
+                    (setq blk-name (cdr (assoc 2 ent-data)))
+                    (if (and layer-name blk-name
+                             (= (strcase layer-name) (strcase "_중간말뚝(Post pile)"))
+                             (wcmatch (strcase blk-name) "_POST_PILE*"))
+                      (progn
+                        (setq pt (cdr (assoc 10 ent-data)))
+                        (setq pt (list (car pt) (cadr pt) 0.0))
+                        (setq is-deleted nil)
+                        (foreach del-pt *tsp-deleted-post-points*
+                          (if (< (distance pt del-pt) 10.0)
+                            (setq is-deleted T)
+                          )
+                        )
+                        (if is-deleted
+                          (progn
+                            (setq edata (entget next-ent))
+                            (if (not (assoc 60 edata))
+                              (entmod (append edata (list (cons 60 1))))
+                              (entmod (subst (cons 60 1) (assoc 60 edata) edata))
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+            (setq next-ent (entnext next-ent))
+          )
+          (setq *tsp-realtime-entities* (reverse *tsp-realtime-entities*))
+
+          ;; 5. 엑셀 불러오기 및 일괄 작도 시 연속 보강재 완벽 복원 로직 (XDATA 연동)
+          (if (and (boundp '*segment-list*) *segment-list*)
+            (foreach seg *segment-list*
+              (setq support-list (cdr (assoc 'SUPPORT-LIST seg)))
+              (if support-list
+                (foreach support support-list
+                  (if (wcmatch (car support) "버팀보*")
+                    (progn
+                      (setq s-brace-opt (if (> (length support) 11) (nth 11 support) nil))
+                      (if (and s-brace-opt (= (nth 0 s-brace-opt) "1"))
+                        (progn
+                          (setq manual-pts (if (> (length support) 8) (nth 8 support) '()))
+                          (if (and manual-pts (> (length manual-pts) 0))
+                            (progn
+                              (setq sec-str (if (> (length support) 6) (nth 6 support) ""))
+                              (setq count-val (if (> (length support) 4) (nth 4 support) 1))
+                              (setq is-double (if (>= count-val 2) T nil))
+
+                              (setq strut-ang nil strut-len nil real-pts-list '())
+
+                              (foreach pt-raw manual-pts
+                                (setq pt-base (list (car pt-raw) (cadr pt-raw) 0.0))
+                                (setq matched-pt1 nil)
+
+                                (foreach ent *tsp-realtime-entities*
+                                  (if (not matched-pt1)
+                                    (progn
+                                      (setq edata (if (entget ent) (entget ent '("TSP_STRUT_SPEC")) nil))
+                                      (if (and edata (assoc -3 edata))
+                                        (progn
+                                          (setq xvals (cdr (car (cdr (assoc -3 edata)))))
+                                          (if (and (> (length xvals) 7) (= (cdr (nth 7 xvals)) "MANUAL_STRUT"))
+                                            (progn
+                                              (setq pt1-raw (cdr (nth 2 xvals)) pt2-raw (cdr (nth 3 xvals)))
+                                              (if (and pt1-raw pt2-raw)
+                                                (progn
+                                                  (setq x-pt1 (list (car pt1-raw) (cadr pt1-raw) 0.0))
+                                                  (setq x-pt2 (list (car pt2-raw) (cadr pt2-raw) 0.0))
+                                                  (setq line-ang (angle x-pt1 x-pt2))
+
+                                                  (setq dist-to-line (abs (tsp-project-dist x-pt1 (+ line-ang (/ pi 2.0)) pt-base)))
+                                                  (setq dist-along (tsp-project-dist x-pt1 line-ang pt-base))
+
+                                                  (if (and (< dist-to-line 10.0) (>= dist-along -1000.0) (<= dist-along (+ (distance x-pt1 x-pt2) 1000.0)))
+                                                    (progn
+                                                      (setq matched-pt1 x-pt1)
+                                                      (if (not strut-ang)
+                                                        (progn
+                                                          (setq strut-ang line-ang)
+                                                          (setq strut-len (distance x-pt1 x-pt2))
+                                                        )
+                                                      )
+                                                    )
+                                                  )
+                                                )
+                                              )
+                                            )
+                                          )
+                                        )
+                                      )
+                                    )
+                                  )
+                                )
+                                (if matched-pt1 (setq real-pts-list (cons matched-pt1 real-pts-list)))
+                              )
+
+                              (setq real-pts-list (reverse real-pts-list))
+
+                              (if (and strut-ang strut-len (> (length real-pts-list) 0))
+                                (progn
+                                  (setq *tsp-1h-jack-base* (car real-pts-list))
+                                  (setq *tsp-group-ref-len* strut-len)
+                                  (setq current-seg-id (cdr (assoc 'ID seg)))
+                                  (setq batch-braces (vl-catch-all-apply 'tsp-draw-realtime-continuous-braces (list real-pts-list s-brace-opt sec-str is-double strut-ang strut-len current-seg-id)))
+                                  (if (and batch-braces (not (vl-catch-all-error-p batch-braces)))
+                                    (setq *tsp-realtime-entities* (append *tsp-realtime-entities* batch-braces))
+                                  )
+                                )
+                              )
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+
+          ;; 6. 연속 보강재(TSP_LISP_BRACE) 객체를 TSP_GRP 그룹에 포함하여 재그룹화
+          (tsp-group-last-entities group-start-ent boundary-ent)
+          (vl-catch-all-apply 'vla-regen (list (vla-get-activedocument (vlax-get-acad-object)) 1))
+
+          ;; 7. 작도가 무사히 완료되었으므로, 현재 상태를 '마지막 작도 상태'로 갱신하여 기억
+          (setq *tsp-last-draw-state* current-draw-state)
+        )
+      )
+    )
+  )
+)
+
+;;;;==========================================================================
+;;;; defun tsp-fix-mirrored-polyline : 경계선 Z축 양수화(OCS 좌표계 재조정)
+;;;;==========================================================================
+(defun tsp-fix-mirrored-polyline (ent / ent-data normal new-data item pt bulge)
+  (setq ent-data (entget ent))
+  (setq normal (cdr (assoc 210 ent-data)))
+  (if (and normal (< (caddr normal) 0.0))
+    (progn
+      (princ "\n[시스템] OCS 좌표 및 Z축을 양수(+)로 자동 보정")
+      (setq new-data '())
+      (foreach item ent-data
+        (cond
+          ((= (car item) 10)
+           (setq pt (cdr item))
+           (setq new-data (append new-data (list (cons 10 (list (- (car pt)) (cadr pt))))))
+          )
+          ;; 곡선(Bulge) 부호 반전
+          ((= (car item) 42)
+           (setq bulge (cdr item))
+           (setq new-data (append new-data (list (cons 42 (- bulge)))))
+          )
+          ;; Extrusion Direction (Z축) 정상화
+          ((= (car item) 210)
+           (setq new-data (append new-data (list (cons 210 '(0.0 0.0 1.0)))))
+          )
+          (t
+           (setq new-data (append new-data (list item)))
+          )
+        )
+      )
+      ;; 객체 업데이트
+      (entmod new-data)
+      (entupd ent)
+      T
+    )
+    nil
+  )
+)
+
+;;; ==========================================================================
+;;; [section 8] EXCEL(CSV) Export / Import 관련 모듈
+;;; ==========================================================================
+
+;;;;==========================================================================
+;;;; defun tsp-split-string-by-comma : 문자열을 쉼표 단위로 분할하여 리스트 반환
+;;;;==========================================================================
+(defun tsp-split-string-by-comma (str / pos lst)
+  (setq lst nil)
+  (while (setq pos (vl-string-search "," str))
+    (setq lst (append lst (list (substr str 1 pos))))
+    (setq str (substr str (+ pos 2)))
+  )
+  (append lst (list str))
+)
+
+;;;;==========================================================================
+;;;; defun tsp-select-project-for-export : 내보낼 프로젝트를 DCL에서 선택
+;;;;==========================================================================
+(defun tsp-select-project-for-export (/ dict proj-list dcl-id dcl-path dcl-file selected-proj idx)
+  (setq dict (dictsearch (namedobjdict) "TSP_DATA_DICT"))
+  (if (not dict)
+    (progn (alert "도면에 저장된 프로젝트 데이터가 없습니다.") nil)
+    (progn
+      (setq proj-list nil)
+      (foreach item dict
+        (if (= (car item) 3)
+          (setq proj-list (append proj-list (list (cdr item))))
+        )
+      )
+      (if (= (length proj-list) 0)
+        (progn (alert "저장된 프로젝트가 없습니다.") nil)
+        (progn
+          (setq dcl-path (strcat (getvar "TEMPPREFIX") "tsp_export.dcl"))
+          (setq dcl-file (open dcl-path "w"))
+          (write-line "tsp_export_dlg : dialog { label = \"내보낼 프로젝트 선택\";" dcl-file)
+          (write-line "  : list_box { key = \"proj_list\"; height = 10; width = 40; }" dcl-file)
+          (write-line "  : row { : button { key = \"accept\"; label = \"확인(Export)\"; is_default = true; } : button { key = \"cancel\"; label = \"취소\"; is_cancel = true; } }" dcl-file)
+          (write-line "}" dcl-file)
+          (close dcl-file)
+
+          (setq dcl-id (load_dialog dcl-path))
+          (if (new_dialog "tsp_export_dlg" dcl-id)
+            (progn
+              (start_list "proj_list")
+              (mapcar 'add_list proj-list)
+              (end_list)
+              (setq selected-proj nil)
+              (action_tile "proj_list" "(setq idx (atoi $value))")
+              (action_tile "accept" "(if idx (setq selected-proj (nth idx proj-list))) (done_dialog 1)")
+              (action_tile "cancel" "(done_dialog 0)")
+              (start_dialog)
+              (unload_dialog dcl-id)
+              selected-proj
+            )
+            (progn (alert "DCL 로드 실패") nil)
+          )
+        )
+      )
+    )
+  )
+)
+
+;;;;==========================================================================
+;;;; defun tsp-export-name-prompt-callback : CSV 내보내기 시 프로젝트 이름 확인/수정 DCL 팝업창 호출
+;;;;==========================================================================
+(defun tsp-export-name-prompt-callback (dcl-path default-name / dcl-id res input-name)
+  (if (or (null default-name) (= default-name ""))
+    (setq default-name (tsp-generate-default-project-name))
+  )
+  (setq input-name default-name)
+  (setq dcl-id (load_dialog dcl-path))
+  (if (and dcl-id (>= dcl-id 0) (new_dialog "tsp_export_csv_prompt" dcl-id))
+    (progn
+      (set_tile "exp_proj_name" default-name)
+      (mode_tile "exp_proj_name" 2)
+      (action_tile "exp_proj_name" "(setq input-name $value)")
+      (action_tile "accept" "(progn (setq input-name (get_tile \"exp_proj_name\")) (done_dialog 1))")
+      (action_tile "cancel" "(done_dialog 0)")
+      (setq res (start_dialog))
+      (unload_dialog dcl-id)
+      (if (= res 1)
+        (progn
+          (setq input-name (vl-string-trim " \t" (if input-name input-name "")))
+          (if (= input-name "") default-name input-name)
+        )
+        nil
+      )
+    )
+    (progn
+      (if (and dcl-id (>= dcl-id 0)) (unload_dialog dcl-id))
+      nil
+    )
+  )
+)

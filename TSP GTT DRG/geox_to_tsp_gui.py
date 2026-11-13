@@ -1,0 +1,3587 @@
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+GeoX 단면 검토 데이터 -> TSP (Temporary Structure Plan) 통합 생성/연동 GUI 프로그램
+================================================================================
+주요 기능:
+1. 3가지 세그먼트 구성 모드 지원:
+   - [가상 생성] 기준 CSV 없이 세그먼트 개수 직접 설정 / 추가(+) / 삭제(-)
+   - [CAD 연동] 열려 있는 AutoCAD에서 경계선, 방향, 시작점을 클릭하여 기하 정보 추출
+   - [기존 CSV] TSP에서 내보낸 CSV 파일 로드 및 기하 정보 보존
+2. 지보재 3종(Anchor / 일반 Strut / 사보강 Corner Strut) 자동 판별 및 파싱
+3. 우측 패널에서 GeoX 단면별 [시추공 이름(HOLE-NO)] 및 [지하수위(고려여부/심도)] 직접 수정 후 할당
+4. 지층 분류 시 풍화암/경암이 아닌 모든 '암'(기반암 등)은 '연암(SR)'으로 자동 분류
+5. N치는 각 지층의 층두께 중심(상단~하단 중간 심도)에 대표 N치 1개씩 자동 배치
+6. 세그먼트 목록 직접 편집 지원
+   - 목록 셀 더블클릭 -> 값 직접 수정
+     (할당 단면 / 시추공 / 지하수위 / 벽체공법 / CIP 직경 / H-Pile 규격 / CTC / 굴착깊이 / 길이 / 각도 / 코너 사보강재)
+   - H-Pile 규격은 TSP 표준 규격 5종(*tsp-std-wall-list*) 중 선택, 벽체공법은 HPILE/CIP 중 선택
+   - 지보재(SUPPORT-LIST)는 GeoX 엑셀에서 자동 산출되므로 읽기 전용
+   - 우클릭 메뉴 -> 할당/해제/분할 및 [좌표·길이·각도 상세 편집] 대화상자
+   - 수정 시 길이·각도·인접 구간 연결·구간분할 범위가 자동으로 재계산되어 기존 기능에 영향 없음
+   - 파싱 오류 보고: 벽체 하단깊이/CTC/규격 등 핵심 값이 비어 있으면 기본값으로 대체하지 않고 오류 팝업으로 알림
+================================================================================
+"""
+
+import os
+import re
+import sys
+import math
+import subprocess
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+# ==============================================================================
+# [자동 의존성 설치 모듈] 시작 시 필수 라이브러리 검사 및 설치 (팝업 안내 포함)
+# ==============================================================================
+
+def _install_required_packages():
+    required_packages = {
+        "pandas": "pandas",
+        "openpyxl": "openpyxl",
+        "win32com": "pywin32",
+        "pythoncom": "pywin32",
+        "pywintypes": "pywin32"
+    }
+    
+    missing = []
+    for mod, pkg in required_packages.items():
+        try:
+            __import__(mod)
+        except ImportError:
+            if pkg not in missing:
+                missing.append(pkg)
+
+    if missing:
+        splash = tk.Tk()
+        splash.title("초기 설정 진행 중")
+        
+        window_width, window_height = 420, 160
+        screen_width = splash.winfo_screenwidth()
+        screen_height = splash.winfo_screenheight()
+        x_cordinate = int((screen_width/2) - (window_width/2))
+        y_cordinate = int((screen_height/2) - (window_height/2))
+        
+        splash.geometry(f"{window_width}x{window_height}+{x_cordinate}+{y_cordinate}")
+        splash.attributes('-topmost', True)
+        splash.overrideredirect(True)
+        splash.configure(bg="#f8f9fa", highlightbackground="#0055aa", highlightthickness=2)
+        
+        msg = f"초기 실행에 필요한 필수 라이브러리를 설치하고 있습니다.\n(대상: {', '.join(missing)})\n\n백그라운드에서 설치가 완료되면 이 창은 자동으로 닫힙니다.\n잠시만 기다려주세요..."
+        lbl = tk.Label(splash, text=msg, font=("맑은 고딕", 10), justify="center", bg="#f8f9fa", fg="#333333")
+        lbl.pack(expand=True, fill="both", padx=20, pady=20)
+        
+        splash.update()
+        
+        try:
+            subprocess.call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for pkg in missing:
+                if pkg == "pywin32":
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", pkg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        finally:
+            splash.destroy()
+
+_install_required_packages()
+
+import pandas as pd
+
+
+# ==============================================================================
+# [상수 및 TSP 표준 데이터베이스 정의]
+# ==============================================================================
+STD_WALL_LIST = [
+    "H 250×250×9/14",   
+    "H 298×201×9/14",   
+    "H 300×300×10/15",  
+    "H 350×350×12/19",  
+    "H 400×400×13/21",  
+]
+
+SOIL_DATA_MAP = {
+    "입도양호 자갈(GW)": ("GW_", 100.0, 0.0),
+    "입도불량 자갈(GP)": ("GP_", 100.0, 0.0),
+    "실트질 자갈(GM)": ("GM_", 100.0, 0.0),
+    "점토질 자갈(GC)": ("GC_", 100.0, 0.0),
+    "입도양호 모래(SW)": ("SW_", 100.0, 0.0),
+    "입도불량 모래(SP)": ("SP_", 100.0, 0.0),
+    "실트질 모래(SM)": ("SM_", 100.0, 0.0),
+    "점토질 모래(SC)": ("SC_", 100.0, 0.0),
+    "저소성 실트(ML)": ("ML_", 100.0, 0.0),
+    "고소성 실트(MH)": ("MH_", 100.0, 0.0),
+    "저소성 점토(CL)": ("CL_", 100.0, 0.0),
+    "고소성 점토(CH)": ("CH_", 100.0, 0.0),
+    "전석(BOULDER)": ("GRAVEL", 30.0, 0.0),
+    "풍화잔류토(RS)": ("RS_", 2500.0, 0.0),
+    "풍화암(WR)": ("WR_", 100.0, 0.0),
+    "연암(SR)": ("SR_", 100.0, 0.0),
+    "경암(HR)": ("HR_", 100.0, 0.0),
+    "기타": ("LINE", 78.74, 0.0),
+}
+
+
+def extract_min_num(val, default=0.0):
+    if pd.isna(val):
+        return default
+    s = str(val).strip()
+    nums = [float(x) for x in re.findall(r'[-+]?\d*\.?\d+', s)]
+    return min(nums) if nums else default
+
+
+def parse_n_str(val):
+    if pd.isna(val):
+        return "10/30"
+    s = str(val).strip()
+    if "/" in s:
+        return s
+    m = re.match(r'(\d+)\s*\(\s*(\d+)\s*\)', s)
+    if m:
+        a, b = int(m.group(1)), int(m.group(2))
+        if b >= 50 and a >= 30:
+            return f"{b}/30"
+        return f"{a}/30"
+    nums = [int(float(x)) for x in re.findall(r'\d+\.?\d*', s)]
+    if nums:
+        return f"{nums[0]}/30"
+    return "10/30"
+
+
+def classify_soil_type(name, gamma_t, c, phi, n_str, kh):
+    uname = str(name).upper()
+    n_hit = int(parse_n_str(n_str).split("/")[0])
+
+    if "경암" in uname or "HR" in uname:
+        return "경암(HR)"
+    if "풍화암" in uname or "WR" in uname:
+        return "풍화암(WR)"
+    if "연암" in uname or "SR" in uname or "암" in uname or "ROCK" in uname:
+        return "연암(SR)"
+    if "풍화토" in uname or "풍화잔류" in uname or "RS" in uname:
+        return "풍화잔류토(RS)"
+    if "전석" in uname or "호박돌" in uname or "BOULDER" in uname:
+        return "전석(BOULDER)"
+
+    for code, label in [
+        ("GW", "입도양호 자갈(GW)"), ("GP", "입도불량 자갈(GP)"),
+        ("GM", "실트질 자갈(GM)"), ("GC", "점토질 자갈(GC)"),
+        ("SW", "입도양호 모래(SW)"), ("SP", "입도불량 모래(SP)"),
+        ("SM", "실트질 모래(SM)"), ("SC", "점토질 모래(SC)"),
+        ("ML", "저소성 실트(ML)"), ("MH", "고소성 실트(MH)"),
+        ("CL", "저소성 점토(CL)"), ("CH", "고소성 점토(CH)")
+    ]:
+        if code in uname:
+            return label
+
+    if "자갈" in uname or (gamma_t >= 19.5 and phi >= 34.0 and c <= 5.0):
+        if c > 10.0:
+            return "점토질 자갈(GC)"
+        if c > 0.0:
+            return "실트질 자갈(GM)"
+        return "입도양호 자갈(GW)" if (phi >= 36.0 or n_hit >= 30) else "입도불량 자갈(GP)"
+
+    if "점토" in uname or (c >= 18.0 and phi <= 22.0):
+        return "고소성 점토(CH)" if (gamma_t < 16.5 and c >= 25.0) else "저소성 점토(CL)"
+
+    if "실트" in uname or (12.0 <= c < 18.0 and phi < 23.0):
+        return "저소성 실트(ML)"
+
+    if "모래" in uname or "사질" in uname or "퇴적" in uname or "충적" in uname or "매립" in uname:
+        if c >= 15.0 and phi < 25.0:
+            return "점토질 모래(SC)"
+        if c > 0.0 or phi < 32.0:
+            return "실트질 모래(SM)"
+        return "입도양호 모래(SW)" if (phi >= 35.0 and n_hit >= 20) else "입도불량 모래(SP)"
+
+    return "기타"
+
+
+def parse_h_dims(spec_str):
+    if not spec_str:
+        return (300, 300, 10, 15), "H 300×300×10/15", "2"
+    s_clean = str(spec_str).strip()
+    nums = [int(x) for x in re.findall(r'\d+', s_clean)]
+    if len(nums) >= 4:
+        if s_clean.upper().startswith("2H") and len(nums) >= 5:
+            dims = (nums[1], nums[2], nums[3], nums[4])
+        else:
+            dims = (nums[0], nums[1], nums[2], nums[3])
+    else:
+        dims = (300, 300, 10, 15)
+
+    norm_spec = f"H {dims[0]}×{dims[1]}×{dims[2]}/{dims[3]}"
+    idx_str = "2"
+    for i, std_s in enumerate(STD_WALL_LIST):
+        if std_s == norm_spec:
+            idx_str = str(i)
+            break
+    return dims, norm_spec, idx_str
+
+
+def generate_n_values_layer_mid(soil_layers):
+    if not soil_layers:
+        return []
+    n_vals = []
+    prev_d = 0.0
+    for layer in soil_layers:
+        cur_d = float(layer["depth"])
+        mid_d = round((prev_d + cur_d) / 2.0, 2)
+        n_vals.append((mid_d, layer["n_str"]))
+        prev_d = cur_d
+    return n_vals
+
+
+def get_polygon_orientation(vertices):
+    signed_area = 0.0
+    n = len(vertices)
+    for i in range(n):
+        x1, y1 = vertices[i][0], vertices[i][1]
+        x2, y2 = vertices[(i + 1) % n][0], vertices[(i + 1) % n][1]
+        signed_area += (x1 - x2) * (y1 + y2)
+    return 1 if signed_area > 0 else -1
+
+
+def is_corner_convex(prev_pt, curr_pt, next_pt, orientation):
+    v1x = curr_pt[0] - prev_pt[0]
+    v1y = curr_pt[1] - prev_pt[1]
+    v2x = next_pt[0] - curr_pt[0]
+    v2y = next_pt[1] - curr_pt[1]
+    cross_product = (v1x * v2y) - (v1y * v2x)
+    return (cross_product > 0) if orientation == 1 else (cross_product < 0)
+
+
+def dist_2d(p1, p2):
+    return math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+
+
+def angle_2d(p1, p2):
+    ang = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
+    if ang < 0.0:
+        ang += 2.0 * math.pi
+    return ang
+
+
+def filter_collinear_vertices(verts, is_closed, tol_deg=5.0):
+    tol_rad = math.radians(tol_deg)
+    min_verts = 3 if is_closed else 2
+    cur_verts = list(verts)
+    changed = True
+    while changed and len(cur_verts) > min_verts:
+        changed = False
+        n = len(cur_verts)
+        new_verts = []
+        for i in range(n):
+            if not is_closed and (i == 0 or i == n - 1):
+                new_verts.append(cur_verts[i])
+                continue
+            prev_pt = new_verts[-1] if new_verts else cur_verts[(i - 1) % n]
+            curr_pt = cur_verts[i]
+            next_pt = cur_verts[(i + 1) % n]
+            ang1 = angle_2d(prev_pt, curr_pt)
+            ang2 = angle_2d(curr_pt, next_pt)
+            diff = abs(ang1 - ang2)
+            if diff > math.pi:
+                diff = 2.0 * math.pi - diff
+            if diff < tol_rad and (len(new_verts) + (n - i)) > min_verts:
+                changed = True
+            else:
+                new_verts.append(curr_pt)
+        cur_verts = new_verts
+    return cur_verts
+
+
+def get_dist_point_to_segment(pt, p1, p2):
+    x0, y0 = pt[0], pt[1]
+    x1, y1 = p1[0], p1[1]
+    x2, y2 = p2[0], p2[1]
+    dx, dy = x2 - x1, y2 - y1
+    if dx == 0 and dy == 0:
+        return dist_2d(pt, p1)
+    t_param = ((x0 - x1) * dx + (y0 - y1) * dy) / (dx * dx + dy * dy)
+    t_param = max(0.0, min(1.0, t_param))
+    cx = x1 + t_param * dx
+    cy = y1 + t_param * dy
+    return dist_2d(pt, (cx, cy))
+
+
+def calc_orientation_by_closest_segment(vertices, user_pt):
+    ext_len = 100000.0
+    p1, p2 = vertices[0], vertices[1]
+    ang_back = angle_2d(p2, p1)
+    virt_start = (p1[0] + ext_len * math.cos(ang_back), p1[1] + ext_len * math.sin(ang_back), 0.0)
+
+    p_prev, p_next = vertices[-2], vertices[-1]
+    ang_fwd = angle_2d(p_prev, p_next)
+    virt_end = (p_next[0] + ext_len * math.cos(ang_fwd), p_next[1] + ext_len * math.sin(ang_fwd), 0.0)
+
+    ext_segments = [(virt_start, vertices[0])]
+    for i in range(len(vertices) - 1):
+        ext_segments.append((vertices[i], vertices[i + 1]))
+    ext_segments.append((vertices[-1], virt_end))
+
+    min_dist = 1e99
+    best_seg = None
+    for seg in ext_segments:
+        d = get_dist_point_to_segment(user_pt, seg[0], seg[1])
+        if d < min_dist:
+            min_dist = d
+            best_seg = seg
+
+    if best_seg:
+        sp1, sp2 = best_seg
+        cross_z = (sp2[0] - sp1[0]) * (user_pt[1] - sp1[1]) - (sp2[1] - sp1[1]) * (user_pt[0] - sp1[0])
+        return -1 if cross_z > 0 else 1
+    return 1
+
+
+def build_segments_from_vertices(vertices, is_closed, boundary_orient, geo_known=True):
+    num_segs = len(vertices) if is_closed else (len(vertices) - 1)
+    segs = []
+    for i in range(num_segs):
+        pt1 = vertices[i]
+        pt2 = vertices[(i + 1) % num_segs] if is_closed else vertices[i + 1]
+        if is_closed:
+            pt0 = vertices[num_segs - 1 if i == 0 else i - 1]
+        else:
+            pt0 = vertices[i - 1] if i > 0 else None
+
+        seg_len = dist_2d(pt1, pt2)
+        seg_angle = angle_2d(pt1, pt2)
+        is_convex = False
+        if not geo_known:
+            is_convex = True
+        elif pt0 is not None and pt2 is not None:
+            if is_corner_convex(pt0, pt1, pt2, boundary_orient):
+                is_convex = True
+            ang_v1 = angle_2d(pt1, pt0)
+            ang_v2 = angle_2d(pt1, pt2)
+            diff = abs(ang_v1 - ang_v2)
+            if diff > math.pi:
+                diff = 2.0 * math.pi - diff
+            if diff >= math.radians(160.0):
+                is_convex = False
+            prev_len = dist_2d(pt0, pt1)
+            if min(seg_len, prev_len) < 1000.0:
+                is_convex = False
+
+        brace_str = '("Y" nil "1" "0" "0.0" "1" "50" "0" "L" "0" "화타쐐기 없음" "0" "0" "1.5" "0.0")' if is_convex else '("N" nil)'
+        segs.append({
+            "id": i + 1,
+            "v_start": (float(pt1[0]), float(pt1[1]), 0.0),
+            "v_end": (float(pt2[0]), float(pt2[1]), 0.0),
+            "angle": seg_angle,
+            "length": seg_len,
+            "can_have_brace": is_convex,
+            "geo_known": geo_known,
+            "corner_brace_str": brace_str,
+            "corner_geox_key": None,
+            "geox_key": None,
+            "hole_no": f"BH-{i + 1}",
+            "water_chk": "0",
+            "water_depth": 0.0,
+            "raw_alist_override": None,
+            "sub_zones": [],
+        })
+    return segs
+
+
+# ==============================================================================
+# [세그먼트 목록 직접 편집] 값 파싱 / 기하 일관성 유지 헬퍼
+# ==============================================================================
+
+# ==============================================================================
+# [세그먼트 목록 직접 편집] 벽체/말뚝 제원 편집 지원 (공법 / H-Pile 규격 / CIP 직경 / CTC / 굴착깊이)
+#   - TSP 원본 근거: *tsp-wall-type* = "HPILE" | "CIP"  (TSP_1A_Globals_Utils.lsp)
+#                    *tsp-std-wall-list* 5종       (TSP_1A_Globals_Utils.lsp, STD_WALL_LIST와 동일)
+#   - 수정값은 seg["param_override"] 에만 저장하고, CSV/ALIST 생성 직전에 GeoX 값에 덮어씌운다.
+#     (원본 GeoX 데이터는 건드리지 않으므로 다른 세그먼트/미리보기에 영향 없음)
+# ==============================================================================
+WALL_TYPE_CHOICES = ["HPILE", "CIP"]
+CIP_DIA_PRESETS = ["400", "450", "500", "550", "600", "700", "800", "900", "1000"]
+
+
+def get_param_override(tgt):
+    ov = tgt.get("param_override") if isinstance(tgt, dict) else None
+    return ov if isinstance(ov, dict) else {}
+
+
+def set_param_override(tgt, key, value):
+    ov = tgt.get("param_override")
+    if not isinstance(ov, dict):
+        ov = {}
+        tgt["param_override"] = ov
+    if value is None:
+        ov.pop(key, None)
+    else:
+        ov[key] = value
+    return ov
+
+
+def clear_param_override(tgt):
+    if isinstance(tgt, dict):
+        tgt["param_override"] = {}
+
+
+def _ov_float(val):
+    try:
+        f = float(str(val).strip())
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f):
+        return None
+    return f
+
+
+def apply_param_override(gdata, ov):
+    # GeoX 단면 데이터(dict) 사본에 사용자 수정값을 덮어쓴 새 dict 를 반환
+    if not gdata or not ov:
+        return gdata
+    nd = dict(gdata)
+    if ov.get("wall_type"):
+        nd["wall_type"] = ov["wall_type"]
+    if ov.get("wall_spec"):
+        dims, norm, idx = parse_h_dims(ov["wall_spec"])
+        nd["wall_spec"] = norm
+        nd["wall_custom"] = dims
+        nd["cip_hpile_idx"] = idx
+        if not ov.get("wall_type") and not nd.get("wall_type"):
+            nd["wall_type"] = "HPILE"
+    if ov.get("cip_dia") not in (None, ""):
+        f = _ov_float(ov["cip_dia"])
+        if f is not None:
+            nd["cip_dia"] = str(int(round(f)))
+    if ov.get("ctc") is not None:
+        f = _ov_float(ov["ctc"])
+        if f is not None:
+            nd["ctc"] = f
+    if ov.get("max_depth") is not None:
+        f = _ov_float(ov["max_depth"])
+        if f is not None:
+            nd["max_depth"] = f
+    return nd
+
+
+def apply_override_pairs(raw_alist, ov):
+    # ALIST 문자열에서 이미 존재하는 항목만 값 치환 (없는 항목을 새로 만들지 않음)
+    if not raw_alist or not ov or not str(raw_alist).strip().startswith("("):
+        return raw_alist
+    repl = {}
+    if ov.get("wall_type"):
+        repl["WALL-TYPE"] = '(WALL-TYPE . "%s")' % ov["wall_type"]
+    if ov.get("wall_spec"):
+        dims, norm, idx = parse_h_dims(ov["wall_spec"])
+        repl["WALL-SPEC"] = '(WALL-SPEC . "%s")' % norm
+        repl["WALL-CUSTOM"] = "(WALL-CUSTOM %d %d %d %d)" % dims
+        repl["CIP-HPILE-IDX"] = '(CIP-HPILE-IDX . "%s")' % idx
+    if ov.get("cip_dia") not in (None, ""):
+        f = _ov_float(ov["cip_dia"])
+        if f is not None:
+            repl["CIP-DIA"] = '(CIP-DIA . "%d")' % int(round(f))
+    if ov.get("ctc") is not None:
+        f = _ov_float(ov["ctc"])
+        if f is not None:
+            repl["CTC"] = "(CTC . %.2f)" % f
+    if ov.get("max_depth") is not None:
+        f = _ov_float(ov["max_depth"])
+        if f is not None:
+            repl["MAX-DEPTH"] = "(MAX-DEPTH . %.2f)" % f
+            repl["CIP-MAX-DEPTH"] = '(CIP-MAX-DEPTH . "%.2f")' % f
+    if not repl:
+        return raw_alist
+    try:
+        pairs = parse_top_level_elements(raw_alist)
+    except Exception:
+        return raw_alist
+    out = []
+    for p in pairs:
+        inner = p[1:-1].strip()
+        key = inner.split()[0] if inner else ""
+        out.append(repl.get(key, p))
+    return "(" + " ".join(out) + ")"
+
+
+def parse_water_text(text, cur_chk="0", cur_depth=0.0):
+    # '미고려', '-', '' -> (chk='0', depth=0.0)
+    # '-3.5', '3.5', '-3.5m', 'GL-3.5' -> (chk='1', depth=3.5)
+    # 반환: (water_chk, water_depth, ok)
+    s = "" if text is None else str(text).strip().lower()
+    s = s.replace("gl", "").replace("m", "").strip()
+    if s in ("", "-", "미고려", "없음", "none", "n/a", "na", "no", "0", "0.0", "0.00"):
+        return "0", 0.0, True
+    s = s.replace("−", "-")
+    try:
+        d = abs(float(s))
+    except ValueError:
+        return cur_chk, cur_depth, False
+    return "1", d, True
+
+
+def parse_angle_text(text, cur_rad=0.0):
+    # 입력 문자열(도 단위)을 radian 으로 변환. '45', '45°', '45deg', '45도' 모두 허용
+    s = "" if text is None else str(text).strip().lower()
+    for tok in ("°", "deg", "degree", "degrees", "도"):
+        s = s.replace(tok, "")
+    s = s.strip()
+    if s == "":
+        return cur_rad, True
+    try:
+        deg = float(s)
+    except ValueError:
+        return cur_rad, False
+    return math.radians(deg), True
+
+
+def sanitize_csv_text(val, default=""):
+    # CSV 구분자 및 LISP 문자열 구분자를 깨뜨리는 문자 제거 (시추공명 등)
+    s = "" if val is None else str(val)
+    s = s.replace(",", " ").replace('"', "").replace("(", "").replace(")", "")
+    s = s.replace("\r", " ").replace("\n", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s if s else default
+
+
+def sync_alist_geometry(raw_alist, seg):
+    # ALIST 내부의 V-START / V-END / ANGLE / LENGTH 를 현재 seg 기하값으로 강제 동기화.
+    # (기존 CSV 유지 모드에서 좌표를 수정할 때 #GLOBAL_RAW 팩과 SEGMENT 행이 어긋나는 것을 방지)
+    if not raw_alist or not raw_alist.strip().startswith("("):
+        return raw_alist
+    try:
+        pairs = parse_top_level_elements(raw_alist)
+    except Exception:
+        return raw_alist
+    vs = seg["v_start"]
+    ve = seg["v_end"]
+    repl = {
+        "V-START": "(V-START . (%.12f %.12f %.12f))" % (vs[0], vs[1], vs[2]),
+        "V-END": "(V-END . (%.12f %.12f %.12f))" % (ve[0], ve[1], ve[2]),
+        "ANGLE": "(ANGLE . %.12f)" % seg["angle"],
+        "LENGTH": "(LENGTH . %.12f)" % seg["length"],
+    }
+    out = []
+    hit = 0
+    for p in pairs:
+        inner = p[1:-1].strip()
+        key = inner.split()[0] if inner else ""
+        if key in repl:
+            out.append(repl[key])
+            hit += 1
+        else:
+            out.append(p)
+    if hit == 0:
+        return raw_alist
+    return "(" + " ".join(out) + ")"
+
+
+def pick_split_distance_from_autocad(seg_info):
+    import win32com.client
+    import pythoncom
+    try:
+        acad = win32com.client.GetActiveObject("AutoCAD.Application")
+    except Exception:
+        acad = win32com.client.Dispatch("AutoCAD.Application")
+    try:
+        acad.Visible = True
+    except Exception:
+        pass
+
+    doc = acad.ActiveDocument
+    util = doc.Utility
+    vs = seg_info["v_start"]
+    ang = seg_info["angle"]
+    seg_len_m = seg_info["length"] / 1000.0
+
+    util.Prompt(f"\n[구간 분할] Seg-{seg_info['id']} (총 길이 {seg_len_m:.2f}m) 상의 분할 기준점(또는 H-Pile)을 클릭하세요: ")
+    pt = util.GetPoint(pythoncom.Empty, f"\nSeg-{seg_info['id']} 분할 기준점(H-Pile) 클릭: ")
+    px, py = float(pt[0]), float(pt[1])
+    dx = px - vs[0]
+    dy = py - vs[1]
+    proj_mm = dx * math.cos(ang) + dy * math.sin(ang)
+    proj_m = max(0.0, min(seg_len_m, proj_mm / 1000.0))
+    return round(proj_m, 2)
+
+
+def parse_geox_excel(filepath):
+    xls = pd.ExcelFile(filepath)
+
+    input_sheet = next((s for s in xls.sheet_names if "전산 입력 정보" in s or "전산입력정보" in s.replace(" ", "")), None)
+    if not input_sheet:
+        raise ValueError(f"선택한 엑셀 파일에 '전산 입력 정보' 시트가 존재하지 않습니다.\n(현재 시트 목록: {xls.sheet_names})")
+
+    has_corner_strut_sheet = any("사보강" in s for s in xls.sheet_names)
+
+    df_in = pd.read_excel(xls, sheet_name=input_sheet, header=None)
+
+    bond_map = {}
+    parse_errors = []   # [오류 보고] 값이 비어(nil) 기본값으로 대체할 수 없는 핵심 항목 수집 -> 파일 로드 중단
+    parse_warnings = [] # [경고 수집] 지층 빈칸 등 치환되어도 치명적이지 않은 항목 수집 -> 미리보기에 표시
+    summary_sheet = next((s for s in xls.sheet_names if "설계요약" in s.replace(" ", "")), None)
+    if summary_sheet:
+        df_sum = pd.read_excel(xls, sheet_name=summary_sheet, header=None)
+        cur_sup_name = None
+        for _, row in df_sum.iterrows():
+            v1 = str(row[1]).strip() if (1 in row and pd.notna(row[1])) else ""
+            v10 = str(row[10]).strip() if (10 in row and pd.notna(row[10])) else ""
+            v20 = row[20] if (20 in row and pd.notna(row[20])) else None
+            if v1 and any(k in v1 for k in ("Anchor", "앵커", "Strut", "버팀")):
+                cur_sup_name = v1
+            if cur_sup_name and v10 == "정착장" and v20 is not None:
+                try:
+                    bond_map[cur_sup_name] = float(v20)
+                except ValueError:
+                    pass
+
+    data = {
+        "filepath": filepath,
+        "filename": os.path.basename(filepath),
+        "is_corner_strut_file": has_corner_strut_sheet,
+        "hole_no": "BH-1",
+        "max_depth": 10.0,
+        "model_height": 30.0,
+        "soil_layers": [],
+        "wall_type": "CIP",
+        "wall_spec": "H 300×300×10/15",
+        "wall_custom": (300, 300, 10, 15),
+        "cip_hpile_idx": "2",
+        "wall_bot_depth": 13.0,
+        "ctc": 2.0,
+        "cip_dia": "500",
+        "wale_spec": "H 300×300×10/15",
+        "wale_custom": (300, 300, 10, 15),
+        "cip_wale_idx": "2",
+        "supports": [],
+        "water_chk": "0",
+        "water_depth": 0.0,
+        "parse_warnings": parse_warnings,
+    }
+
+    section = None
+    sup_header_map = {}
+    max_wale_h = -1
+
+    for _, row in df_in.iterrows():
+        c0 = str(row[0]).strip() if (0 in row and pd.notna(row[0])) else ""
+        c1 = str(row[1]).strip() if (1 in row and pd.notna(row[1])) else ""
+
+        c0_key = c0.replace(" ", "")  # [판별 강화] 섹션 제목의 공백 변형('흙막이 벽체' 등)까지 일관 매칭
+        if re.match(r'^\d+\.\d+', c0):
+            if "모델형상" in c0_key:
+                section = "MODEL"
+            elif "지층조건" in c0_key:
+                section = "SOIL"
+                continue
+            elif "흙막이벽체" in c0_key:
+                # [오류 수정] '흙막이벽체'(토류판)는 '흙막이벽'이라는 문자열을 포함하므로
+                # 반드시 흙막이벽보다 먼저 판별해야 함. 기존에는 WALL 로 잘못 분류되어
+                # 벽체 데이터가 토류판 행(설치깊이 '0 ~ 2', 빈 CTC)으로 덮어써져
+                # 하단깊이 0.0 / CTC 2.0 / 근입깊이 0.0 이 나오는 문제가 있었음.
+                # 토류판(벽체) 정보는 이 프로그램에서 파싱 대상이 아니므로 무시함.
+                section = "OTHER"
+                continue
+            elif "흙막이벽" in c0_key:
+                section = "WALL"
+                continue
+            elif "지보재" in c0_key:
+                section = "SUPPORT"
+                sup_header_map = {}
+                continue
+            elif "띠장" in c0_key:
+                section = "WALE"
+                continue
+            elif "C.I.P" in c0_key.upper() or "CIP" in c0_key.upper():
+                section = "CIP"
+                continue
+            elif "시공단계" in c0_key or "지하수위" in c0_key:
+                section = "WATER"
+                continue
+            else:
+                section = "OTHER"
+                continue
+
+        if section == "MODEL" and "최대굴착깊이" in c1:
+            m_exc = re.search(r'최대굴착깊이\s*=\s*([\d\.]+)', c1)
+            if m_exc:
+                data["max_depth"] = float(m_exc.group(1))
+            else:
+                parse_errors.append(f"모델형상: '최대굴착깊이' 숫자를 읽지 못했습니다. (셀 내용: '{c1}')")
+            m_ht = re.search(r'전모델높이\s*=\s*([\d\.]+)', c1)
+            if m_ht:
+                data["model_height"] = float(m_ht.group(1))
+            else:
+                parse_errors.append(f"모델형상: '전모델높이' 숫자를 읽지 못했습니다. (셀 내용: '{c1}')")
+
+        elif section == "SOIL" and c1.isdigit():
+            s_name = str(row[2]).strip() if pd.notna(row[2]) else f"지층{c1}"
+            # [경고 수집] 지층 셀이 빈칸(None)이면 기존대로 기본값으로 대체하되, 조용히 넘어가지 않고 경고 수집
+            # ('-' 처럼 숫자가 없는 표기는 GeoX 계산서에서 '해당 없음' 의미일 수 있어 경고 대상에서 제외)
+            for _lbl, _idx in (("층 이름", 2), ("깊이", 5), ("γt(단위중량)", 8),
+                               ("C(점착력)", 14), ("φ(내부마찰각)", 17), ("N값", 20)):
+                try:
+                    _v = row[_idx]
+                except (KeyError, IndexError):
+                    _v = None
+                if pd.isna(_v) or not str(_v).strip():
+                    parse_warnings.append(f"지층조건 {c1}번 지층({s_name}): {_lbl} 셀이 비어 있어 기본값으로 대체했습니다.")
+            s_depth = extract_min_num(row[5], 0.0)
+            s_gt = extract_min_num(row[8], 18.0)
+            s_c = extract_min_num(row[14], 0.0)
+            s_phi = extract_min_num(row[17], 30.0)
+            s_n_raw = str(row[20]).strip() if pd.notna(row[20]) else "10"
+            s_kh = extract_min_num(row[26], 15000.0)
+            s_type = classify_soil_type(s_name, s_gt, s_c, s_phi, s_n_raw, s_kh)
+            pat, scale, ang = SOIL_DATA_MAP.get(s_type, ("LINE", 78.74, 0.0))
+            n_str = parse_n_str(s_n_raw)
+            data["soil_layers"].append({
+                "name": s_name,
+                "depth": s_depth,
+                "pat": pat,
+                "scale": scale,
+                "ang": ang,
+                "type_name": s_type,
+                "phi": s_phi,
+                "n_str": n_str,
+            })
+
+        elif section == "WALL" and c1.isdigit():
+            w_shape = str(row[8]).strip() if pd.notna(row[8]) else ""
+            w_sec = str(row[13]).strip() if pd.notna(row[13]) else ""
+            # [오류 보고 강화] 벽체 핵심 값(형상/규격/하단깊이/수평간격)이 비어 있으면
+            # 기본값으로 자동 대체하지 않고 오류를 수집해 파일 로드를 중단함
+            def _wall_miss(idx, lbl):
+                try:
+                    _v = row[idx]
+                except (KeyError, IndexError):
+                    return True
+                if pd.isna(_v) or not str(_v).strip() or not re.findall(r'[-+]?\d*\.?\d+', str(_v)):
+                    parse_errors.append(f"흙막이벽 {c1}번 행: {lbl} 값이 비어 있거나 숫자가 아닙니다.")
+                    return True
+                return False
+
+            _wall_miss(23, "하단깊이(말뚝 선단 깊이)")
+            _wall_miss(26, "수평간격(CTC)")
+            if not w_shape:
+                parse_errors.append(f"흙막이벽 {c1}번 행: 형상(공법) 값이 비어 있습니다.")
+            if not w_sec or not re.findall(r'\d+', w_sec):
+                parse_errors.append(f"흙막이벽 {c1}번 행: 단면(규격) 값이 비어 있거나 숫자를 포함하지 않습니다.")
+            else:
+                _is_cip_shape = "C.I.P" in w_shape.upper() or "CIP" in w_shape.upper()
+                if not _is_cip_shape and len(re.findall(r'\d+', w_sec)) < 4:
+                    parse_errors.append(f"흙막이벽 {c1}번 행: 단면(규격) '{w_sec}' 에서 H형강 치수 4개(예: H 300x300x10/15)를 읽지 못했습니다.")
+            w_bot = extract_min_num(row[23], data["max_depth"] + 3.0)
+            w_ctc = extract_min_num(row[26], 2.0)
+            if "C.I.P" in w_shape.upper() or "CIP" in w_shape.upper():
+                data["wall_type"] = "CIP"
+            else:
+                data["wall_type"] = "HPILE"
+            dims, norm_spec, idx_str = parse_h_dims(w_sec)
+            data["wall_spec"] = norm_spec
+            data["wall_custom"] = dims
+            data["cip_hpile_idx"] = idx_str
+            data["wall_bot_depth"] = w_bot
+            data["ctc"] = w_ctc
+
+        elif section == "SUPPORT":
+            if c1 == "번호":
+                sup_header_map = {}
+                for col_idx, cell_val in row.items():
+                    if pd.notna(cell_val):
+                        h_txt = str(cell_val).strip()
+                        if "단면" in h_txt:
+                            sup_header_map["sec"] = col_idx
+                        elif "재질" in h_txt:
+                            sup_header_map["mat"] = col_idx
+                        elif "설치깊이" in h_txt:
+                            sup_header_map["depth"] = col_idx
+                        elif "수평간격" in h_txt:
+                            sup_header_map["ctc"] = col_idx
+                        elif "설치각도" in h_txt or "각도" in h_txt:
+                            sup_header_map["ang"] = col_idx
+                        elif "자유장" in h_txt:
+                            sup_header_map["free"] = col_idx
+                        elif "개수" in h_txt:
+                            sup_header_map["cnt"] = col_idx
+                continue
+
+            if c1.isdigit():
+                sup_name = str(row[2]).strip() if pd.notna(row[2]) else f"Support_{c1}"
+                if not sup_header_map:
+                    parse_warnings.append(f"지보재 {c1}번 행: '번호' 헤더 행을 찾지 못해 기준 열 위치(기본값)로 읽었습니다.")
+
+                sec_col = sup_header_map.get("sec", 6 if (6 in row and pd.notna(row[6])) else 7)
+                mat_col = sup_header_map.get("mat", 11 if (11 in row and pd.notna(row[11])) else 12)
+                dep_col = sup_header_map.get("depth", 14 if (14 in row and pd.notna(row[14])) else 15)
+                ctc_col = sup_header_map.get("ctc", 17 if (17 in row and pd.notna(row[17])) else 18)
+                ang_col = sup_header_map.get("ang", 21)
+                free_col = sup_header_map.get("free", 24)
+                cnt_col = sup_header_map.get("cnt", 28)
+
+                sup_sec_raw = str(row[sec_col]).strip() if (sec_col in row and pd.notna(row[sec_col])) else ""
+                sup_mat = str(row[mat_col]).strip() if (mat_col in row and pd.notna(row[mat_col])) else "SS275"
+                sup_depth = extract_min_num(row[dep_col], 1.0) if dep_col in row else 1.0
+                sup_ctc = extract_min_num(row[ctc_col], data["ctc"]) if ctc_col in row else data["ctc"]
+
+                is_anchor = (
+                    "ANCHOR" in sup_name.upper()
+                    or "앵커" in sup_name
+                    or "STRAND" in sup_sec_raw.upper()
+                    or "SWPC" in sup_mat.upper()
+                )
+
+                if is_anchor:
+                    sup_ang = extract_min_num(row[ang_col], 30.0) if ang_col in row else 30.0
+                    sup_free = extract_min_num(row[free_col], 5.0) if free_col in row else 5.0
+                    sup_bond = bond_map.get(sup_name, 5.0)
+                    data["supports"].append({
+                        "kind": "ANCHOR",
+                        "name": sup_name,
+                        "sec": sup_sec_raw or "Strand12.7x4EA",
+                        "mat": sup_mat or "SWPC7B",
+                        "depth": sup_depth,
+                        "ctc": sup_ctc,
+                        "ang": sup_ang,
+                        "free": sup_free,
+                        "bond": sup_bond,
+                        "cnt": 1,
+                    })
+                else:
+                    cnt_val = int(extract_min_num(row[cnt_col], 1.0)) if (cnt_col in row and pd.notna(row[cnt_col])) else 1
+                    cnt_val = max(1, cnt_val)
+                    dims, norm_spec, _ = parse_h_dims(sup_sec_raw)
+                    final_sec = f"2{norm_spec}" if cnt_val >= 2 else norm_spec
+                    kind_str = "CORNER_STRUT" if has_corner_strut_sheet else "STRUT"
+                    data["supports"].append({
+                        "kind": kind_str,
+                        "name": sup_name,
+                        "sec": final_sec,
+                        "dims": dims,
+                        "mat": sup_mat or "SS275",
+                        "depth": sup_depth,
+                        "ctc": sup_ctc,
+                        "cnt": 2 if cnt_val >= 2 else 1,
+                    })
+
+        elif section == "WALE" and c1.isdigit():
+            wale_target_name = str(row[2]).strip() if (2 in row and pd.notna(row[2])) else ""
+            wale_sec = str(row[13]).strip() if (13 in row and pd.notna(row[13])) else "H 300x300x10/15"
+            dims, norm_spec, idx_str = parse_h_dims(wale_sec)
+            if dims[0] >= max_wale_h:
+                max_wale_h = dims[0]
+                data["wale_spec"] = norm_spec
+                data["wale_custom"] = dims
+                data["cip_wale_idx"] = idx_str
+            matched = False
+            if wale_target_name:
+                w_key = wale_target_name.replace(" ", "").upper()
+                for sup in data["supports"]:
+                    s_key = str(sup.get("name", "")).replace(" ", "").upper()
+                    if s_key and (s_key == w_key or s_key in w_key or w_key in s_key):
+                        sup["wale_spec"] = norm_spec
+                        sup["wale_custom"] = dims
+                        matched = True
+            if not matched:
+                w_idx = int(c1) - 1
+                if 0 <= w_idx < len(data["supports"]):
+                    data["supports"][w_idx]["wale_spec"] = norm_spec
+                    data["supports"][w_idx]["wale_custom"] = dims
+
+        elif section == "CIP" and c1.isdigit():
+            dia_m = extract_min_num(row[9], 0.5)
+            dia_mm = int(round(dia_m * 1000)) if dia_m < 10 else int(round(dia_m))
+            data["cip_dia"] = str(dia_mm)
+
+        elif section == "WATER":
+            # [오류 수정] '지하수위 : 비고려' 도 '고려' 를 포함하므로('비고려' 부분 일치)
+            # 비고려/미고려 문구를 제외해야 정확히 판별됨. 기존에는 비고려를 고려로 오판.
+            if ("지하수위" in c1 and "고려" in c1
+                    and "비고려" not in c1 and "미고려" not in c1):
+                data["water_chk"] = "1"
+            if "초기 지하수위" in c1:
+                m_w = re.search(r'초기\s*지하수위\s*=\s*([\d\.]+)', c1)
+                if m_w:
+                    data["water_depth"] = float(m_w.group(1))
+                    data["water_chk"] = "1"
+
+    data["supports"].sort(key=lambda x: x["depth"])
+    data["embed_depth"] = round(max(0.0, data["wall_bot_depth"] - data["max_depth"]), 3)
+
+    dia_mm = float(data["cip_dia"])
+    ctc_mm = data["ctc"] * 1000.0
+    if dia_mm > 0:
+        ratio = int(round(ctc_mm / dia_mm))
+        if ratio <= 1:
+            data["cip_interval_idx"] = "0"
+        elif ratio == 2:
+            data["cip_interval_idx"] = "1"
+        else:
+            data["cip_interval_idx"] = "2"
+
+        anc_supports = [s for s in data["supports"] if s["kind"] == "ANCHOR"]
+        anc_ctc_mm = (anc_supports[0]["ctc"] * 1000.0) if anc_supports else ctc_mm
+        anc_n = max(1, int(round(anc_ctc_mm / dia_mm)))
+        data["cip_anchor_n"] = str(anc_n)
+    else:
+        data["cip_interval_idx"] = "1"
+        data["cip_anchor_n"] = "2"
+
+    if has_corner_strut_sheet and data["supports"]:
+        cs0 = data["supports"][0]
+        data["corner_strut_spec"] = cs0["sec"]
+        data["corner_strut_dims"] = cs0.get("dims", (300, 300, 10, 15))
+        data["corner_strut_ctc"] = cs0["ctc"]
+    else:
+        data["corner_strut_spec"] = None
+        data["corner_strut_dims"] = None
+        data["corner_strut_ctc"] = None
+
+    # [오류 보고] 읽지 못한 핵심 값이 있으면 기본값으로 진행하지 않고 파일 로드를 중단
+    # (GUI 의 'GeoX 파싱 오류' 팝업으로 아래 내용이 표시됨)
+    if parse_errors:
+        raise ValueError(
+            "아래 항목을 읽지 못해 파일을 불러오지 않았습니다. (기본값으로 자동 대체하지 않음)\n"
+            "GeoX 계산서의 '전산 입력 정보' 시트 값을 확인해주세요.\n- " + "\n- ".join(parse_errors)
+        )
+
+    return data
+
+
+def find_balanced_paren(s, start_idx):
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start_idx, len(s)):
+        ch = s[i]
+        if escape:
+            escape = False
+            continue
+        if ch == '\\':
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if not in_str:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    return i
+    return -1
+
+
+def parse_top_level_elements(s):
+    s_strip = s.strip()
+    if not (s_strip.startswith('(') and s_strip.endswith(')')):
+        raise ValueError("유효한 LISP 리스트 형식이 아닙니다.")
+    elements = []
+    i = 1
+    n = len(s_strip) - 1
+    while i < n:
+        while i < n and s_strip[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        if s_strip[i] == '(':
+            end_i = find_balanced_paren(s_strip, i)
+            if end_i == -1:
+                raise ValueError("괄호 짝이 맞지 않습니다.")
+            elements.append(s_strip[i:end_i + 1])
+            i = end_i + 1
+        elif s_strip[i] == '"':
+            end_i = i + 1
+            escape = False
+            while end_i < n:
+                if escape:
+                    escape = False
+                elif s_strip[end_i] == '\\':
+                    escape = True
+                elif s_strip[end_i] == '"':
+                    break
+                end_i += 1
+            elements.append(s_strip[i:end_i + 1])
+            i = end_i + 1
+        else:
+            end_i = i
+            while end_i < n and (not s_strip[end_i].isspace()) and s_strip[end_i] not in '()':
+                end_i += 1
+            elements.append(s_strip[i:end_i])
+            i = end_i
+    return elements
+
+
+def format_lisp_soil_data(soil_layers):
+    if not soil_layers:
+        return "(SOIL-DATA)"
+    items_str = []
+    for lyr in soil_layers:
+        items_str.append(
+            f'("{lyr["name"]}" {lyr["depth"]:.2f} "{lyr["pat"]}" {lyr["scale"]:.2f} {lyr["ang"]:.1f} "{lyr["type_name"]}" {lyr["phi"]:.1f})'
+        )
+    return "(SOIL-DATA " + " ".join(items_str) + ")"
+
+
+def format_lisp_n_values(n_vals):
+    if not n_vals:
+        return "(N-VALUES)"
+    items_str = [f'({dep:.2f} "{n_str}")' for dep, n_str in n_vals]
+    return "(N-VALUES " + " ".join(items_str) + ")"
+
+
+def format_lisp_supports(supports, default_wale_spec="H 300×300×10/15", range_pts=None):
+    if range_pts and len(range_pts) == 2:
+        p1, p2 = range_pts
+        range_str = f"(({p1[0]:.8f} {p1[1]:.8f} 0.0) ({p2[0]:.8f} {p2[1]:.8f} 0.0))"
+    else:
+        range_str = "nil"
+
+    sup_strs = []
+    strut_idx = 1
+    anc_idx = 1
+    for sup in supports:
+        w_spec = sup.get("wale_spec") or default_wale_spec
+        if sup["kind"] == "ANCHOR":
+            s_name = sup["name"] if sup["name"] else f"Anchor_{anc_idx}"
+            s_item = (
+                f'("앵커(Earth Anchor)" "{s_name}" "Earth Anchor" '
+                f'{sup["depth"]:.2f} {sup["ang"]:.1f} {sup["free"]:.2f} {sup["bond"]:.2f} '
+                f'"{sup["mat"]}" "{sup["sec"]}" nil "{w_spec}" {range_str})'
+            )
+            sup_strs.append(s_item)
+            anc_idx += 1
+        else:
+            s_name = sup["name"] if sup.get("name") else f"Strut_{strut_idx}"
+            cnt = sup.get("cnt", 1)
+            sec_label = sup["sec"]
+            # [LISP 패치 동기화] TSP_5B 버팀보 옵션 15개 항목 배열 매칭 적용
+            s_item = (
+                f'("버팀보(Strut)" "{s_name}" "H형강" '
+                f'{sup["depth"]:.2f} {cnt} "{sup["mat"]}" "{sec_label}" "스크류잭" '
+                f'nil "1" "{sup["ctc"]:.2f}" ("1" "0" "0" "" "50" "1" "0" "0" "L" "0" "화타쐐기 없음" "0" "0" "1.5" "0.0") "{w_spec}" {range_str})'
+            )
+            sup_strs.append(s_item)
+            strut_idx += 1
+    return sup_strs
+
+
+def get_geox_wall_stiffness_key(gdata):
+    if not gdata:
+        return (0, 0, 0, 0)
+    is_cip = 1 if gdata.get("wall_type") == "CIP" else 0
+    wc = gdata.get("wall_custom") or (300, 300, 10, 15)
+    h_val = int(wc[0]) if len(wc) > 0 else 300
+    b_val = int(wc[1]) if len(wc) > 1 else 300
+    dia_val = int(float(gdata.get("cip_dia", 500))) if is_cip else 0
+    return (is_cip, h_val, dia_val, b_val)
+
+
+def format_lisp_sub_zones(seg_info, geox_pool):
+    sub_zones = seg_info.get("sub_zones") or []
+    if not sub_zones:
+        return None
+    vs = seg_info["v_start"]
+    ang = seg_info["angle"]
+    seg_len_m = seg_info["length"] / 1000.0
+
+    zone_strs = []
+    for idx, sz in enumerate(sub_zones, start=1):
+        s_m = max(0.0, min(seg_len_m, float(sz.get("start_m", 0.0))))
+        e_m = max(0.0, min(seg_len_m, float(sz.get("end_m", seg_len_m))))
+        if e_m < s_m:
+            s_m, e_m = e_m, s_m
+        p1 = (vs[0] + s_m * 1000.0 * math.cos(ang), vs[1] + s_m * 1000.0 * math.sin(ang), 0.0)
+        p2 = (vs[0] + e_m * 1000.0 * math.cos(ang), vs[1] + e_m * 1000.0 * math.sin(ang), 0.0)
+
+        gkey = sz.get("geox_key")
+        gdata = apply_param_override(geox_pool.get(gkey) if gkey else None, get_param_override(sz))
+        z_name = sz.get("name") or f"제{idx}구간"
+        hole_no = sz.get("hole_no", f"BH-{seg_info['id']}-{idx}")
+        w_chk = sz.get("water_chk", "0")
+        w_dep = float(sz.get("water_depth", 0.0))
+
+        if gdata:
+            wc = gdata["wall_custom"]
+            wlc = gdata["wale_custom"]
+            n_vals = generate_n_values_layer_mid(gdata["soil_layers"])
+            sup_items = format_lisp_supports(gdata["supports"], gdata["wale_spec"], (p1, p2))
+            sup_s = ("(SUPPORT-LIST " + " ".join(sup_items) + ")") if sup_items else "(SUPPORT-LIST)"
+            z_pairs = [
+                f"(ZONE-ID . {idx})",
+                f'(ZONE-NAME . "{z_name}")',
+                f"(START-M . {s_m:.4f})",
+                f"(END-M . {e_m:.4f})",
+                "(IS-DEFINED . T)",
+                f'(WALL-TYPE . "{gdata["wall_type"]}")',
+                f'(WALL-SPEC . "{gdata["wall_spec"]}")',
+                f"(WALL-CUSTOM {wc[0]} {wc[1]} {wc[2]} {wc[3]})",
+                f'(WALE-SPEC . "{gdata["wale_spec"]}")',
+                f"(WALE-CUSTOM {wlc[0]} {wlc[1]} {wlc[2]} {wlc[3]})",
+                f'(CTC . {gdata["ctc"]:.2f})',
+                "(TIMBER-THICKNESS . 60)",
+                f'(MAX-DEPTH . {gdata["max_depth"]:.2f})',
+                f'(EMBED-DEPTH . {gdata["embed_depth"]:.2f})',
+                f'(CIP-HPILE-IDX . "{gdata["cip_hpile_idx"]}")',
+                f'(CIP-WALE-IDX . "{gdata["cip_wale_idx"]}")',
+                f'(CIP-DIA . "{gdata["cip_dia"]}")',
+                '(CIP-MODE-IDX . "0")',
+                '(CIP-OVERLAP . "0")',
+                '(CIP-EQUAL-DIVIDE . "0")',
+                f'(CIP-INTERVAL-IDX . "{gdata["cip_interval_idx"]}")',
+                f'(CIP-ANCHOR-N . "{gdata["cip_anchor_n"]}")',
+                '(CIP-GROUTING-IDX . "0")',
+                '(CIP-GROUTING-SPACE-IDX . "0")',
+                '(CIP-GROUTING-SPACE-CUSTOM . "")',
+                '(CIP-GROUTING-OFFSET-IDX . "0")',
+                '(CIP-GROUTING-OFFSET-CUSTOM . "")',
+                format_lisp_soil_data(gdata["soil_layers"]),
+                format_lisp_n_values(n_vals),
+                f'(HOLE-NO . "{hole_no}")',
+                f'(WATER-CHK . "{w_chk}")',
+                f'(WATER-DEPTH . {w_dep:.2f})',
+                sup_s,
+            ]
+        else:
+            z_pairs = [
+                f"(ZONE-ID . {idx})",
+                f'(ZONE-NAME . "{z_name}")',
+                f"(START-M . {s_m:.4f})",
+                f"(END-M . {e_m:.4f})",
+                "(IS-DEFINED)",
+                '(WALL-TYPE . "HPILE")',
+                '(WALL-SPEC . "H 300×300×10/15")',
+                "(WALL-CUSTOM 300 300 10 15)",
+                '(WALE-SPEC . "H 300×300×10/15")',
+                "(WALE-CUSTOM 300 300 10 15)",
+                "(CTC . 2.00)",
+                "(TIMBER-THICKNESS . 60)",
+                "(MAX-DEPTH . 10.00)",
+                "(EMBED-DEPTH . 3.00)",
+                '(CIP-HPILE-IDX . "2")',
+                '(CIP-WALE-IDX . "2")',
+                '(CIP-DIA . "500")',
+                '(CIP-MODE-IDX . "0")',
+                '(CIP-OVERLAP . "0")',
+                '(CIP-EQUAL-DIVIDE . "0")',
+                '(CIP-INTERVAL-IDX . "2")',
+                '(CIP-ANCHOR-N . "3")',
+                '(CIP-GROUTING-IDX . "0")',
+                '(CIP-GROUTING-SPACE-IDX . "0")',
+                '(CIP-GROUTING-SPACE-CUSTOM . "")',
+                '(CIP-GROUTING-OFFSET-IDX . "0")',
+                '(CIP-GROUTING-OFFSET-CUSTOM . "")',
+                "(SOIL-DATA)",
+                "(N-VALUES)",
+                f'(HOLE-NO . "{hole_no}")',
+                '(WATER-CHK . "0")',
+                "(WATER-DEPTH . 0.00)",
+                "(SUPPORT-LIST)",
+            ]
+        zone_strs.append("(" + " ".join(z_pairs) + ")")
+    return "(SUB-ZONES " + " ".join(zone_strs) + ")"
+
+
+def format_lisp_corner_brace(seg_info, corner_geox_data):
+    if corner_geox_data is None:
+        return seg_info.get("corner_brace_str", '("N" nil)')
+
+    spec = corner_geox_data.get("corner_strut_spec") or "2H 300×300×10/15"
+    dims = corner_geox_data.get("corner_strut_dims") or (300, 300, 10, 15)
+    is_2h = spec.upper().startswith("2H")
+    dist_m = 2.0 if is_2h else 1.5
+    def_jack = "스크류잭" if is_2h else "잭 없음"
+    row_str = f'("{spec}" ({dims[0]} {dims[1]} {dims[2]} {dims[3]}) {dist_m:.2f} "{def_jack}" "화타쐐기 없음")'
+
+    # Corner Strut 엑셀 파일의 각 단별 설치깊이(supports)를 다단 사보강재("MULTI") 리스트로 구성
+    stage_strs = []
+    supports = corner_geox_data.get("supports") or []
+    if supports:
+        for idx, sup in enumerate(supports, start=1):
+            s_spec = sup.get("sec") or spec
+            s_dims = sup.get("dims") or dims
+            s_is_2h = str(s_spec).upper().startswith("2H")
+            s_dist = 2.0 if s_is_2h else 1.5
+            s_jack = "스크류잭" if s_is_2h else "잭 없음"
+            s_depth = float(sup.get("depth", 1.5 * idx))
+            s_row = f'("{s_spec}" ({s_dims[0]} {s_dims[1]} {s_dims[2]} {s_dims[3]}) {s_dist:.2f} "{s_jack}" "화타쐐기 없음")'
+            stage_strs.append(
+                f'("Corner_{idx}" {s_depth:.2f} ({s_row}) "1" "0" "0.0" "1" "50" "0" "L" "1" "0")'
+            )
+    else:
+        stage_strs.append(
+            f'("Corner_1" 1.50 ({row_str}) "1" "0" "0.0" "1" "50" "0" "L" "1" "0")'
+        )
+
+    stages_lisp = "(" + " ".join(stage_strs) + ")"
+    return f'("Y" ({row_str}) "1" "0" "0.0" "1" "50" "0" "L" "1" "0" "MULTI" {stages_lisp})'
+
+
+def format_lisp_upgrade_wale(curr_geox_data, prev_geox_data, corner_geox_data):
+    if corner_geox_data is None and (curr_geox_data is None or prev_geox_data is None):
+        return None
+
+    def _get_max_wale_info(gdata):
+        if not gdata:
+            return 300, "H 300×300×10/15"
+        best_h = gdata["wale_custom"][0] if gdata.get("wale_custom") else 300
+        best_spec = gdata.get("wale_spec") or "H 300×300×10/15"
+        for sup in gdata.get("supports", []):
+            sw_spec = sup.get("wale_spec")
+            if sw_spec:
+                dims, norm_s, _ = parse_h_dims(sw_spec)
+                if dims[0] > best_h:
+                    best_h = dims[0]
+                    best_spec = norm_s
+        return best_h, best_spec
+
+    curr_h, curr_spec = _get_max_wale_info(curr_geox_data)
+    prev_h, prev_spec = _get_max_wale_info(prev_geox_data) if prev_geox_data else (curr_h, curr_spec)
+
+    req_h = max(curr_h, prev_h)
+    req_spec = prev_spec if prev_h > curr_h else curr_spec
+
+    if corner_geox_data is not None:
+        c_wale_h, c_wale_spec = _get_max_wale_info(corner_geox_data)
+        c_dims = corner_geox_data.get("corner_strut_dims") or (300, 300, 10, 15)
+        c_brace_h = c_dims[0]
+        _, c_brace_norm_spec, _ = parse_h_dims(f"H {c_dims[0]}×{c_dims[1]}×{c_dims[2]}/{c_dims[3]}")
+
+        if c_wale_h > req_h:
+            req_h = c_wale_h
+            req_spec = c_wale_spec
+        if c_brace_h > req_h:
+            req_h = c_brace_h
+            req_spec = c_brace_norm_spec
+
+    min_main_h = min(curr_h, prev_h) if prev_geox_data else curr_h
+    if req_h > min_main_h:
+        return f'("Y" "{req_spec}" nil)'
+    return None
+
+
+def update_seg_alist_string(seg_str, geox_data, hole_no="BH-1", water_chk="0", water_depth=0.0, corner_brace_str=None, upgrade_wale_str=None):
+    pairs = parse_top_level_elements(seg_str)
+    if geox_data is None:
+        new_pairs = []
+        for p in pairs:
+            inner = p[1:-1].strip()
+            key = inner.split()[0] if inner else ""
+            if key == "IS-DEFINED" and not corner_brace_str:
+                new_pairs.append("(IS-DEFINED)")
+            elif key == "CORNER-BRACE" and corner_brace_str:
+                new_pairs.append(f"(CORNER-BRACE . {corner_brace_str})")
+            else:
+                new_pairs.append(p)
+        return "(" + " ".join(new_pairs) + ")"
+
+    n_vals = generate_n_values_layer_mid(geox_data["soil_layers"])
+    sup_items = format_lisp_supports(geox_data["supports"])
+
+    w_c = geox_data["wall_custom"]
+    wl_c = geox_data["wale_custom"]
+
+    replacements = {
+        "IS-DEFINED": "(IS-DEFINED . T)",
+        "SECTION-DRAW": "(SECTION-DRAW . T)",
+        "WALL-TYPE": f'(WALL-TYPE . "{geox_data["wall_type"]}")',
+        "SOIL-DATA": format_lisp_soil_data(geox_data["soil_layers"]),
+        "N-VALUES": format_lisp_n_values(n_vals),
+        "HOLE-NO": f'(HOLE-NO . "{hole_no}")',
+        "WALL-SPEC": f'(WALL-SPEC . "{geox_data["wall_spec"]}")',
+        "WALL-CUSTOM": f'(WALL-CUSTOM {w_c[0]} {w_c[1]} {w_c[2]} {w_c[3]})',
+        "WALE-SPEC": f'(WALE-SPEC . "{geox_data["wale_spec"]}")',
+        "WALE-CUSTOM": f'(WALE-CUSTOM {wl_c[0]} {wl_c[1]} {wl_c[2]} {wl_c[3]})',
+        "CTC": f'(CTC . {geox_data["ctc"]:.2f})',
+        "MAX-DEPTH": f'(MAX-DEPTH . {geox_data["max_depth"]:.2f})',
+        "EMBED-DEPTH": f'(EMBED-DEPTH . {geox_data["embed_depth"]:.2f})',
+        "CIP-MAX-DEPTH": f'(CIP-MAX-DEPTH . "{geox_data["max_depth"]:.2f}")',
+        "CIP-EMBED-DEPTH": f'(CIP-EMBED-DEPTH . "{geox_data["embed_depth"]:.2f}")',
+        "CIP-HPILE-IDX": f'(CIP-HPILE-IDX . "{geox_data["cip_hpile_idx"]}")',
+        "CIP-WALE-IDX": f'(CIP-WALE-IDX . "{geox_data["cip_wale_idx"]}")',
+        "CIP-DIA": f'(CIP-DIA . "{geox_data["cip_dia"]}")',
+        "CIP-INTERVAL-IDX": f'(CIP-INTERVAL-IDX . "{geox_data["cip_interval_idx"]}")',
+        "CIP-ANCHOR-N": f'(CIP-ANCHOR-N . "{geox_data["cip_anchor_n"]}")',
+        "WATER-CHK": f'(WATER-CHK . "{water_chk}")',
+        "WATER-DEPTH": f'(WATER-DEPTH . {water_depth:.2f})',
+        "SUPPORT-LIST": ("(SUPPORT-LIST " + " ".join(sup_items) + ")") if sup_items else "(SUPPORT-LIST)",
+    }
+    if corner_brace_str:
+        replacements["CORNER-BRACE"] = f"(CORNER-BRACE . {corner_brace_str})"
+    if upgrade_wale_str is not None:
+        replacements["UPGRADE-WALE"] = f"(UPGRADE-WALE . {upgrade_wale_str})" if upgrade_wale_str else "(UPGRADE-WALE)"
+
+    new_pairs = []
+    for p in pairs:
+        inner = p[1:-1].strip()
+        key = inner.split()[0] if inner else ""
+        if key in replacements:
+            new_pairs.append(replacements[key])
+            if key == "SOIL-DATA":
+                has_n = any(x[1:-1].strip().startswith("N-VALUES") for x in pairs)
+                has_h = any(x[1:-1].strip().startswith("HOLE-NO") for x in pairs)
+                if not has_n:
+                    new_pairs.append(replacements["N-VALUES"])
+                if not has_h:
+                    new_pairs.append(replacements["HOLE-NO"])
+        else:
+            new_pairs.append(p)
+
+    return "(" + " ".join(new_pairs) + ")"
+
+
+def build_fresh_seg_alist_string(seg_info, geox_data, corner_brace_str, upgrade_wale_str=None):
+    sid = seg_info["id"]
+    vs = seg_info["v_start"]
+    ve = seg_info["v_end"]
+    ang = seg_info["angle"]
+    length = seg_info["length"]
+    hole_no = seg_info.get("hole_no", f"BH-{sid}")
+    water_chk = seg_info.get("water_chk", "0")
+    water_depth = float(seg_info.get("water_depth", 0.0))
+
+    vs_str = f"({vs[0]:.12f} {vs[1]:.12f} {vs[2]:.12f})"
+    ve_str = f"({ve[0]:.12f} {ve[1]:.12f} {ve[2]:.12f})"
+    upg_pair_str = f"(UPGRADE-WALE . {upgrade_wale_str})" if upgrade_wale_str else "(UPGRADE-WALE)"
+
+    if geox_data is None:
+        pairs = [
+            f"(ID . {sid})",
+            f'(NAME . "Seg-{sid}")',
+            "(IS-DEFINED)",
+            "(SECTION-DRAW)",
+            "(SOIL-DATA)",
+            "(N-VALUES)",
+            f'(HOLE-NO . "{hole_no}")',
+            '(WALL-SPEC . "H 300×300×10/15")',
+            "(WALL-CUSTOM 300 300 10 15)",
+            '(WALE-SPEC . "H 300×300×10/15")',
+            "(WALE-CUSTOM 300 300 10 15)",
+            "(CTC . 2.00)",
+            "(TIMBER-THICKNESS . 60)",
+            "(MAX-DEPTH . 10.00)",
+            "(EMBED-DEPTH . 3.00)",
+            '(WATER-CHK . "0")',
+            "(WATER-DEPTH . 0.00)",
+            '(SHOTCRETE-ENABLE . "1")',
+            '(SHOTCRETE-CHK . "0")',
+            '(SHOTCRETE-LAYER . "")',
+            "(SHOTCRETE-THICK . 0.0)",
+            "(SUPPORT-LIST)",
+            f"(CORNER-BRACE . {corner_brace_str})",
+            upg_pair_str,
+            '(WALL-TYPE . "HPILE")',
+            '(CIP-MAX-DEPTH . "10.0")',
+            '(CIP-EMBED-DEPTH . "3.0")',
+            '(CIP-HPILE-IDX . "2")',
+            '(CIP-WALE-IDX . "2")',
+            '(CIP-DIA . "500")',
+            '(CIP-MODE-IDX . "0")',
+            '(CIP-OVERLAP . "0")',
+            '(CIP-EQUAL-DIVIDE . "0")',
+            '(CIP-INTERVAL-IDX . "2")',
+            '(CIP-ANCHOR-N . "3")',
+            '(CIP-GROUTING-IDX . "0")',
+            '(CIP-GROUTING-SPACE-IDX . "0")',
+            '(CIP-GROUTING-SPACE-CUSTOM . "")',
+            '(CIP-GROUTING-OFFSET-IDX . "0")',
+            '(CIP-GROUTING-OFFSET-CUSTOM . "")',
+            f"(V-START . {vs_str})",
+            f"(V-END . {ve_str})",
+            f"(ANGLE . {ang:.12f})",
+            f"(LENGTH . {length:.12f})",
+        ]
+        return "(" + " ".join(pairs) + ")"
+
+    n_vals = generate_n_values_layer_mid(geox_data["soil_layers"])
+    sup_items = format_lisp_supports(geox_data["supports"])
+    w_c = geox_data["wall_custom"]
+    wl_c = geox_data["wale_custom"]
+
+    pairs = [
+        f"(ID . {sid})",
+        f'(NAME . "Seg-{sid}")',
+        "(IS-DEFINED . T)",
+        f'(WALL-TYPE . "{geox_data["wall_type"]}")',
+        "(SECTION-DRAW . T)",
+        format_lisp_soil_data(geox_data["soil_layers"]),
+        format_lisp_n_values(n_vals),
+        f'(HOLE-NO . "{hole_no}")',
+        f'(WALL-SPEC . "{geox_data["wall_spec"]}")',
+        f"(WALL-CUSTOM {w_c[0]} {w_c[1]} {w_c[2]} {w_c[3]})",
+        f'(WALE-SPEC . "{geox_data["wale_spec"]}")',
+        f"(WALE-CUSTOM {wl_c[0]} {wl_c[1]} {wl_c[2]} {wl_c[3]})",
+        f'(CTC . {geox_data["ctc"]:.2f})',
+        "(TIMBER-THICKNESS . 60)",
+        f'(MAX-DEPTH . {geox_data["max_depth"]:.2f})',
+        f'(EMBED-DEPTH . {geox_data["embed_depth"]:.2f})',
+        '(ROCK-EMBED . "500")',
+        f'(CIP-MAX-DEPTH . "{geox_data["max_depth"]:.2f}")',
+        f'(CIP-EMBED-DEPTH . "{geox_data["embed_depth"]:.2f}")',
+        f'(CIP-HPILE-IDX . "{geox_data["cip_hpile_idx"]}")',
+        f'(CIP-WALE-IDX . "{geox_data["cip_wale_idx"]}")',
+        f'(CIP-DIA . "{geox_data["cip_dia"]}")',
+        '(CIP-MODE-IDX . "0")',
+        '(CIP-OVERLAP . "0")',
+        '(CIP-EQUAL-DIVIDE . "0")',
+        f'(CIP-INTERVAL-IDX . "{geox_data["cip_interval_idx"]}")',
+        f'(CIP-ANCHOR-N . "{geox_data["cip_anchor_n"]}")',
+        '(CIP-GROUTING-IDX . "0")',
+        '(CIP-GROUTING-SPACE-IDX . "0")',
+        '(CIP-GROUTING-SPACE-CUSTOM . "")',
+        '(CIP-GROUTING-OFFSET-IDX . "0")',
+        '(CIP-GROUTING-OFFSET-CUSTOM . "")',
+        f'(WATER-CHK . "{water_chk}")',
+        f'(WATER-DEPTH . {water_depth:.2f})',
+        '(SHOTCRETE-ENABLE . "1")',
+        '(SHOTCRETE-CHK . "0")',
+        '(SHOTCRETE-LAYER . "")',
+        "(SHOTCRETE-THICK . 0.0)",
+        ("(SUPPORT-LIST " + " ".join(sup_items) + ")") if sup_items else "(SUPPORT-LIST)",
+        f"(CORNER-BRACE . {corner_brace_str})",
+        upg_pair_str,
+        f"(V-START . {vs_str})",
+        f"(V-END . {ve_str})",
+        f"(ANGLE . {ang:.12f})",
+        f"(LENGTH . {length:.12f})",
+    ]
+    return "(" + " ".join(pairs) + ")"
+
+
+def split_csv_segment_line(line_str):
+    cols = line_str.split(",")
+    if len(cols) == 13:
+        return cols
+    fixed_head = cols[:10]
+    rest = ",".join(cols[10:])
+    rem_items = []
+    i = 0
+    n = len(rest)
+    for _ in range(2):
+        while i < n and rest[i].isspace():
+            i += 1
+        if rest[i:i+3] == "nil":
+            rem_items.append("nil")
+            i += 3
+        elif rest[i] == "(":
+            end_i = find_balanced_paren(rest, i)
+            rem_items.append(rest[i:end_i+1])
+            i = end_i + 1
+        while i < n and rest[i] != ",":
+            i += 1
+        if i < n and rest[i] == ",":
+            i += 1
+    rem_items.append(rest[i:])
+    return fixed_head + rem_items
+
+
+def _resolve_seg_effective_geox(seg, geox_pool, at_end=False):
+    sub_zones = seg.get("sub_zones") or []
+    defined_zones = [
+        (sz, apply_param_override(geox_pool.get(sz.get("geox_key")), get_param_override(sz)))
+        for sz in sub_zones
+        if sz.get("geox_key") and sz.get("geox_key") in geox_pool
+    ]
+    if defined_zones:
+        if at_end:
+            _, zd = max(defined_zones, key=lambda item: float(item[0].get("end_m", 0.0)))
+        else:
+            _, zd = min(defined_zones, key=lambda item: float(item[0].get("start_m", 0.0)))
+        return zd
+    gkey = seg.get("geox_key")
+    return apply_param_override(geox_pool.get(gkey) if gkey else None, get_param_override(seg))
+
+
+def build_complete_tsp_csv_lines(proj_name, scale_s, scale_p, orient, segments, geox_pool, orig_csv_lines=None, boundary_record=None):
+    seg_alist_strs = []
+    seg_csv_rows = []
+    first_defined_geox = None
+    num_segs = len(segments)
+    is_closed_loop = False
+    if num_segs > 1:
+        p_first = segments[0]["v_start"]
+        p_last = segments[-1]["v_end"]
+        is_closed_loop = (dist_2d(p_first, p_last) < 1.0)
+
+    for seg_i, seg in enumerate(segments):
+        sid = seg["id"]
+        sub_zones = seg.get("sub_zones") or []
+        defined_zones = [
+            (sz, apply_param_override(geox_pool.get(sz.get("geox_key")), get_param_override(sz)))
+            for sz in sub_zones
+            if sz.get("geox_key") and sz.get("geox_key") in geox_pool
+        ]
+
+        gkey = seg.get("geox_key")
+        seg_ov = get_param_override(seg)
+        gdata = apply_param_override(geox_pool.get(gkey) if gkey else None, seg_ov)
+
+        combined_sup_items = None
+        if defined_zones:
+            best_sz, best_gdata = max(defined_zones, key=lambda item: get_geox_wall_stiffness_key(item[1]))
+            gdata = dict(best_gdata)
+            best_wale_sz, best_wale_g = max(defined_zones, key=lambda item: item[1]["wale_custom"][0])
+            gdata["wale_spec"] = best_wale_g["wale_spec"]
+            gdata["wale_custom"] = best_wale_g["wale_custom"]
+            gdata["cip_wale_idx"] = best_wale_g["cip_wale_idx"]
+
+            vs = seg["v_start"]
+            ang = seg["angle"]
+            seg_len_m = seg["length"] / 1000.0
+            combined_sup_items = []
+            for z_idx, (sz, zd) in enumerate(defined_zones, start=1):
+                s_m = max(0.0, min(seg_len_m, float(sz.get("start_m", 0.0))))
+                e_m = max(0.0, min(seg_len_m, float(sz.get("end_m", seg_len_m))))
+                if e_m < s_m:
+                    s_m, e_m = e_m, s_m
+                p1 = (vs[0] + s_m * 1000.0 * math.cos(ang), vs[1] + s_m * 1000.0 * math.sin(ang), 0.0)
+                p2 = (vs[0] + e_m * 1000.0 * math.cos(ang), vs[1] + e_m * 1000.0 * math.sin(ang), 0.0)
+                combined_sup_items.extend(format_lisp_supports(zd["supports"], zd["wale_spec"], (p1, p2)))
+
+            seg["hole_no"] = best_sz.get("hole_no", f"BH-{sid}")
+            seg["water_chk"] = best_sz.get("water_chk", "0")
+            seg["water_depth"] = float(best_sz.get("water_depth", 0.0))
+
+        if gdata and first_defined_geox is None:
+            first_defined_geox = gdata
+
+        ckey = seg.get("corner_geox_key")
+        cdata = geox_pool.get(ckey) if ckey else None
+        brace_str = format_lisp_corner_brace(seg, cdata)
+
+        prev_seg_obj = None
+        if seg_i > 0:
+            prev_seg_obj = segments[seg_i - 1]
+        elif is_closed_loop and num_segs > 1:
+            prev_seg_obj = segments[-1]
+        curr_corner_gdata = _resolve_seg_effective_geox(seg, geox_pool, at_end=False)
+        prev_corner_gdata = _resolve_seg_effective_geox(prev_seg_obj, geox_pool, at_end=True) if prev_seg_obj else None
+        upg_wale_str = format_lisp_upgrade_wale(curr_corner_gdata, prev_corner_gdata, cdata)
+
+        hole_no = seg.get("hole_no", f"BH-{sid}")
+        w_chk = seg.get("water_chk", "0")
+        w_dep = float(seg.get("water_depth", 0.0))
+
+        if seg.get("raw_alist_override") and gdata is not None and not defined_zones:
+            raw_alist = update_seg_alist_string(
+                seg["raw_alist_override"], gdata, hole_no, w_chk, w_dep, brace_str, upg_wale_str
+            )
+        elif seg.get("raw_alist_override") and gkey == "__KEEP_ORIG__" and not defined_zones:
+            raw_alist = update_seg_alist_string(
+                seg["raw_alist_override"], None, hole_no, w_chk, w_dep, brace_str if cdata else None, upg_wale_str if cdata else None
+            )
+        else:
+            raw_alist = build_fresh_seg_alist_string(seg, gdata, brace_str, upg_wale_str)
+
+        if sub_zones:
+            sub_zones_lisp = format_lisp_sub_zones(seg, geox_pool)
+            elems = parse_top_level_elements(raw_alist)
+            new_elems = []
+            for el in elems:
+                inner = el[1:-1].strip()
+                k = inner.split()[0] if inner else ""
+                if k == "SUPPORT-LIST" and combined_sup_items is not None:
+                    new_elems.append(("(SUPPORT-LIST " + " ".join(combined_sup_items) + ")") if combined_sup_items else "(SUPPORT-LIST)")
+                elif k == "SUB-ZONES":
+                    continue
+                else:
+                    new_elems.append(el)
+            if sub_zones_lisp:
+                new_elems.append(sub_zones_lisp)
+            raw_alist = "(" + " ".join(new_elems) + ")"
+
+        # [패치] 세그먼트 기하를 직접 수정한 경우에도 ALIST 내부 좌표/각도/길이가 어긋나지 않도록 동기화
+        if seg.get("raw_alist_override"):
+            raw_alist = sync_alist_geometry(raw_alist, seg)
+        raw_alist = apply_override_pairs(raw_alist, seg_ov)
+
+        seg_alist_strs.append(raw_alist)
+
+        vs = seg["v_start"]
+        ve = seg["v_end"]
+        vs_str = f"({vs[0]:.12f} {vs[1]:.12f} {vs[2]:.12f})"
+        ve_str = f"({ve[0]:.12f} {ve[1]:.12f} {ve[2]:.12f})"
+        ang_str = f'{seg["angle"]:.12f}'
+        len_str = f'{seg["length"]:.12f}'
+
+        if gdata is not None:
+            w_type = gdata["wall_type"]
+            w_spec = gdata["wall_spec"]
+            ctc_s = f'{gdata["ctc"]:.3f}'
+            max_d_s = f'{gdata["max_depth"]:.3f}'
+            sup_items = combined_sup_items if combined_sup_items is not None else format_lisp_supports(gdata["supports"], gdata["wale_spec"])
+            sup_s = "(" + " ".join(sup_items) + ")" if sup_items else "nil"
+        elif gkey == "__KEEP_ORIG__" and seg.get("orig_cols"):
+            ocols = seg["orig_cols"]
+            w_type, w_spec, ctc_s, max_d_s, sup_s = (
+                ocols[2], ocols[7], ocols[8], ocols[9], ocols[10]
+            )
+            if seg_ov.get("wall_type"):
+                w_type = seg_ov["wall_type"]
+            if seg_ov.get("wall_spec"):
+                w_spec = parse_h_dims(seg_ov["wall_spec"])[1]
+            if seg_ov.get("ctc") is not None:
+                _f = _ov_float(seg_ov["ctc"])
+                if _f is not None:
+                    ctc_s = "%.3f" % _f
+            if seg_ov.get("max_depth") is not None:
+                _f = _ov_float(seg_ov["max_depth"])
+                if _f is not None:
+                    max_d_s = "%.3f" % _f
+            if not cdata:
+                brace_str = ocols[11]
+        else:
+            w_type = seg_ov.get("wall_type") or "HPILE"
+            w_spec = parse_h_dims(seg_ov["wall_spec"])[1] if seg_ov.get("wall_spec") else "H 300×300×10/15"
+            ctc_s = "2.000"
+            max_d_s = "10.000"
+            _f = _ov_float(seg_ov.get("ctc")) if seg_ov.get("ctc") is not None else None
+            if _f is not None:
+                ctc_s = "%.3f" % _f
+            _f = _ov_float(seg_ov.get("max_depth")) if seg_ov.get("max_depth") is not None else None
+            if _f is not None:
+                max_d_s = "%.3f" % _f
+            sup_s = "nil"
+
+        row_str = ",".join([
+            "SEGMENT", str(sid), w_type, vs_str, ve_str, ang_str, len_str,
+            w_spec, ctc_s, max_d_s, sup_s, brace_str, raw_alist
+        ])
+        seg_csv_rows.append(row_str)
+
+    if orig_csv_lines:
+        out_lines = []
+        seg_row_idx = 0
+        for line in orig_csv_lines:
+            if line.startswith("#GLOBAL,"):
+                out_lines.append(f"#GLOBAL,PROJECT_NAME,{proj_name},SCALE_S,{scale_s},SCALE_P,{scale_p},ORIENT,{orient}")
+            elif line.startswith("#GLOBAL_RAW,"):
+                raw_str = line[len("#GLOBAL_RAW,"):]
+                pack_elems = parse_top_level_elements(raw_str)
+                pack_elems[0] = "(" + " ".join(seg_alist_strs) + ")"
+                out_lines.append("#GLOBAL_RAW,(" + " ".join(pack_elems) + ")")
+            elif line.startswith("SEGMENT,"):
+                if seg_row_idx < len(seg_csv_rows):
+                    out_lines.append(seg_csv_rows[seg_row_idx])
+                    seg_row_idx += 1
+            else:
+                out_lines.append(line)
+        while seg_row_idx < len(seg_csv_rows):
+            out_lines.append(seg_csv_rows[seg_row_idx])
+            seg_row_idx += 1
+        return out_lines
+
+    ref_g = first_defined_geox
+    if ref_g:
+        wc = ref_g["wall_custom"]
+        wlc = ref_g["wale_custom"]
+        soil_lisp = format_lisp_soil_data(ref_g["soil_layers"])[len("(SOIL-DATA"): -1].strip()
+        soil_pack_str = f"({soil_lisp})" if soil_lisp else "nil"
+        sup_items = format_lisp_supports(ref_g["supports"])
+        sup_pack_str = "(" + " ".join(sup_items) + ")" if sup_items else "nil"
+        global_raw_elems = [
+            "(" + " ".join(seg_alist_strs) + ")",
+            f'"{ref_g["wall_spec"]}"',
+            f"({wc[0]} {wc[1]} {wc[2]} {wc[3]})",
+            f'"{ref_g["wale_spec"]}"',
+            f"({wlc[0]} {wlc[1]} {wlc[2]} {wlc[3]})",
+            f'{ref_g["ctc"]:.2f}',
+            "60",
+            f'{ref_g["max_depth"]:.2f}',
+            f'{ref_g["embed_depth"]:.2f}',
+            soil_pack_str,
+            f'"{ref_g["water_chk"]}"',
+            f'{ref_g["water_depth"]:.2f}',
+            sup_pack_str,
+            str(scale_s),
+            str(scale_p),
+            "nil",
+            "nil",
+            str(orient),
+            "nil",
+        ]
+    else:
+        global_raw_elems = [
+            "(" + " ".join(seg_alist_strs) + ")",
+            '"H 300×300×10/15"',
+            "(300 300 10 15)",
+            '"H 300×300×10/15"',
+            "(300 300 10 15)",
+            "2.0",
+            "60",
+            "10.0",
+            "3.0",
+            "nil",
+            '"0"',
+            "0.0",
+            "nil",
+            str(scale_s),
+            str(scale_p),
+            "nil",
+            "nil",
+            str(orient),
+            "nil",
+        ]
+
+    out_lines = [
+        f"#GLOBAL,PROJECT_NAME,{proj_name},SCALE_S,{scale_s},SCALE_P,{scale_p},ORIENT,{orient}",
+        "#GLOBAL_RAW,(" + " ".join(global_raw_elems) + ")",
+    ]
+        if ref_g and ref_g["soil_layers"]:
+        for lyr in ref_g["soil_layers"]:
+            out_lines.append(
+                f'#SOIL,("{lyr["name"]}" {lyr["depth"]:.2f} "{lyr["pat"]}" {lyr["scale"]:.2f} {lyr["ang"]:.1f} "{lyr["type_name"]}" {lyr["phi"]:.1f})'
+            )
+    if boundary_record and len(boundary_record) == 2 and boundary_record[1]:
+        b_closed, b_verts = boundary_record
+        b_pts_str = " ".join(f"({v[0]:.12f} {v[1]:.12f})" for v in b_verts)
+        out_lines.append(f"#BOUNDARY,{1 if b_closed else 0},{b_pts_str} ")
+    out_lines.append("#HEADER,ID,TYPE,V-START,V-END,ANGLE,LENGTH,WALL-SPEC,CTC,MAX-DEPTH,SUPPORT-LIST,CORNER-BRACE,RAW-DATA")
+    out_lines.extend(seg_csv_rows)
+    return out_lines
+
+
+def fetch_boundary_from_autocad():
+    import win32com.client
+    import pythoncom
+    try:
+        acad = win32com.client.GetActiveObject("AutoCAD.Application")
+    except Exception:
+        acad = win32com.client.Dispatch("AutoCAD.Application")
+    try:
+        acad.Visible = True
+    except Exception:
+        pass
+    doc = acad.ActiveDocument
+    util = doc.Utility
+    util.Prompt("\n========================================\n")
+    util.Prompt("[GeoX->TSP] AutoCAD 화면에서 1. 굴착 경계선(Polyline)을 클릭하세요...\n")
+    ent = None
+    try:
+        res = util.GetEntity(None, "\n[GeoX->TSP] 1. 굴착 경계선(Polyline)을 선택하세요: ")
+        ent = res[0] if isinstance(res, tuple) else res
+    except Exception:
+        ss_name = "TSP_TEMP_SEL"
+        try:
+            doc.SelectionSets.Item(ss_name).Delete()
+        except Exception:
+            pass
+        ss = doc.SelectionSets.Add(ss_name)
+        util.Prompt("\n[GeoX->TSP] 1. 굴착 경계선(Polyline) 1개를 선택하고 Enter(우클릭)를 누르세요: ")
+        ss.SelectOnScreen()
+        if ss.Count < 1:
+            ss.Delete()
+            raise ValueError("선택된 경계선 객체가 없습니다.")
+        ent = ss.Item(0)
+        ss.Delete()
+
+    obj_name = ent.ObjectName
+    if "Polyline" not in obj_name:
+        raise ValueError(f"선택한 객체({obj_name})가 폴리선(Polyline)이 아닙니다.")
+
+    coords = list(ent.Coordinates)
+    step = 2 if obj_name == "AcDbPolyline" else 3
+    vertices = []
+    for i in range(0, len(coords), step):
+        vertices.append((float(coords[i]), float(coords[i + 1]), 0.0))
+
+    is_closed = bool(getattr(ent, "Closed", False))
+    if len(vertices) >= 2 and dist_2d(vertices[0], vertices[-1]) <= 0.1:
+        is_closed = True
+        vertices.pop()
+
+    if len(vertices) < 2:
+        raise ValueError("유효한 정점이 2개 미만입니다.")
+
+    if is_closed:
+        boundary_orient = get_polygon_orientation(vertices)
+    else:
+        pt_out = util.GetPoint(pythoncom.Empty, "\n[GeoX->TSP] 2. 파일설치 위치(Outside, 굴착 배면)를 클릭하세요: ")
+        user_out_pt = (float(pt_out[0]), float(pt_out[1]), 0.0)
+        boundary_orient = calc_orientation_by_closest_segment(vertices, user_out_pt)
+
+    pt_start = util.GetPoint(pythoncom.Empty, "\n[GeoX->TSP] 3. 세그먼 시작점(No.1)이 될 모서리 위치를 클릭하세요: ")
+    user_start_pt = (float(pt_start[0]), float(pt_start[1]), 0.0)
+
+    if is_closed:
+        poly_orient = get_polygon_orientation(vertices)
+        if poly_orient == 1:
+            vertices = list(reversed(vertices))
+            boundary_orient = -boundary_orient
+        best_idx = min(range(len(vertices)), key=lambda idx: dist_2d(vertices[idx], user_start_pt))
+        vertices = vertices[best_idx:] + vertices[:best_idx]
+    else:
+        d_start = dist_2d(vertices[0], user_start_pt)
+        d_end = dist_2d(vertices[-1], user_start_pt)
+        if d_end < d_start:
+            vertices = list(reversed(vertices))
+            boundary_orient = -boundary_orient
+
+        raw_vertices = [(float(c[0]), float(c[1]), 0.0) for c in (
+        [(coords[i], coords[i + 1]) for i in range(0, len(coords), step)]
+    )]
+    if len(raw_vertices) >= 2 and dist_2d(raw_vertices[0], raw_vertices[-1]) <= 0.1:
+        raw_vertices.pop()
+    boundary_record = (1 if is_closed else 0, raw_vertices)
+
+    vertices = filter_collinear_vertices(vertices, is_closed, tol_deg=5.0)
+    ent_handle = str(getattr(ent, "Handle", ""))
+    segs = build_segments_from_vertices(vertices, is_closed, boundary_orient, geo_known=True)
+    util.Prompt(f"\n[완료] 총 {len(segs)}개의 세그먼트 기하 정보를 파이썬 프로그램으로 가져왔습니다.\n")
+    return segs, boundary_orient, ent_handle, user_start_pt, boundary_record
+
+
+# ==============================================================================
+# [Tkinter GUI 메인 클래스]
+# ==============================================================================
+class GeoXToTspApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("GeoX 단면 데이터 -> TSP 다중 세그먼트 생성/연동 프로그램")
+        # 기본 창 크기 및 최소 크기 설정 후 시작 시 창 최대화(zoomed) 적용
+        self.root.geometry("1240x780")
+        self.root.minsize(900, 600)
+        try:
+            self.root.state("zoomed")
+        except Exception:
+            try:
+                sw = self.root.winfo_screenwidth()
+                sh = self.root.winfo_screenheight()
+                self.root.geometry(f"{sw}x{sh}+0+0")
+            except Exception:
+                pass
+
+        self.csv_filepath = ""
+        self.orig_csv_lines = None
+        self.cad_ent_handle = ""
+        self.cad_start_pt = None
+        self.has_boundary_data = False
+        self.project_name_var = tk.StringVar(value="Project")
+        self.scale_sec_var = tk.StringVar(value="200")
+        self.scale_plan_var = tk.StringVar(value="600")
+        self.boundary_orient = 1
+
+        self.cur_hole_var = tk.StringVar(value="BH-1")
+        self.cur_water_chk_var = tk.BooleanVar(value=False)
+        self.cur_water_depth_var = tk.StringVar(value="0.0")
+
+        self.segments = []
+        self.geox_pool = {}
+
+        self._build_ui()
+        self.create_virtual_segments(4)
+
+    def _build_ui(self):
+        pad = {"padx": 8, "pady": 4}
+
+        # ======================================================================
+        # 1. 상단 프레임: 작은 모니터에서도 잘리지 않도록 2줄(Row 1 / Row 2) 분리 배치
+        # ======================================================================
+        frm_top = ttk.LabelFrame(
+            self.root,
+            text=" 1. 세그먼트(구간) 구성 방식 선택 (가상 생성 / CAD 경계선 직접 연동 / 기존 TSP CSV 로드) "
+        )
+        frm_top.pack(fill="x", **pad)
+
+        # [상단 1행] 세그먼트 생성 / 추가 / 삭제 / 구간 분할 및 해제 버튼 그룹
+        frm_top_row1 = ttk.Frame(frm_top)
+        frm_top_row1.pack(fill="x", padx=6, pady=(4, 2))
+
+        ttk.Label(frm_top_row1, text="세그먼트 수:").pack(side="left", padx=(2, 2))
+        self.spn_seg_cnt = ttk.Spinbox(frm_top_row1, from_=1, to=99, width=5)
+        self.spn_seg_cnt.set(4)
+        self.spn_seg_cnt.pack(side="left", padx=(0, 4))
+
+        ttk.Button(
+            frm_top_row1, text="새 세그먼트 N개 생성(초기화)",
+            command=lambda: self.create_virtual_segments(int(self.spn_seg_cnt.get() or 4))
+        ).pack(side="left", padx=2)
+
+        ttk.Button(frm_top_row1, text="+ 세그먼트 추가", command=self.add_one_segment).pack(side="left", padx=2)
+        ttk.Button(frm_top_row1, text="- 선택 세그먼트 삭제", command=self.delete_selected_segments).pack(side="left", padx=2)
+
+        ttk.Separator(frm_top_row1, orient="vertical").pack(side="left", fill="y", padx=6, pady=2)
+
+        ttk.Button(frm_top_row1, text="🔀 선택 세그먼트 구간 분할", command=self.open_split_segment_dialog).pack(side="left", padx=2)
+        ttk.Button(frm_top_row1, text="🔗 분할 해제(단일화)", command=self.unsplit_selected_segments).pack(side="left", padx=2)
+
+        ttk.Separator(frm_top_row1, orient="vertical").pack(side="left", fill="y", padx=6, pady=2)
+        ttk.Button(frm_top_row1, text="✏️ 좌표/길이 직접 편집...", command=self.open_segment_geometry_dialog).pack(side="left", padx=2)
+
+        # [상단 2행] CAD 경계선 연동 / CSV 불러오기 / 프로젝트명 및 축척 입력 그룹
+        frm_top_row2 = ttk.Frame(frm_top)
+        frm_top_row2.pack(fill="x", padx=6, pady=(2, 4))
+
+        ttk.Button(frm_top_row2, text="📐 CAD에서 경계선 직접 가져오기", command=self.load_from_autocad).pack(side="left", padx=(2, 4))
+        ttk.Button(frm_top_row2, text="📂 기존 TSP CSV 불러오기...", command=self.load_tsp_csv).pack(side="left", padx=2)
+
+        ttk.Separator(frm_top_row2, orient="vertical").pack(side="left", fill="y", padx=8, pady=2)
+
+        ttk.Label(frm_top_row2, text="프로젝트명:").pack(side="left", padx=(2, 2))
+        ttk.Entry(frm_top_row2, textvariable=self.project_name_var, width=16).pack(side="left", padx=(0, 8))
+
+        ttk.Label(frm_top_row2, text="단면축척 1/:").pack(side="left", padx=(2, 2))
+        ttk.Entry(frm_top_row2, textvariable=self.scale_sec_var, width=6).pack(side="left", padx=(0, 8))
+
+        ttk.Label(frm_top_row2, text="평면축척 1/:").pack(side="left", padx=(2, 2))
+        ttk.Entry(frm_top_row2, textvariable=self.scale_plan_var, width=6).pack(side="left", padx=(0, 4))
+
+        # [상단 3행] 현재 상태 안내 라벨
+        self.lbl_status_source = ttk.Label(
+            frm_top, text="현재 모드: 가상 세그먼트 (기준 CSV 없이 GeoX 데이터만으로 생성 가능)", foreground="#0055aa"
+        )
+        self.lbl_status_source.pack(fill="x", padx=8, pady=(0, 4))
+
+        # ======================================================================
+        # 2. 중앙 영역: 마우스로 좌/우 영역 폭 조절이 가능한 PanedWindow 적용
+        # ======================================================================
+        self.paned_mid = ttk.PanedWindow(self.root, orient="horizontal")
+        self.paned_mid.pack(fill="both", expand=True, **pad)
+
+        frm_left = ttk.LabelFrame(
+            self.paned_mid,
+            text=" 세그먼트(구간) 목록 — 셀 더블클릭=값 수정 / 우클릭=편집 메뉴 / Ctrl·Shift 클릭=다중 선택 (경계선 드래그로 좌우 폭 조절 가능) "
+        )
+
+        # 좌측 표 내부 레이아웃 (수직 + 수평 스크롤바 모두 지원)
+        frm_tree_container = ttk.Frame(frm_left)
+        frm_tree_container.pack(fill="both", expand=True, padx=6, pady=6)
+        frm_tree_container.rowconfigure(0, weight=1)
+        frm_tree_container.columnconfigure(0, weight=1)
+
+        cols = ("id", "geox", "hole", "water", "type", "cip", "hpile", "ctc", "depth", "sup_cnt", "brace", "len", "ang")
+        self.tree_seg = ttk.Treeview(frm_tree_container, columns=cols, show="headings", height=16, selectmode="extended")
+        self.tree_seg.heading("id", text="구간")
+        self.tree_seg.heading("geox", text="할당된 일반단면 ✎")
+        self.tree_seg.heading("hole", text="시추공 ✎")
+        self.tree_seg.heading("water", text="지하수위 ✎")
+        self.tree_seg.heading("type", text="벽체공법 ✎")
+        self.tree_seg.heading("cip", text="CIP직경(mm) ✎")
+        self.tree_seg.heading("hpile", text="H-Pile 규격 ✎")
+        self.tree_seg.heading("ctc", text="CTC(m) ✎")
+        self.tree_seg.heading("depth", text="굴착깊이 ✎")
+        self.tree_seg.heading("sup_cnt", text="지보재")
+        self.tree_seg.heading("brace", text="코너 사보강재 ✎")
+        self.tree_seg.heading("len", text="길이(m) ✎")
+        self.tree_seg.heading("ang", text="각도(°) ✎")
+
+        self.tree_seg.column("id", width=55, minwidth=45, anchor="center")
+        self.tree_seg.column("geox", width=130, minwidth=90, anchor="w")
+        self.tree_seg.column("hole", width=60, minwidth=50, anchor="center")
+        self.tree_seg.column("water", width=65, minwidth=55, anchor="center")
+        self.tree_seg.column("type", width=70, minwidth=55, anchor="center")
+        self.tree_seg.column("cip", width=78, minwidth=60, anchor="center")
+        self.tree_seg.column("hpile", width=125, minwidth=95, anchor="center")
+        self.tree_seg.column("ctc", width=58, minwidth=48, anchor="center")
+        self.tree_seg.column("depth", width=68, minwidth=55, anchor="center")
+        self.tree_seg.column("sup_cnt", width=60, minwidth=50, anchor="center")
+        self.tree_seg.column("brace", width=115, minwidth=80, anchor="center")
+        self.tree_seg.column("len", width=65, minwidth=55, anchor="e")
+        self.tree_seg.column("ang", width=60, minwidth=50, anchor="e")
+
+        scr_seg_y = ttk.Scrollbar(frm_tree_container, orient="vertical", command=self.tree_seg.yview)
+        scr_seg_x = ttk.Scrollbar(frm_tree_container, orient="horizontal", command=self.tree_seg.xview)
+        self.tree_seg.configure(yscrollcommand=scr_seg_y.set, xscrollcommand=scr_seg_x.set)
+
+        self.tree_seg.grid(row=0, column=0, sticky="nsew")
+        scr_seg_y.grid(row=0, column=1, sticky="ns")
+        scr_seg_x.grid(row=1, column=0, sticky="ew")
+
+        # [패치] 세그먼트 목록 직접 편집: 더블클릭 = 셀 값 수정, 우클릭 = 편집 메뉴
+        self.tree_seg.bind("<Double-1>", self.on_seg_double_click)
+        self.tree_seg.bind("<Button-3>", self.on_seg_right_click)
+        self.tree_seg.bind("<MouseWheel>", lambda e: self._cell_editor_destroy())
+        self.tree_seg.bind("<Button-4>", lambda e: self._cell_editor_destroy())
+        self.tree_seg.bind("<Button-5>", lambda e: self._cell_editor_destroy())
+
+        self.menu_seg = tk.Menu(self.root, tearoff=0)
+        self.menu_seg.add_command(label="값 직접 편집 (셀 더블클릭)", state="disabled")
+        self.menu_seg.add_separator()
+        self.menu_seg.add_command(label="📐 좌표 / 길이 / 각도 상세 편집...", command=self.open_segment_geometry_dialog)
+        self.menu_seg.add_separator()
+        self.menu_seg.add_command(label="▶ 현재 GeoX 단면 할당", command=self.assign_geox_to_selected_segments)
+        self.menu_seg.add_command(label="🧹 할당 해제", command=self.clear_selected_segments)
+        self.menu_seg.add_separator()
+        self.menu_seg.add_command(label="🔀 선택 구간 분할...", command=self.open_split_segment_dialog)
+        self.menu_seg.add_command(label="🔗 분할 해제(단일화)", command=self.unsplit_selected_segments)
+        self.menu_seg.add_separator()
+        self.menu_seg.add_command(label="➖ 선택 세그먼트 삭제", command=self.delete_selected_segments)
+
+        frm_right = ttk.Frame(self.paned_mid, width=440)
+
+        # PanedWindow에 좌측(가중치 3) 및 우측(가중치 2) 패널 추가
+        self.paned_mid.add(frm_left, weight=3)
+        self.paned_mid.add(frm_right, weight=2)
+
+        frm_pool = ttk.LabelFrame(frm_right, text=" 2. 다중 GeoX 단면 엑셀(.xlsx) 라이브러리 ")
+        frm_pool.pack(fill="x", pady=(0, 6))
+
+        frm_pool_btns = ttk.Frame(frm_pool)
+        frm_pool_btns.pack(fill="x", padx=6, pady=4)
+
+        ttk.Button(
+            frm_pool_btns, text="➕ GeoX 엑셀 추가 (다중선택 가능)...", command=self.add_geox_files
+        ).pack(side="left", padx=2)
+        ttk.Button(
+            frm_pool_btns, text="➖ 선택 단면 제거", command=self.remove_selected_geox
+        ).pack(side="right", padx=2)
+
+        self.lst_geox = tk.Listbox(frm_pool, height=5, exportselection=False, font=("맑은 고딕", 9))
+        self.lst_geox.pack(fill="x", padx=6, pady=(0, 6))
+        self.lst_geox.bind("<<ListboxSelect>>", self.on_geox_select)
+
+        frm_edit = ttk.LabelFrame(
+            frm_right, text=" 3. 선택한 GeoX 단면의 시추공 / 지하수위 수정 (수정 후 할당 시 적용됨) "
+        )
+        frm_edit.pack(fill="x", pady=(0, 6))
+
+        frm_edit_inner = ttk.Frame(frm_edit)
+        frm_edit_inner.pack(fill="x", padx=6, pady=6)
+
+        ttk.Label(frm_edit_inner, text="시추공(HOLE-NO):").pack(side="left", padx=(0, 2))
+        ent_hole = ttk.Entry(frm_edit_inner, textvariable=self.cur_hole_var, width=9)
+        ent_hole.pack(side="left", padx=(0, 8))
+
+        chk_w = ttk.Checkbutton(
+            frm_edit_inner, text="지하수위 표시", variable=self.cur_water_chk_var, command=self.on_geox_param_edit
+        )
+        chk_w.pack(side="left", padx=(2, 2))
+
+        ttk.Label(frm_edit_inner, text="GL -").pack(side="left", padx=(2, 0))
+        self.ent_water_d = ttk.Entry(frm_edit_inner, textvariable=self.cur_water_depth_var, width=5)
+        self.ent_water_d.pack(side="left", padx=2)
+        ttk.Label(frm_edit_inner, text="m").pack(side="left", padx=(0, 6))
+
+        btn_apply_param = ttk.Button(frm_edit_inner, text="수정값 반영", command=self.on_geox_param_edit)
+        btn_apply_param.pack(side="left", padx=2)
+
+        ent_hole.bind("<FocusOut>", lambda e: self.on_geox_param_edit())
+        self.ent_water_d.bind("<FocusOut>", lambda e: self.on_geox_param_edit())
+        ent_hole.bind("<Return>", lambda e: self.on_geox_param_edit())
+        self.ent_water_d.bind("<Return>", lambda e: self.on_geox_param_edit())
+
+        frm_preview = ttk.LabelFrame(frm_right, text=" 선택한 GeoX 단면 상세 미리보기 ")
+        frm_preview.pack(fill="both", expand=True)
+
+        frm_prev_inner = ttk.Frame(frm_preview)
+        frm_prev_inner.pack(fill="both", expand=True, padx=6, pady=6)
+
+        scr_prev_y = ttk.Scrollbar(frm_prev_inner, orient="vertical")
+        self.txt_preview = tk.Text(
+            frm_prev_inner, width=45, height=12, font=("맑은 고딕", 9),
+            yscrollcommand=scr_prev_y.set
+        )
+        scr_prev_y.config(command=self.txt_preview.yview)
+        self.txt_preview.pack(side="left", fill="both", expand=True)
+        scr_prev_y.pack(side="right", fill="y")
+
+        # ======================================================================
+        # 3. 하단 프레임: 작은 모니터에서 버튼 충돌/생략이 없도록 2줄 분리 배치
+        # ======================================================================
+        frm_btn = ttk.LabelFrame(
+            self.root,
+            text=" 4. 세그먼트 할당 및 CSV 생성 / AutoCAD 작도 (Corner Strut 파일은 사보강 가능 코너에만 자동 할당됨) "
+        )
+        frm_btn.pack(fill="x", **pad)
+
+        # [하단 1행] 세그먼트 단면 할당 및 해제 버튼 그룹
+        frm_btn_row1 = ttk.Frame(frm_btn)
+        frm_btn_row1.pack(fill="x", padx=6, pady=(4, 2))
+
+        ttk.Label(frm_btn_row1, text="■ 단면 할당:", font=("맑은 고딕", 9, "bold")).pack(side="left", padx=(2, 6))
+
+        ttk.Button(
+            frm_btn_row1,
+            text="▶ 선택한 세그먼트(들)에 현재 GeoX 할당",
+            command=self.assign_geox_to_selected_segments
+        ).pack(side="left", padx=4, pady=2, ipadx=6, ipady=2)
+
+        ttk.Button(
+            frm_btn_row1,
+            text="⏩ 전체 세그먼트에 현재 GeoX 일괄 할당",
+            command=self.assign_geox_to_all_segments
+        ).pack(side="left", padx=4, pady=2, ipadx=6, ipady=2)
+
+        ttk.Button(
+            frm_btn_row1,
+            text="🧹 선택한 세그먼트 비워두기 (할당 해제)",
+            command=self.clear_selected_segments
+        ).pack(side="left", padx=4, pady=2, ipadx=6, ipady=2)
+
+        # [하단 2행] AutoCAD 즉시 작도 및 CSV 파일 저장 버튼 그룹
+        frm_btn_row2 = ttk.Frame(frm_btn)
+        frm_btn_row2.pack(fill="x", padx=6, pady=(2, 4))
+
+        ttk.Label(frm_btn_row2, text="■ 도면 작도 및 저장:", font=("맑은 고딕", 9, "bold")).pack(side="left", padx=(2, 6))
+
+        ttk.Button(
+            frm_btn_row2,
+            text="📐 AutoCAD 평면도 즉시 작도",
+            command=self.direct_draw_plan_in_autocad
+        ).pack(side="left", padx=4, pady=2, ipadx=6, ipady=2)
+
+        ttk.Button(
+            frm_btn_row2,
+            text="📏 AutoCAD 단면도 즉시 작도",
+            command=self.direct_draw_section_in_autocad
+        ).pack(side="left", padx=4, pady=2, ipadx=6, ipady=2)
+
+        ttk.Button(
+            frm_btn_row2,
+            text="📊 AutoCAD 전개도 즉시 작도",
+            command=self.direct_draw_elevation_in_autocad
+        ).pack(side="left", padx=4, pady=2, ipadx=6, ipady=2)
+
+        ttk.Separator(frm_btn_row2, orient="vertical").pack(side="left", fill="y", padx=8, pady=2)
+
+        ttk.Button(
+            frm_btn_row2,
+            text="💾 CSV 파일 저장",
+            command=self.save_tsp_csv
+        ).pack(side="left", padx=4, pady=2, ipadx=8, ipady=2)
+
+    def create_virtual_segments(self, count):
+        if count < 1:
+            count = 1
+        self.csv_filepath = ""
+        self.orig_csv_lines = None
+        self.cad_ent_handle = ""
+        self.cad_start_pt = None
+        self.has_boundary_data = False
+        self.boundary_orient = 1
+
+        verts = []
+        if count == 4:
+            verts = [(0.0, 0.0, 0.0), (0.0, 20000.0, 0.0), (30000.0, 20000.0, 0.0), (30000.0, 0.0, 0.0)]
+            is_closed = True
+            orient = -1
+        else:
+            for i in range(count + 1):
+                verts.append((float(i * 20000.0), 0.0, 0.0))
+            is_closed = False
+            orient = 1
+
+        self.boundary_orient = orient
+        self.segments = build_segments_from_vertices(verts, is_closed, orient, geo_known=False)
+        self.lbl_status_source.config(
+            text=f"현재 모드: 가상 세그먼트 {count}개 (캐드에서 [기존 경계선에 적용(B)] 또는 [단면도 전용(S)]으로 즉시 사용 가능)"
+        )
+        self.refresh_segment_table()
+
+    def add_one_segment(self):
+        new_id = len(self.segments) + 1
+        last_end = self.segments[-1]["v_end"] if self.segments else (0.0, 0.0, 0.0)
+        new_end = (last_end[0] + 20000.0, last_end[1], 0.0)
+        self.segments.append({
+            "id": new_id,
+            "v_start": last_end,
+            "v_end": new_end,
+            "angle": 0.0,
+            "length": 20000.0,
+            "can_have_brace": True,
+            "geo_known": False,
+            "corner_brace_str": '("Y" nil "1" "0" "0.0" "1" "50" "1" "0" "0" "L" "0" "화타쐐기 없음" "0" "0" "1.5" "0.0")',
+            "corner_geox_key": None,
+            "geox_key": None,
+            "hole_no": f"BH-{new_id}",
+            "water_chk": "0",
+            "water_depth": 0.0,
+            "raw_alist_override": None,
+            "sub_zones": [],
+        })
+        self.spn_seg_cnt.set(len(self.segments))
+        self.refresh_segment_table()
+
+    def delete_selected_segments(self):
+        sel = self.tree_seg.selection()
+        if not sel:
+            messagebox.showwarning("경고", "삭제할 세그먼트를 목록에서 선택해주세요.")
+            return
+        if len(sel) >= len(self.segments):
+            messagebox.showwarning("경고", "최소 1개 이상의 세그먼트는 남아있어야 합니다.")
+            return
+
+        del_ids = {int(iid) for iid in sel}
+        self.segments = [s for s in self.segments if s["id"] not in del_ids]
+        for idx, s in enumerate(self.segments, start=1):
+            s["id"] = idx
+        self.spn_seg_cnt.set(len(self.segments))
+        self.refresh_segment_table()
+
+        def load_from_autocad(self):
+        try:
+            segs, orient, ent_handle, start_pt, bnd_rec = fetch_boundary_from_autocad()
+            self.csv_filepath = ""
+            self.orig_csv_lines = None
+            self.cad_ent_handle = ent_handle
+            self.cad_start_pt = start_pt
+            self.cad_boundary_record = bnd_rec
+            self.has_boundary_data = True
+            self.boundary_orient = orient
+            self.segments = segs
+            self.spn_seg_cnt.set(len(segs))
+            self.lbl_status_source.config(
+                text=f"현재 모드: AutoCAD 실제 경계선 연동 완료 (총 {len(segs)}개 구간, Handle: {ent_handle})"
+            )
+            self.refresh_segment_table()
+            messagebox.showinfo(
+                "CAD 경계선 가져오기 성공",
+                f"AutoCAD에서 총 {len(segs)}개의 세그먼트 좌표를 성공적으로 가져왔습니다!"
+            )
+        except Exception as e:
+            messagebox.showerror("CAD 연동 오류", f"AutoCAD에서 경계선을 가져오는 중 오류가 발생했습니다:\n{e}")
+
+    def load_tsp_csv(self):
+        path = filedialog.askopenfilename(
+            title="TSP CSV 파일 선택",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="cp949") as f:
+                lines = [l.rstrip("\r\n") for l in f]
+        except UnicodeDecodeError:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines = [l.rstrip("\r\n") for l in f]
+
+        self.csv_filepath = path
+        self.orig_csv_lines = lines
+        self.cad_ent_handle = ""
+        self.cad_start_pt = None
+        self.has_boundary_data = True
+        segs = []
+        for line in lines:
+            if line.startswith("#GLOBAL,"):
+                parts = line.split(",")
+                if len(parts) >= 7:
+                    self.project_name_var.set(parts[2])
+                    self.scale_sec_var.set(parts[4])
+                    self.scale_plan_var.set(parts[6])
+                if len(parts) >= 9:
+                    try:
+                        self.boundary_orient = int(parts[8])
+                    except ValueError:
+                        self.boundary_orient = 1
+            elif line.startswith("SEGMENT,"):
+                cols = split_csv_segment_line(line)
+                sid = int(cols[1])
+                vs_nums = [float(x) for x in re.findall(r'[-+]?\d*\.?\d+', cols[3])]
+                ve_nums = [float(x) for x in re.findall(r'[-+]?\d*\.?\d+', cols[4])]
+                vs = tuple(vs_nums[:3]) if len(vs_nums) >= 3 else (0.0, 0.0, 0.0)
+                ve = tuple(ve_nums[:3]) if len(ve_nums) >= 3 else (0.0, 0.0, 0.0)
+                brace_raw = cols[11].strip()
+                can_brace = brace_raw.startswith('("Y"')
+                raw_alist = cols[12]
+                is_def = "(IS-DEFINED . T)" in raw_alist
+                m_hole = re.search(r'\(HOLE-NO\s*\.\s*"([^"]*)"\)', raw_alist)
+                hole_s = m_hole.group(1) if m_hole else f"BH-{sid}"
+                m_wchk = re.search(r'\(WATER-CHK\s*\.\s*"([^"]*)"\)', raw_alist)
+                wchk_s = m_wchk.group(1) if m_wchk else "0"
+                m_wdep = re.search(r'\(WATER-DEPTH\s*\.\s*([-+]?\d*\.?\d+)\)', raw_alist)
+                wdep_f = float(m_wdep.group(1)) if m_wdep else 0.0
+
+                segs.append({
+                    "id": sid,
+                    "v_start": vs,
+                    "v_end": ve,
+                    "angle": float(cols[5]),
+                    "length": float(cols[6]),
+                    "can_have_brace": can_brace,
+                    "geo_known": True,
+                    "corner_brace_str": brace_raw,
+                    "corner_geox_key": None,
+                    "geox_key": "__KEEP_ORIG__" if is_def else None,
+                    "hole_no": hole_s,
+                    "water_chk": wchk_s,
+                    "water_depth": wdep_f,
+                    "raw_alist_override": raw_alist,
+                    "orig_cols": cols,
+                })
+
+        self.segments = segs
+        self.spn_seg_cnt.set(len(segs))
+        self.lbl_status_source.config(text=f"현재 모드: 기존 TSP CSV 파일 로드됨 ({os.path.basename(path)})")
+        self.refresh_segment_table()
+
+    def add_geox_files(self):
+        paths = filedialog.askopenfilenames(
+            title="GeoX 단면 검토 엑셀 파일 선택 (다중 선택 가능)",
+            filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")]
+        )
+        if not paths:
+            return
+        added_cnt = 0
+        for p in paths:
+            try:
+                gdata = parse_geox_excel(p)
+                key = gdata["filename"]
+                gdata["hole_no"] = f"BH-{len(self.geox_pool) + 1}"
+                self.geox_pool[key] = gdata
+                added_cnt += 1
+            except Exception as e:
+                messagebox.showerror("GeoX 파싱 오류", f"[{os.path.basename(p)}] 파싱 중 오류:\n{e}")
+
+        self.refresh_geox_listbox()
+        if added_cnt > 0 and self.lst_geox.size() > 0:
+            self.lst_geox.selection_clear(0, tk.END)
+            self.lst_geox.selection_set(self.lst_geox.size() - 1)
+            self.on_geox_select(None)
+
+    def remove_selected_geox(self):
+        key = self._get_selected_pool_key_silent()
+        if not key:
+            return
+        if key in self.geox_pool:
+            del self.geox_pool[key]
+        for s in self.segments:
+            if s.get("geox_key") == key:
+                s["geox_key"] = None
+            if s.get("corner_geox_key") == key:
+                s["corner_geox_key"] = None
+        self.refresh_geox_listbox()
+        self.refresh_segment_table()
+        self.txt_preview.delete("1.0", tk.END)
+
+    def refresh_geox_listbox(self):
+        self.lst_geox.delete(0, tk.END)
+        for key, gdata in self.geox_pool.items():
+            tag = "[사보강 Corner Strut] " if gdata.get("is_corner_strut_file") else "[일반단면] "
+            self.lst_geox.insert(tk.END, f"{tag}{key}")
+
+    def _get_selected_pool_key_silent(self):
+        sel = self.lst_geox.curselection()
+        if not sel:
+            return None
+        keys = list(self.geox_pool.keys())
+        idx = sel[0]
+        return keys[idx] if 0 <= idx < len(keys) else None
+
+    def on_geox_select(self, event):
+        key = self._get_selected_pool_key_silent()
+        if not key:
+            return
+        gdata = self.geox_pool.get(key)
+        if not gdata:
+            return
+        self.cur_hole_var.set(gdata.get("hole_no", "BH-1"))
+        self.cur_water_chk_var.set(gdata.get("water_chk", "0") == "1")
+        self.cur_water_depth_var.set(str(gdata.get("water_depth", 0.0)))
+        self.show_geox_preview(gdata)
+
+    def on_geox_param_edit(self):
+        key = self._get_selected_pool_key_silent()
+        if not key:
+            return
+        gdata = self.geox_pool.get(key)
+        if not gdata:
+            return
+        gdata["hole_no"] = self.cur_hole_var.get().strip() or "BH-1"
+        gdata["water_chk"] = "1" if self.cur_water_chk_var.get() else "0"
+        try:
+            gdata["water_depth"] = abs(float(self.cur_water_depth_var.get().strip() or "0.0"))
+        except ValueError:
+            gdata["water_depth"] = 0.0
+            self.cur_water_depth_var.set("0.0")
+        self.show_geox_preview(gdata)
+
+    def show_geox_preview(self, d):
+        self.txt_preview.delete("1.0", tk.END)
+        if not d:
+            return
+        n_vals = generate_n_values_layer_mid(d["soil_layers"])
+        mode_str = "★ 사보강 Strut 전용 파일 (코너 사보강재 제원만 할당됨)" if d.get("is_corner_strut_file") else "일반 단면 파일 (벽체 + 지층 + 지보재 할당)"
+        lines = [
+            f"■ 파일명: {d['filename']}",
+            f"■ 파일유형: {mode_str}",
+            f"■ 시추공 번호(HOLE-NO): {d.get('hole_no', 'BH-1')}",
+            f"■ 지하수위(사용자 설정): {'고려 (GL -' + str(d['water_depth']) + 'm)' if d['water_chk'] == '1' else '미고려'}",
+            f"■ 벽체공법: {d['wall_type']} (직경 D{d['cip_dia']}mm)",
+            f"■ 엄지말뚝: {d['wall_spec']} | 말뚝간격(CTC): {d['ctc']}m",
+            f"■ 띠장(Wale): {d['wale_spec']}",
+            f"■ 굴착깊이: {d['max_depth']}m / 근입장: {d['embed_depth']}m (하단 {d['wall_bot_depth']}m)",
+            "",
+            f"■ 지층 및 대표 N치 (각 지층 중앙 배치, 총 {len(d['soil_layers'])}개 층):"
+        ]
+        # [경고 표시] 파싱 중 빈칸으로 기본값을 대체한 항목이 있으면 미리보기 상단에 안내
+        if d.get("parse_warnings"):
+            warn_block = [f"⚠ 파싱 경고 {len(d['parse_warnings'])}건 (빈칸 → 기본값 대체):"]
+            warn_block.extend("  - " + w for w in d["parse_warnings"])
+            warn_block.append("")
+            lines[1:1] = warn_block
+        for i, (s, nv) in enumerate(zip(d["soil_layers"], n_vals), start=1):
+            lines.append(
+                f"  {i}. {s['name']} (~{s['depth']}m) -> {s['type_name']} [{s['pat']}], "
+                f"N={nv[1]} (중간심도 {nv[0]}m)"
+            )
+        lines.append("")
+        lines.append(f"■ 지보재 정보 (총 {len(d['supports'])}단):")
+        for i, sup in enumerate(d["supports"], start=1):
+            w_str = sup.get("wale_spec") or d.get("wale_spec", "H 300×300×10/15")
+            if sup["kind"] == "ANCHOR":
+                lines.append(
+                    f"  {i}단 [Anchor]: {sup['name']} | 깊이 {sup['depth']}m | 각도 {sup['ang']}° | "
+                    f"자유장 {sup['free']}m + 정착장 {sup['bond']}m | {sup['sec']} | 띠장: {w_str}"
+                )
+            else:
+                tag = "Corner Strut" if sup["kind"] == "CORNER_STRUT" else "Strut"
+                lines.append(
+                    f"  {i}단 [{tag}]: {sup['name']} | 깊이 {sup['depth']}m | "
+                    f"간격 {sup['ctc']}m | {sup['cnt']}단({sup['sec']}) | 띠장: {w_str}"
+                )
+        self.txt_preview.insert(tk.END, "\n".join(lines))
+
+    def open_split_segment_dialog(self):
+        sel = self.tree_seg.selection()
+        if not sel:
+            messagebox.showwarning("경고", "구간을 분할할 세그먼트를 먼저 선택해주세요.")
+            return
+        first_iid = str(sel[0]).split("_")[0]
+        sid = int(first_iid)
+        target_seg = next((s for s in self.segments if s["id"] == sid), None)
+        if not target_seg:
+            return
+
+        seg_len_m = round(target_seg["length"] / 1000.0, 2)
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"Seg-{sid} 구간 분할 설정 (전체 길이: {seg_len_m:.2f}m)")
+        dlg.geometry("680x440")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        frm_head = ttk.Frame(dlg)
+        frm_head.pack(fill="x", padx=10, pady=8)
+
+        ttk.Label(frm_head, text=f"■ 대상: Seg-{sid} (총 길이 {seg_len_m:.2f}m)   |   분할 구간 수:").pack(side="left")
+        existing_zones = target_seg.get("sub_zones") or []
+        init_cnt = len(existing_zones) if len(existing_zones) >= 2 else 2
+        cnt_var = tk.IntVar(value=init_cnt)
+        spn_cnt = ttk.Spinbox(frm_head, from_=2, to=10, textvariable=cnt_var, width=5)
+        spn_cnt.pack(side="left", padx=4)
+
+        mode_var = tk.StringVar(value="DIST")
+        ttk.Radiobutton(frm_head, text="거리(m) 입력", variable=mode_var, value="DIST").pack(side="left", padx=(14, 4))
+        ttk.Radiobutton(frm_head, text="비율(%) 입력", variable=mode_var, value="PCT").pack(side="left", padx=4)
+
+        frm_rows = ttk.LabelFrame(dlg, text=" 구간별 적용 범위 지정 (중첩 구간 지정 가능 — 벽체는 중첩 구간에서 강성이 큰 공법/규격 자동 우선) ")
+        frm_rows.pack(fill="both", expand=True, padx=10, pady=6)
+
+        row_vars = []
+
+        def rebuild_rows():
+            for w in frm_rows.winfo_children():
+                w.destroy()
+            row_vars.clear()
+            n = max(2, int(cnt_var.get() or 2))
+            is_pct = (mode_var.get() == "PCT")
+            unit_lbl = "%" if is_pct else "m"
+
+            for idx in range(n):
+                if idx < len(existing_zones):
+                    sm = float(existing_zones[idx].get("start_m", 0.0))
+                    em = float(existing_zones[idx].get("end_m", seg_len_m))
+                    gkey = existing_zones[idx].get("geox_key")
+                else:
+                    sm = round(seg_len_m * idx / n, 2)
+                    em = round(seg_len_m * (idx + 1) / n, 2)
+                    gkey = target_seg.get("geox_key") if idx == 0 else None
+
+                if is_pct and seg_len_m > 0:
+                    s_val = round(sm / seg_len_m * 100.0, 1)
+                    e_val = round(em / seg_len_m * 100.0, 1)
+                else:
+                    s_val = sm
+                    e_val = em
+
+                sv = tk.StringVar(value=f"{s_val}")
+                ev = tk.StringVar(value=f"{e_val}")
+                row_vars.append({"sv": sv, "ev": ev, "geox_key": gkey})
+
+                r_frm = ttk.Frame(frm_rows)
+                r_frm.pack(fill="x", padx=8, pady=4)
+                ttk.Label(r_frm, text=f"제{idx + 1}구간:", width=9).pack(side="left")
+                ttk.Label(r_frm, text="시작").pack(side="left", padx=(4, 2))
+                ttk.Entry(r_frm, textvariable=sv, width=9).pack(side="left")
+                ttk.Label(r_frm, text=unit_lbl).pack(side="left", padx=(1, 6))
+
+                def pick_cad_pt(target_var=sv, next_var=(row_vars[idx - 1]["ev"] if idx > 0 else None)):
+                    try:
+                        d_m = pick_split_distance_from_autocad(target_seg)
+                        if mode_var.get() == "PCT" and seg_len_m > 0:
+                            val_str = f"{round(d_m / seg_len_m * 100.0, 1)}"
+                        else:
+                            val_str = f"{d_m:.2f}"
+                        target_var.set(val_str)
+                    except Exception as ex:
+                        messagebox.showerror("CAD 클릭 오류", f"CAD에서 기준점을 가져오지 못했습니다:\n{ex}")
+
+                ttk.Button(r_frm, text="📐 CAD 클릭", command=lambda tv=sv: pick_cad_pt(tv)).pack(side="left", padx=2)
+
+                ttk.Label(r_frm, text="  ~  끝").pack(side="left", padx=(8, 2))
+                ttk.Entry(r_frm, textvariable=ev, width=9).pack(side="left")
+                ttk.Label(r_frm, text=unit_lbl).pack(side="left", padx=(1, 6))
+                ttk.Button(r_frm, text="📐 CAD 클릭", command=lambda tv=ev: pick_cad_pt(tv)).pack(side="left", padx=2)
+
+        ttk.Button(frm_head, text="구간 수 적용", command=rebuild_rows).pack(side="left", padx=6)
+        mode_var.trace_add("write", lambda *args: rebuild_rows())
+        rebuild_rows()
+
+        def on_confirm():
+            is_pct = (mode_var.get() == "PCT")
+            new_zones = []
+            for idx, rv in enumerate(row_vars, start=1):
+                try:
+                    v1 = float(rv["sv"].get().strip())
+                    v2 = float(rv["ev"].get().strip())
+                except ValueError:
+                    messagebox.showwarning("입력 오류", f"제{idx}구간의 시작/끝 범위를 숫자로 입력해주세요.")
+                    return
+                if is_pct:
+                    s_m = round(seg_len_m * (v1 / 100.0), 2)
+                    e_m = round(seg_len_m * (v2 / 100.0), 2)
+                else:
+                    s_m = round(v1, 2)
+                    e_m = round(v2, 2)
+                s_m = max(0.0, min(seg_len_m, s_m))
+                e_m = max(0.0, min(seg_len_m, e_m))
+                if e_m < s_m:
+                    s_m, e_m = e_m, s_m
+
+                prev_z = existing_zones[idx - 1] if idx - 1 < len(existing_zones) else {}
+                new_zones.append({
+                    "zone_id": idx,
+                    "name": f"제{idx}구간",
+                    "start_m": s_m,
+                    "end_m": e_m,
+                    "geox_key": rv["geox_key"],
+                    "hole_no": prev_z.get("hole_no", f"BH-{sid}-{idx}"),
+                    "water_chk": prev_z.get("water_chk", target_seg.get("water_chk", "0")),
+                    "water_depth": prev_z.get("water_depth", target_seg.get("water_depth", 0.0)),
+                })
+            target_seg["sub_zones"] = new_zones
+            self.refresh_segment_table()
+            dlg.destroy()
+
+        frm_bot = ttk.Frame(dlg)
+        frm_bot.pack(fill="x", padx=10, pady=8)
+        ttk.Button(frm_bot, text="확인 (구간 분할 적용)", command=on_confirm).pack(side="right", padx=4, ipadx=8, ipady=3)
+        ttk.Button(frm_bot, text="취소", command=dlg.destroy).pack(side="right", padx=4)
+
+    def unsplit_selected_segments(self):
+        sel = self.tree_seg.selection()
+        if not sel:
+            messagebox.showwarning("경고", "분할 해제할 세그먼트를 먼저 선택해주세요.")
+            return
+        target_sids = {int(str(x).split("_")[0]) for x in sel}
+        for seg in self.segments:
+            if seg["id"] in target_sids:
+                if seg.get("sub_zones"):
+                    z0 = seg["sub_zones"][0]
+                    if z0.get("geox_key"):
+                        seg["geox_key"] = z0["geox_key"]
+                seg["sub_zones"] = []
+        self.refresh_segment_table()
+
+    def _format_geox_row_values(self, gkey, hole_no, w_chk, w_dep, default_hole):
+        if gkey and gkey in self.geox_pool:
+            d = self.geox_pool[gkey]
+            w_type = d["wall_type"]
+            if w_type == "CIP":
+                hp_s = d["wall_spec"].split("×")[0]
+                disp_spec = f"D{d['cip_dia']}+{hp_s}"
+            else:
+                disp_spec = d["wall_spec"]
+            ctc_s = f"{d['ctc']:.2f}"
+            max_d_s = f"{d['max_depth']:.2f}"
+            if d["supports"]:
+                k0 = d["supports"][0]["kind"]
+                k_lbl = "EA" if k0 == "ANCHOR" else "ST"
+                sup_cnt_s = f"{k_lbl} {len(d['supports'])}단"
+            else:
+                sup_cnt_s = "없음"
+            geox_label = gkey
+            hole_s = hole_no or default_hole
+            water_s = f"-{w_dep}m" if w_chk == "1" else "미고려"
+            return geox_label, hole_s, water_s, w_type, disp_spec, ctc_s, max_d_s, sup_cnt_s
+        return "(비어있음 / 미정의)", "-", "-", "-", "-", "-", "-", "-"
+
+    def _get_display_params(self, seg, sz=None, zidx=0):
+        # 표에 표시할 벽체/말뚝 제원을 계산 (GeoX 값 -> 사용자 수정값 순으로 덮어씀)
+        tgt = sz if sz is not None else seg
+        gkey = tgt.get("geox_key")
+        gdata = self.geox_pool.get(gkey) if gkey else None
+        ov = get_param_override(tgt)
+
+        d = {"label": "(비어있음 / 미정의)", "type": "-", "cip": "-", "hpile": "-",
+             "ctc": "-", "depth": "-", "sup": "-", "hole": "-", "water": "-",
+             "s_m": 0.0, "e_m": seg["length"] / 1000.0}
+
+        if gdata is not None:
+            d["label"] = gkey
+            d["type"] = gdata.get("wall_type", "-")
+            d["hpile"] = gdata.get("wall_spec", "-")
+            d["cip"] = "D%s" % gdata.get("cip_dia", "") if gdata.get("wall_type") == "CIP" else "-"
+            try:
+                d["ctc"] = "%.3f" % float(gdata.get("ctc", 0.0))
+            except (TypeError, ValueError):
+                d["ctc"] = "-"
+            try:
+                d["depth"] = "%.3f" % float(gdata.get("max_depth", 0.0))
+            except (TypeError, ValueError):
+                d["depth"] = "-"
+            sup_n = len(gdata.get("supports") or [])
+            d["sup"] = "없음" if sup_n == 0 else "%d단" % sup_n
+        elif gkey == "__KEEP_ORIG__" and seg.get("orig_cols"):
+            ocols = seg["orig_cols"]
+            d["label"] = "[기존 CSV 유지]"
+            d["type"] = ocols[2]
+            d["hpile"] = ocols[7]
+            d["ctc"] = ocols[8]
+            d["depth"] = ocols[9]
+            sup_raw = (ocols[10] or "").strip()
+            d["sup"] = "없음" if sup_raw in ("nil", "()", "") else "%d단" % len(parse_top_level_elements(sup_raw))
+            m = re.search(r'\(CIP-DIA\s*\.\s*"([^"]*)"\)', seg.get("raw_alist_override") or "")
+            if d["type"] == "CIP":
+                d["cip"] = "D%s" % (m.group(1) if m else "?")
+            else:
+                d["cip"] = "-"
+
+        # 사용자 수정값 우선 적용
+        if ov.get("wall_type"):
+            d["type"] = ov["wall_type"]
+        if ov.get("wall_spec"):
+            d["hpile"] = parse_h_dims(ov["wall_spec"])[1]
+        if ov.get("cip_dia") not in (None, ""):
+            f = _ov_float(ov["cip_dia"])
+            if f is not None:
+                d["cip"] = "D%d" % int(round(f))
+        if ov.get("ctc") is not None:
+            f = _ov_float(ov["ctc"])
+            if f is not None:
+                d["ctc"] = "%.3f" % f
+        if ov.get("max_depth") is not None:
+            f = _ov_float(ov["max_depth"])
+            if f is not None:
+                d["depth"] = "%.3f" % f
+
+        if d["type"] != "CIP":
+            d["cip"] = "-" if d["type"] not in ("-", "") else d["cip"]
+
+        d["hole"] = tgt.get("hole_no") or ("BH-%d" % seg["id"])
+        if str(tgt.get("water_chk", "0")) == "1":
+            d["water"] = "-%sm" % tgt.get("water_depth", 0.0)
+        else:
+            d["water"] = "미고려"
+
+        if sz is not None:
+            L = seg["length"] / 1000.0
+            d["s_m"] = float(sz.get("start_m", 0.0))
+            d["e_m"] = float(sz.get("end_m", L))
+        return d
+
+    def refresh_segment_table(self):
+        prev_sel = self.tree_seg.selection()
+        for row in self.tree_seg.get_children():
+            self.tree_seg.delete(row)
+
+        for seg in self.segments:
+            sid = seg["id"]
+            ckey = seg.get("corner_geox_key")
+            seg_len_m = seg["length"] / 1000.0
+            sub_zones = seg.get("sub_zones") or []
+
+            if ckey and ckey in self.geox_pool:
+                cd = self.geox_pool[ckey]
+                brace_disp = "Y (%s)" % cd.get("corner_strut_spec", "2H")
+            elif not seg.get("geo_known", False):
+                brace_disp = "가능(미지정)"
+            else:
+                brace_disp = "Y (미입력)" if seg.get("can_have_brace") else "N (불가)"
+
+            if sub_zones:
+                def_cnt = sum(1 for sz in sub_zones if sz.get("geox_key") in self.geox_pool)
+                self.tree_seg.insert(
+                    "", "end", iid=str(sid),
+                    values=(
+                        "Seg-%d" % sid, "[구간분할 %d개 (%d/%d 할당)]" % (len(sub_zones), def_cnt, len(sub_zones)),
+                        "-", "-", "복합구간", "-", "-", "-", "-", "-", brace_disp,
+                        "%.2f" % seg_len_m, "%.2f" % math.degrees(seg["angle"])
+                    )
+                )
+                for idx, sz in enumerate(sub_zones, start=1):
+                    d = self._get_display_params(seg, sz, idx)
+                    self.tree_seg.insert(
+                        "", "end", iid="%d_%d" % (sid, idx),
+                        values=(
+                            "  └ %d구간" % idx, "[%.1f~%.1fm] %s" % (d["s_m"], d["e_m"], d["label"]),
+                            d["hole"], d["water"], d["type"], d["cip"], d["hpile"],
+                            d["ctc"], d["depth"], d["sup"], "-",
+                            "%.2f" % max(0.0, d["e_m"] - d["s_m"]),
+                            "%.2f" % math.degrees(seg["angle"])
+                        )
+                    )
+                continue
+
+            d = self._get_display_params(seg)
+            self.tree_seg.insert(
+                "", "end", iid=str(sid),
+                values=(
+                    "Seg-%d" % sid, d["label"], d["hole"], d["water"], d["type"], d["cip"],
+                    d["hpile"], d["ctc"], d["depth"], d["sup"], brace_disp,
+                    "%.2f" % seg_len_m, "%.2f" % math.degrees(seg["angle"])
+                )
+            )
+
+        for iid in prev_sel:
+            if self.tree_seg.exists(iid):
+                self.tree_seg.selection_add(iid)
+
+    EDITABLE_COLS = ("geox", "hole", "water", "type", "cip", "hpile", "ctc", "depth", "len", "ang", "brace")
+
+    def _cell_editor_destroy(self):
+        ed = getattr(self, "_seg_cell_editor", None)
+        if ed is not None:
+            try:
+                ed.destroy()
+            except Exception:
+                pass
+        self._seg_cell_editor = None
+
+    def _seg_target_by_iid(self, iid):
+        # 트리 iid -> (seg, sub_zone or None, zone_index)
+        s_iid = str(iid)
+        if "_" in s_iid:
+            sid_s, zidx_s = s_iid.split("_", 1)
+            try:
+                sid, zidx = int(sid_s), int(zidx_s) - 1
+            except ValueError:
+                return None, None, -1
+            for seg in self.segments:
+                if seg["id"] == sid and seg.get("sub_zones") and 0 <= zidx < len(seg["sub_zones"]):
+                    return seg, seg["sub_zones"][zidx], zidx
+            return None, None, -1
+        try:
+            sid = int(s_iid)
+        except ValueError:
+            return None, None, -1
+        for seg in self.segments:
+            if seg["id"] == sid:
+                return seg, None, -1
+        return None, None, -1
+
+    def _seg_index(self, seg):
+        for i, s in enumerate(self.segments):
+            if s is seg:
+                return i
+        return -1
+
+    def _apply_seg_geometry(self, seg, vs, ve, propagate=True):
+        # 시작/끝 좌표를 반영하고 길이·각도를 재계산한다.
+        # propagate=True 이면 '기존에 이어져 있던' 다음 구간(폐합 시 첫 구간)의 시작점을
+        # 새 끝점으로 따라 이동시켜 경계선이 끊기지 않게 유지한다.
+        vs = (float(vs[0]), float(vs[1]), float(vs[2]) if len(vs) > 2 else 0.0)
+        ve = (float(ve[0]), float(ve[1]), float(ve[2]) if len(ve) > 2 else 0.0)
+        old_end = seg["v_end"]
+        seg["v_start"] = vs
+        seg["v_end"] = ve
+        seg["length"] = dist_2d(vs, ve)
+        seg["angle"] = angle_2d(vs, ve)
+
+        warn = ""
+        if seg["length"] <= 1e-6:
+            warn = "시작점과 끝점이 동일하여 길이가 0입니다. 좌표를 확인해주세요."
+
+        idx = self._seg_index(seg)
+        if propagate and idx >= 0 and dist_2d(old_end, ve) > 0.001:
+            nxt = None
+            if idx + 1 < len(self.segments):
+                nxt = self.segments[idx + 1]
+            elif len(self.segments) > 1 and dist_2d(self.segments[0]["v_start"], old_end) <= 1.0:
+                nxt = self.segments[0]
+            if nxt is not None and dist_2d(nxt["v_start"], old_end) <= 1.0:
+                nxt["v_start"] = ve
+                nxt["length"] = dist_2d(nxt["v_start"], nxt["v_end"])
+                nxt["angle"] = angle_2d(nxt["v_start"], nxt["v_end"])
+        return warn
+
+    def _clamp_sub_zones(self, seg):
+        # 길이 변경 시 구간분할(start_m/end_m) 범위를 새 길이 안으로 보정
+        zones = seg.get("sub_zones") or []
+        if not zones:
+            return False
+        L_m = seg["length"] / 1000.0
+        changed = False
+        for sz in zones:
+            old_s = float(sz.get("start_m", 0.0))
+            old_e = float(sz.get("end_m", L_m))
+            s_m = max(0.0, min(L_m, old_s))
+            e_m = max(0.0, min(L_m, old_e))
+            if e_m < s_m:
+                s_m, e_m = e_m, s_m
+            if abs(s_m - old_s) > 1e-9 or abs(e_m - old_e) > 1e-9:
+                changed = True
+            sz["start_m"] = round(s_m, 2)
+            sz["end_m"] = round(e_m, 2)
+        return changed
+
+    def on_seg_right_click(self, event):
+        row = self.tree_seg.identify_row(event.y)
+        if row:
+            if row not in self.tree_seg.selection():
+                self.tree_seg.selection_set(row)
+            self.tree_seg.focus(row)
+        try:
+            self.menu_seg.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                self.menu_seg.grab_release()
+            except Exception:
+                pass
+
+    def on_seg_double_click(self, event):
+        if self.tree_seg.identify_region(event.x, event.y) != "cell":
+            return
+        row = self.tree_seg.identify_row(event.y)
+        if not row:
+            return
+        col_id = self.tree_seg.identify_column(event.x)
+        try:
+            col_idx = int(str(col_id).replace("#", "")) - 1
+        except ValueError:
+            return
+        cols = list(self.tree_seg["columns"])
+        if col_idx < 0 or col_idx >= len(cols):
+            return
+        col_key = cols[col_idx]
+
+        seg, sz, zidx = self._seg_target_by_iid(row)
+        if seg is None:
+            return
+
+        if col_key not in self.EDITABLE_COLS:
+            self._show_readonly_cell_help(col_key)
+            return
+
+        bbox = self.tree_seg.bbox(row, col_id)
+        if not bbox:
+            return
+        x, y, w, h = bbox
+        self._cell_editor_destroy()
+
+        cur_val = self._get_cell_edit_value(seg, sz, col_key)
+        if self._is_combo_col(col_key):
+            choices = self._get_cell_combo_choices(seg, col_key, sz)
+            editor = ttk.Combobox(self.tree_seg, values=choices, state="readonly")
+            editor.set(cur_val if cur_val in choices else (choices[0] if choices else ""))
+        elif col_key == "cip":
+            choices = self._get_cell_combo_choices(seg, col_key, sz)
+            editor = ttk.Combobox(self.tree_seg, values=choices, state="normal")
+            editor.set(cur_val)
+        else:
+            editor = ttk.Entry(self.tree_seg)
+            editor.insert(0, cur_val)
+            editor.select_range(0, "end")
+
+        editor.place(x=x, y=y, width=max(w, 110), height=h)
+        editor.focus_set()
+        if isinstance(editor, ttk.Entry):
+            editor.icursor("end")
+        self._seg_cell_editor = editor
+
+        def commit(event=None):
+            if self._seg_cell_editor is not editor:
+                return
+            val = editor.get()
+            self._cell_editor_destroy()
+            self._commit_cell_edit(seg, sz, zidx, col_key, val)
+
+        def cancel(event=None):
+            self._cell_editor_destroy()
+
+        editor.bind("<Return>", commit)
+        editor.bind("<KP_Enter>", commit)
+        editor.bind("<FocusOut>", commit)
+        editor.bind("<Escape>", cancel)
+        if isinstance(editor, ttk.Combobox):
+            editor.bind("<<ComboboxSelected>>", commit)
+
+    def _show_readonly_cell_help(self, col_key):
+        if col_key == "id":
+            msg = ("구간 번호는 세그먼트 순서로 자동 부여됩니다.\n"
+                   "(삭제 시 자동으로 다시 1번부터 정리됩니다.)")
+        elif col_key == "sup_cnt":
+            msg = ("지보재(Anchor / Strut / 사보강)는 할당된 GeoX 엑셀 파일의 지보재 시트에서 자동 산출되는 항목입니다.\n\n"
+                   "· 지보재 내용을 바꾸려면: 수정한 GeoX 엑셀을 [➕ GeoX 엑셀 추가]로 다시 불러와 해당 세그먼트에 재할당하십시오.\n"
+                   "· 단수가 예상과 다르면 GeoX 원본 파일의 지보재 표(설치깊이/간격/수량)를 확인하십시오.")
+        else:
+            msg = "이 열은 직접 수정할 수 없습니다."
+        messagebox.showinfo("읽기 전용 열", msg)
+
+    def _get_cell_edit_value(self, seg, sz, col_key):
+        tgt = sz if sz is not None else seg
+        d = self._get_display_params(seg, sz) if col_key in ("type", "cip", "hpile", "ctc", "depth") else None
+        if col_key == "geox":
+            k = tgt.get("geox_key")
+            if k == "__KEEP_ORIG__":
+                return "[기존 CSV 유지]"
+            return k if k else "(할당 없음)"
+        if col_key == "brace":
+            k = seg.get("corner_geox_key")
+            return k if k else "(사보강 없음)"
+        if col_key == "hole":
+            return tgt.get("hole_no", "")
+        if col_key == "water":
+            if str(tgt.get("water_chk", "0")) == "1":
+                return "-%s" % tgt.get("water_depth", 0.0)
+            return "미고려"
+        if col_key == "type":
+            return d["type"] if d["type"] not in ("-", "복합구간") else "HPILE"
+        if col_key == "cip":
+            return d["cip"].replace("D", "") if d["cip"] not in ("-", "D?") else ""
+        if col_key == "hpile":
+            return d["hpile"] if d["hpile"] != "-" else "H 300×300×10/15"
+        if col_key == "ctc":
+            return d["ctc"] if d["ctc"] != "-" else "2.000"
+        if col_key == "depth":
+            return d["depth"] if d["depth"] != "-" else "10.000"
+        if col_key == "len":
+            if sz is not None:
+                return "%.2f" % (float(sz.get("end_m", 0.0)) - float(sz.get("start_m", 0.0)))
+            return "%.3f" % (seg["length"] / 1000.0)
+        if col_key == "ang":
+            return "%.3f" % math.degrees(seg["angle"])
+        return ""
+
+    def _get_cell_combo_choices(self, seg, col_key, sz=None):
+        if col_key == "geox":
+            keys = [k for k, g in self.geox_pool.items() if not g.get("is_corner_strut_file")]
+            choices = ["(할당 없음)"] + keys
+            if sz is None and (seg.get("orig_cols") or seg.get("raw_alist_override")):
+                choices.append("[기존 CSV 유지]")
+            return choices
+        if col_key == "type":
+            return list(WALL_TYPE_CHOICES)
+        if col_key == "hpile":
+            return list(STD_WALL_LIST)
+        if col_key == "cip":
+            return list(CIP_DIA_PRESETS)
+        keys = [k for k, g in self.geox_pool.items() if g.get("is_corner_strut_file")]
+        return ["(사보강 없음)"] + keys
+
+    def _is_combo_col(self, col_key):
+        return col_key in ("geox", "brace", "type", "hpile")
+
+    def _commit_cell_edit(self, seg, sz, zidx, col_key, val):
+        val = "" if val is None else str(val).strip()
+        tgt = sz if sz is not None else seg
+        warn = ""
+        zones = seg.get("sub_zones") or []
+
+        if col_key == "geox":
+            if val in ("(할당 없음)", "", "-"):
+                new_key = None
+            elif val == "[기존 CSV 유지]":
+                if sz is not None:
+                    messagebox.showinfo("안내", "구간분할 세부구간에는 [기존 CSV 유지]를 적용할 수 없습니다.")
+                    return
+                if not (seg.get("orig_cols") or seg.get("raw_alist_override")):
+                    messagebox.showwarning("할당 오류", "이 세그먼트는 기존 CSV에서 불러온 정보가 없어 [기존 CSV 유지]를 사용할 수 없습니다.")
+                    return
+                new_key = "__KEEP_ORIG__"
+            else:
+                if val not in self.geox_pool:
+                    messagebox.showwarning("할당 오류", "'%s' 은(는) 현재 GeoX 라이브러리에 없는 단면입니다." % val)
+                    return
+                new_key = val
+            g = self.geox_pool.get(new_key)
+
+            if sz is not None:
+                sz["geox_key"] = new_key
+                clear_param_override(sz)
+                if g:
+                    sz["hole_no"] = g.get("hole_no", sz.get("hole_no", "BH-%d-%d" % (seg["id"], zidx + 1)))
+                    sz["water_chk"] = g.get("water_chk", "0")
+                    sz["water_depth"] = float(g.get("water_depth", 0.0))
+            else:
+                seg["geox_key"] = new_key
+                clear_param_override(seg)
+                if g:
+                    seg["hole_no"] = g.get("hole_no", seg.get("hole_no", "BH-%d" % seg["id"]))
+                    seg["water_chk"] = g.get("water_chk", "0")
+                    seg["water_depth"] = float(g.get("water_depth", 0.0))
+                if zones and new_key not in (None, "__KEEP_ORIG__"):
+                    for z_i, z in enumerate(zones, start=1):
+                        z["geox_key"] = new_key
+                        clear_param_override(z)
+                        z["hole_no"] = g.get("hole_no", "BH-%d-%d" % (seg["id"], z_i)) if g else z.get("hole_no")
+                        z["water_chk"] = g.get("water_chk", "0") if g else z.get("water_chk", "0")
+                        z["water_depth"] = float(g.get("water_depth", 0.0)) if g else float(z.get("water_depth", 0.0))
+
+        elif col_key == "brace":
+            if val in ("(사보강 없음)", "", "-"):
+                seg["corner_geox_key"] = None
+            else:
+                if val not in self.geox_pool:
+                    messagebox.showwarning("할당 오류", "'%s' 은(는) 현재 GeoX 라이브러리에 없는 단면입니다." % val)
+                    return
+                if seg.get("geo_known") and not seg.get("can_have_brace"):
+                    messagebox.showerror(
+                        "코너 사보강재 할당 불가",
+                        "이 구간은 코너 사보강재가 들어갈 수 없는 오목 모서리(N)입니다.\n"
+                        "사보강 가능한 볼록 모서리(Y) 구간에만 할당할 수 있습니다."
+                    )
+                    return
+                seg["corner_geox_key"] = val
+
+        elif col_key == "hole":
+            new_hole = sanitize_csv_text(val, "")
+            if not new_hole:
+                messagebox.showwarning("입력 오류", "시추공명을 입력해주세요. (쉼표/괄호/따옴표는 사용할 수 없습니다.)")
+                return
+            tgt["hole_no"] = new_hole
+            if sz is None and zones:
+                for z in zones:
+                    z["hole_no"] = new_hole
+
+        elif col_key == "water":
+            new_chk, new_dep, ok = parse_water_text(val, tgt.get("water_chk", "0"), float(tgt.get("water_depth", 0.0)))
+            if not ok:
+                messagebox.showwarning("입력 오류", "지하수위는 '미고려' 또는 심도 숫자(예: -3.5)로 입력해주세요.")
+                return
+            tgt["water_chk"] = new_chk
+            tgt["water_depth"] = new_dep
+            if sz is None and zones:
+                for z in zones:
+                    z["water_chk"] = new_chk
+                    z["water_depth"] = new_dep
+
+        elif col_key == "type":
+            new_type = val.upper()
+            if new_type not in WALL_TYPE_CHOICES:
+                messagebox.showwarning("입력 오류", "벽체공법은 HPILE 또는 CIP 중 하나를 선택해주세요.")
+                return
+            set_param_override(tgt, "wall_type", new_type)
+
+        elif col_key == "cip":
+            if val == "":
+                set_param_override(tgt, "cip_dia", None)
+            else:
+                f = _ov_float(val.replace("D", "").replace("mm", ""))
+                if f is None or f <= 0.0 or f > 5000.0:
+                    messagebox.showwarning("입력 오류", "CIP 직경은 300~2000mm 범위의 숫자로 입력해주세요. (예: 500)")
+                    return
+                set_param_override(tgt, "cip_dia", str(int(round(f))))
+                if not get_param_override(tgt).get("wall_type"):
+                    cur = self._get_display_params(seg, sz)["type"]
+                    if cur != "CIP":
+                        set_param_override(tgt, "wall_type", "CIP")
+
+        elif col_key == "hpile":
+            if val == "":
+                set_param_override(tgt, "wall_spec", None)
+            else:
+                if val not in STD_WALL_LIST:
+                    messagebox.showwarning(
+                        "입력 오류",
+                        "'%s' 은(는) TSP 표준 규격 목록에 없습니다.\n\n사용 가능한 규격:\n- %s"
+                        % (val, "\n- ".join(STD_WALL_LIST))
+                    )
+                    return
+                set_param_override(tgt, "wall_spec", val)
+
+        elif col_key == "ctc":
+            f = _ov_float(val)
+            if f is None or f <= 0.0 or f > 100.0:
+                messagebox.showwarning("입력 오류", "CTC(말뚝간격)는 0보다 크고 100m 이하인 숫자로 입력해주세요.")
+                return
+            set_param_override(tgt, "ctc", "%.3f" % f)
+
+        elif col_key == "depth":
+            f = _ov_float(val)
+            if f is None or f <= 0.0 or f > 200.0:
+                messagebox.showwarning("입력 오류", "굴착깊이는 0보다 크고 200m 이하인 숫자로 입력해주세요.")
+                return
+            set_param_override(tgt, "max_depth", "%.3f" % f)
+
+        elif col_key == "len":
+            if sz is not None:
+                messagebox.showinfo("안내", "구간분할 세부구간의 길이는 [🔀 선택 세그먼트 구간 분할] 대화상자에서 수정하십시오.")
+                return
+            try:
+                L_m = float(val.replace("m", "").strip())
+            except ValueError:
+                messagebox.showwarning("입력 오류", "길이는 숫자(m)로 입력해주세요.")
+                return
+            if L_m <= 0.0:
+                messagebox.showwarning("입력 오류", "길이는 0보다 커야 합니다.")
+                return
+            vs = seg["v_start"]
+            ve = (vs[0] + L_m * 1000.0 * math.cos(seg["angle"]),
+                  vs[1] + L_m * 1000.0 * math.sin(seg["angle"]), 0.0)
+            warn = self._apply_seg_geometry(seg, vs, ve, propagate=True)
+            if self._clamp_sub_zones(seg):
+                warn = (warn + "\n" if warn else "") + "구간분할 범위가 새 길이에 맞게 자동 조정되었습니다."
+
+        elif col_key == "ang":
+            if sz is not None:
+                messagebox.showinfo("안내", "구간분할 세부구간의 각도는 상위 세그먼트 기하를 따릅니다.")
+                return
+            ang_rad, ok = parse_angle_text(val, seg["angle"])
+            if not ok:
+                messagebox.showwarning("입력 오류", "각도는 숫자(도)로 입력해주세요. 예: 45.5")
+                return
+            vs = seg["v_start"]
+            L_mm = seg["length"]
+            ve = (vs[0] + L_mm * math.cos(ang_rad), vs[1] + L_mm * math.sin(ang_rad), 0.0)
+            warn = self._apply_seg_geometry(seg, vs, ve, propagate=True)
+            if self._clamp_sub_zones(seg):
+                warn = (warn + "\n" if warn else "") + "구간분할 범위가 새 길이에 맞게 자동 조정되었습니다."
+        else:
+            return
+
+        self.refresh_segment_table()
+        if warn:
+            messagebox.showwarning("수정 완료 (확인 필요)", warn)
+        self._cell_editor_destroy()
+
+    def open_segment_geometry_dialog(self):
+        if not self.segments:
+            messagebox.showwarning("경고", "편집할 세그먼트가 없습니다.")
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("세그먼트 좌표 / 길이 / 각도 직접 편집")
+        dlg.geometry("1000x620")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        ttk.Label(
+            dlg,
+            text="■ 좌표를 수정하면 길이·각도가 자동 재계산됩니다. 길이 또는 각도만 수정하면 시작점을 기준으로 끝점이 이동합니다.",
+            foreground="#0055aa"
+        ).pack(fill="x", padx=10, pady=(8, 2))
+        ttk.Label(
+            dlg,
+            text="※ 좌표와 길이/각도를 동시에 수정한 경우에는 입력한 좌표가 우선 적용됩니다.",
+            foreground="#777777"
+        ).pack(fill="x", padx=10, pady=(0, 6))
+
+        frm_head = ttk.Frame(dlg)
+        frm_head.pack(fill="x", padx=10)
+        for txt, w in (("구간", 10), ("X 시작", 16), ("Y 시작", 16), ("X 끝", 16), ("Y 끝", 16), ("길이(m)", 12), ("각도(°)", 12)):
+            ttk.Label(frm_head, text=txt, width=w, anchor="center", font=("맑은 고딕", 9, "bold")).pack(side="left", padx=1)
+
+        outer = ttk.Frame(dlg)
+        outer.pack(fill="both", expand=True, padx=10, pady=4)
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        scr = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scr.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scr.pack(side="right", fill="y")
+
+        body = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+        canvas.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+        canvas.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+
+        row_vars = []
+        for seg in self.segments:
+            vs, ve = seg["v_start"], seg["v_end"]
+            r = ttk.Frame(body)
+            r.pack(fill="x", pady=1)
+            ttk.Label(r, text="Seg-%d" % seg["id"], width=10, anchor="center").pack(side="left", padx=1)
+            vals = [
+                "%.3f" % vs[0], "%.3f" % vs[1], "%.3f" % ve[0], "%.3f" % ve[1],
+                "%.4f" % (seg["length"] / 1000.0), "%.4f" % math.degrees(seg["angle"]),
+            ]
+            vars_row = []
+            for i, v in enumerate(vals):
+                var = tk.StringVar(value=v)
+                ent = ttk.Entry(r, textvariable=var, width=(15 if i < 4 else 11), justify="right")
+                ent.pack(side="left", padx=1)
+                vars_row.append(var)
+            row_vars.append((seg, vars_row))
+
+        frm_bot = ttk.Frame(dlg)
+        frm_bot.pack(fill="x", padx=10, pady=8)
+        chain_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            frm_bot, variable=chain_var,
+            text="인접 구간 자동 연결 (기존에 이어져 있던 경계선이 끊기지 않도록 다음 구간 시작점을 자동 이동)"
+        ).pack(side="left")
+
+        def on_apply():
+            warns = []
+            changed_cnt = 0
+            for seg, (v_x1, v_y1, v_x2, v_y2, v_len, v_ang) in row_vars:
+                try:
+                    x1 = float(v_x1.get().strip())
+                    y1 = float(v_y1.get().strip())
+                    x2 = float(v_x2.get().strip())
+                    y2 = float(v_y2.get().strip())
+                    L_m = float(v_len.get().strip())
+                    ang_deg = float(v_ang.get().strip())
+                except ValueError:
+                    messagebox.showwarning("입력 오류", "Seg-%d 행에 숫자가 아닌 값이 있습니다. 확인해주세요." % seg["id"])
+                    return
+                if not all(math.isfinite(v) for v in (x1, y1, x2, y2, L_m, ang_deg)):
+                    messagebox.showwarning("입력 오류", "Seg-%d 행에 계산할 수 없는 값이 있습니다." % seg["id"])
+                    return
+                if L_m <= 0.0:
+                    messagebox.showwarning("입력 오류", "Seg-%d 길이는 0보다 커야 합니다." % seg["id"])
+                    return
+
+                orig_vs, orig_ve = seg["v_start"], seg["v_end"]
+                new_vs = (x1, y1, 0.0)
+                new_ve = (x2, y2, 0.0)
+                ang_rad = math.radians(ang_deg)
+
+                coord_changed = (dist_2d(new_vs, orig_vs) > 0.001) or (dist_2d(new_ve, orig_ve) > 0.001)
+                len_changed = abs(L_m - seg["length"] / 1000.0) > 0.0005
+                ang_changed = abs(ang_rad - seg["angle"]) > math.radians(0.05)
+
+                if coord_changed:
+                    use_vs, use_ve = new_vs, new_ve
+                elif len_changed or ang_changed:
+                    use_ang = ang_rad if ang_changed else seg["angle"]
+                    use_vs = new_vs
+                    use_ve = (new_vs[0] + L_m * 1000.0 * math.cos(use_ang),
+                              new_vs[1] + L_m * 1000.0 * math.sin(use_ang), 0.0)
+                else:
+                    continue
+
+                w = self._apply_seg_geometry(seg, use_vs, use_ve, propagate=bool(chain_var.get()))
+                if w:
+                    warns.append("Seg-%d: %s" % (seg["id"], w))
+                if self._clamp_sub_zones(seg):
+                    warns.append("Seg-%d: 구간분할 범위가 새 길이에 맞게 자동 조정되었습니다." % seg["id"])
+                changed_cnt += 1
+
+            self.refresh_segment_table()
+            if warns:
+                messagebox.showwarning(
+                    "적용 완료 (확인 필요)",
+                    "%d개 세그먼트가 수정되었습니다.\n\n■ 확인 사항:\n- " % changed_cnt + "\n- ".join(warns)
+                )
+            else:
+                messagebox.showinfo("적용 완료", "%d개 세그먼트의 기하 정보가 수정되었습니다." % changed_cnt)
+            dlg.destroy()
+
+        ttk.Button(frm_bot, text="적용", command=on_apply).pack(side="right", padx=4, ipadx=10, ipady=3)
+        ttk.Button(frm_bot, text="닫기", command=dlg.destroy).pack(side="right", padx=4)
+
+    def _get_current_geox_key(self):
+        self.on_geox_param_edit()
+        key = self._get_selected_pool_key_silent()
+        if not key:
+            if len(self.geox_pool) == 1:
+                return next(iter(self.geox_pool.keys()))
+            messagebox.showwarning("경고", "우측 GeoX 라이브러리에서 할당할 GeoX 단면을 먼저 선택(또는 추가)해주세요.")
+            return None
+        return key
+
+    def assign_geox_to_selected_segments(self):
+        sel_segs = self.tree_seg.selection()
+        if not sel_segs:
+            messagebox.showwarning("경고", "좌측 목록에서 단면을 적용할 세그먼트(또는 세부 구간)를 먼저 선택해주세요.")
+            return
+        gkey = self._get_current_geox_key()
+        if not gkey:
+            return
+
+        gdata = self.geox_pool[gkey]
+
+        if gdata.get("is_corner_strut_file"):
+            target_ids = sorted({int(str(x).split("_")[0]) for x in sel_segs})
+            invalid_ids = []
+            for tid in target_ids:
+                for seg in self.segments:
+                    if seg["id"] == tid and seg.get("geo_known") and not seg.get("can_have_brace"):
+                        invalid_ids.append(f"Seg-{tid}")
+            if invalid_ids:
+                messagebox.showerror(
+                    "코너 사보강재 할당 불가 오류",
+                    f"선택한 구간 중 [{', '.join(invalid_ids)}] 구간은 코너 사보강재가 들어갈 수 없는 모서리(N)입니다!\n\n"
+                    f"사보강 Strut 파일({gkey})은 코너 사보강이 가능한 볼록 모서리(Y) 구간에만 할당할 수 있습니다."
+                )
+                return
+
+            for tid in target_ids:
+                for seg in self.segments:
+                    if seg["id"] == tid:
+                        seg["corner_geox_key"] = gkey
+            self.refresh_segment_table()
+            return
+
+        for iid in sel_segs:
+            s_iid = str(iid)
+            if "_" in s_iid:
+                sid_s, zidx_s = s_iid.split("_", 1)
+                sid, zidx = int(sid_s), int(zidx_s) - 1
+                for seg in self.segments:
+                    if seg["id"] == sid and seg.get("sub_zones") and 0 <= zidx < len(seg["sub_zones"]):
+                        sz = seg["sub_zones"][zidx]
+                        sz["geox_key"] = gkey
+                        clear_param_override(sz)
+                        sz["hole_no"] = gdata.get("hole_no", f"BH-{sid}-{zidx + 1}")
+                        sz["water_chk"] = gdata.get("water_chk", "0")
+                        sz["water_depth"] = gdata.get("water_depth", 0.0)
+            else:
+                sid = int(s_iid)
+                for seg in self.segments:
+                    if seg["id"] == sid:
+                        seg["geox_key"] = gkey
+                        clear_param_override(seg)
+                        seg["hole_no"] = gdata.get("hole_no", "BH-1")
+                        seg["water_chk"] = gdata.get("water_chk", "0")
+                        seg["water_depth"] = gdata.get("water_depth", 0.0)
+                        for zidx, sz in enumerate(seg.get("sub_zones") or [], start=1):
+                            sz["geox_key"] = gkey
+                            clear_param_override(sz)
+                            sz["hole_no"] = gdata.get("hole_no", f"BH-{sid}-{zidx}")
+                            sz["water_chk"] = gdata.get("water_chk", "0")
+                            sz["water_depth"] = gdata.get("water_depth", 0.0)
+
+        self.refresh_segment_table()
+
+    def assign_geox_to_all_segments(self):
+        gkey = self._get_current_geox_key()
+        if not gkey:
+            return
+        gdata = self.geox_pool[gkey]
+
+        if gdata.get("is_corner_strut_file"):
+            applied = 0
+            for seg in self.segments:
+                if not seg.get("geo_known") or seg.get("can_have_brace"):
+                    seg["corner_geox_key"] = gkey
+                    applied += 1
+            if applied == 0:
+                messagebox.showerror("할당 불가", "코너 사보강재를 적용할 수 있는 유효한 모서리(Y) 구간이 없습니다.")
+            else:
+                self.refresh_segment_table()
+                messagebox.showinfo("일괄 할당 완료", f"사보강 가능 모서리 {applied}개 구간에 사보강재 제원이 할당되었습니다.")
+            return
+
+        for seg in self.segments:
+            seg["geox_key"] = gkey
+            clear_param_override(seg)
+            seg["hole_no"] = gdata.get("hole_no", "BH-1")
+            seg["water_chk"] = gdata.get("water_chk", "0")
+            seg["water_depth"] = gdata.get("water_depth", 0.0)
+            for zidx, sz in enumerate(seg.get("sub_zones") or [], start=1):
+                sz["geox_key"] = gkey
+                clear_param_override(sz)
+                sz["hole_no"] = gdata.get("hole_no", f"BH-{seg['id']}-{zidx}")
+                sz["water_chk"] = gdata.get("water_chk", "0")
+                sz["water_depth"] = gdata.get("water_depth", 0.0)
+
+        self.refresh_segment_table()
+
+    def clear_selected_segments(self):
+        sel_segs = self.tree_seg.selection()
+        if not sel_segs:
+            messagebox.showwarning("경고", "비워둘 세그먼트를 먼저 선택해주세요.")
+            return
+        for iid in sel_segs:
+            s_iid = str(iid)
+            if "_" in s_iid:
+                sid_s, zidx_s = s_iid.split("_", 1)
+                sid, zidx = int(sid_s), int(zidx_s) - 1
+                for seg in self.segments:
+                    if seg["id"] == sid and seg.get("sub_zones") and 0 <= zidx < len(seg["sub_zones"]):
+                        seg["sub_zones"][zidx]["geox_key"] = None
+            else:
+                sid = int(s_iid)
+                for seg in self.segments:
+                    if seg["id"] == sid:
+                        seg["geox_key"] = None
+                        seg["corner_geox_key"] = None
+                        for sz in (seg.get("sub_zones") or []):
+                            sz["geox_key"] = None
+        self.refresh_segment_table()
+
+    def save_tsp_csv(self):
+        if not self.segments:
+            messagebox.showwarning("경고", "저장할 세그먼트가 없습니다.")
+            return
+
+        proj_name = re.sub(r'[,\\;:/*?"<>|\']', "_", self.project_name_var.get().strip() or "Project_GeoX")
+        try:
+            scale_s = int(self.scale_sec_var.get())
+            scale_p = int(self.scale_plan_var.get())
+        except ValueError:
+            messagebox.showwarning("경고", "단면/평면 축척은 숫자로 입력해주세요.")
+            return
+
+        if self.csv_filepath:
+            base, ext = os.path.splitext(self.csv_filepath)
+            default_out = f"{base}_updated{ext}"
+        else:
+            default_out = f"{proj_name}.csv"
+
+        out_path = filedialog.asksaveasfilename(
+            title="최종 TSP CSV 파일 저장",
+            initialfile=os.path.basename(default_out),
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if not out_path:
+            return
+
+                try:
+            csv_lines = build_complete_tsp_csv_lines(
+                proj_name=proj_name,
+                scale_s=scale_s,
+                scale_p=scale_p,
+                orient=self.boundary_orient,
+                segments=self.segments,
+                geox_pool=self.geox_pool,
+                orig_csv_lines=self.orig_csv_lines,
+                boundary_record=getattr(self, "cad_boundary_record", None),
+            )
+            with open(out_path, "w", encoding="cp949") as f:
+                for line in csv_lines:
+                    f.write(line + "\n")
+            messagebox.showinfo(
+                "저장 완료",
+                f"TSP 호환 CSV 파일이 성공적으로 생성되었습니다:\n{out_path}"
+            )
+        except Exception as e:
+            messagebox.showerror("저장 오류", f"CSV 파일 생성 중 오류가 발생했습니다:\n{e}")
+
+    def _prepare_temp_csv_for_autocad(self):
+        if not self.segments:
+            messagebox.showwarning("경고", "세그먼트가 없습니다.")
+            return None
+        has_any_defined = any(
+            (s.get("geox_key") and (s.get("geox_key") in self.geox_pool or s.get("geox_key") == "__KEEP_ORIG__"))
+            or any(sz.get("geox_key") in self.geox_pool for sz in (s.get("sub_zones") or []))
+            for s in self.segments
+        )
+        if not has_any_defined:
+            messagebox.showwarning("경고", "최소 1개 이상의 세그먼트에 GeoX 단면을 먼저 할당해주세요.")
+            return None
+
+        proj_name = re.sub(r'[,\\;:/*?"<>|\']', "_", self.project_name_var.get().strip() or "Project_GeoX")
+        try:
+            scale_s = int(self.scale_sec_var.get())
+            scale_p = int(self.scale_plan_var.get())
+        except ValueError:
+            messagebox.showwarning("경고", "단면/평면 축척은 숫자로 입력해주세요.")
+            return None
+
+        temp_dir = os.environ.get("TEMP") or os.environ.get("TMP") or os.path.dirname(os.path.abspath(__file__))
+                temp_csv = os.path.join(temp_dir, "tsp_geox_direct_bridge.csv")
+
+        csv_lines = build_complete_tsp_csv_lines(
+            proj_name=proj_name,
+            scale_s=scale_s,
+            scale_p=scale_p,
+            orient=self.boundary_orient,
+            segments=self.segments,
+            geox_pool=self.geox_pool,
+            orig_csv_lines=self.orig_csv_lines,
+            boundary_record=getattr(self, "cad_boundary_record", None),
+        )
+        with open(temp_csv, "w", encoding="cp949") as f:
+            for line in csv_lines:
+                f.write(line + "\n")
+        return temp_csv
+
+    def _send_lisp_to_autocad(self, lisp_expr):
+        """
+        [패치 적용] 
+        LISP 함수가 메모리에 로드되지 않은 상태에서 다이렉트 명령 전송 시 에러를 방지하기 위해,
+        명령어 실행 전에 (boundp)를 통해 검사하고 필요 시 TSP.lsp를 자동 로드하도록 강화했습니다.
+        """
+        import win32com.client
+        try:
+            acad = win32com.client.GetActiveObject("AutoCAD.Application")
+        except Exception:
+            acad = win32com.client.Dispatch("AutoCAD.Application")
+        try:
+            acad.Visible = True
+        except Exception:
+            pass
+        doc = acad.ActiveDocument
+        
+        # TSP 모듈이 아직 로드되지 않았다면 AutoCAD 검색 경로 내의 TSP.lsp를 자동 로드
+        check_load_cmd = '(if (not (boundp \'tsp-direct-plan-from-python)) (load "TSP.lsp"))\n'
+        doc.SendCommand(check_load_cmd)
+        
+        doc.SendCommand(lisp_expr + "\n")
+
+    def direct_draw_plan_in_autocad(self):
+        temp_csv = self._prepare_temp_csv_for_autocad()
+        if not temp_csv:
+            return
+        lisp_csv_path = temp_csv.replace("\\", "/")
+        has_bnd_flag = "T" if self.has_boundary_data else "nil"
+        handle_str = f'"{self.cad_ent_handle}"' if self.cad_ent_handle else '""'
+        if self.cad_start_pt:
+            spt_str = f"'({self.cad_start_pt[0]:.8f} {self.cad_start_pt[1]:.8f} 0.0)"
+        else:
+            spt_str = "nil"
+
+        cmd = f'(tsp-direct-plan-from-python "{lisp_csv_path}" {has_bnd_flag} {handle_str} {spt_str} {self.boundary_orient})'
+        try:
+            self._send_lisp_to_autocad(cmd)
+        except Exception as e:
+            messagebox.showerror("AutoCAD 연동 오류", f"AutoCAD로 명령을 전송하는 중 오류가 발생했습니다:\n{e}")
+
+    def direct_draw_section_in_autocad(self):
+        temp_csv = self._prepare_temp_csv_for_autocad()
+        if not temp_csv:
+            return
+        sel = self.tree_seg.selection()
+        target_seg_idx = 0
+        target_subzone_id = 0
+        if sel:
+            s_iid = str(sel[0])
+            if "_" in s_iid:
+                sid_s, z_s = s_iid.split("_", 1)
+                sid = int(sid_s)
+                target_subzone_id = int(z_s)
+            else:
+                sid = int(s_iid)
+            for idx, s in enumerate(self.segments):
+                if s["id"] == sid:
+                    target_seg_idx = idx
+                    break
+        else:
+            for idx, s in enumerate(self.segments):
+                if s.get("geox_key") or any(sz.get("geox_key") for sz in (s.get("sub_zones") or [])):
+                    target_seg_idx = idx
+                    break
+
+        lisp_csv_path = temp_csv.replace("\\", "/")
+        cmd = f'(tsp-direct-section-from-python "{lisp_csv_path}" {target_seg_idx} {target_subzone_id})'
+        try:
+            self._send_lisp_to_autocad(cmd)
+        except Exception as e:
+            messagebox.showerror("AutoCAD 연동 오류", f"AutoCAD로 명령을 전송하는 중 오류가 발생했습니다:\n{e}")
+
+    def direct_draw_elevation_in_autocad(self):
+        temp_csv = self._prepare_temp_csv_for_autocad()
+        if not temp_csv:
+            return
+        lisp_csv_path = temp_csv.replace("\\", "/")
+        has_bnd_flag = "T" if self.has_boundary_data else "nil"
+        handle_str = f'"{self.cad_ent_handle}"' if self.cad_ent_handle else '""'
+        if self.cad_start_pt:
+            spt_str = f"'({self.cad_start_pt[0]:.8f} {self.cad_start_pt[1]:.8f} 0.0)"
+        else:
+            spt_str = "nil"
+
+        cmd = f'(tsp-direct-elevation-from-python "{lisp_csv_path}" {has_bnd_flag} {handle_str} {spt_str} {self.boundary_orient})'
+        try:
+            self._send_lisp_to_autocad(cmd)
+        except Exception as e:
+            messagebox.showerror("AutoCAD 연동 오류", f"AutoCAD로 명령을 전송하는 중 오류가 발생했습니다:\n{e}")
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = GeoXToTspApp(root)
+    root.mainloop()
