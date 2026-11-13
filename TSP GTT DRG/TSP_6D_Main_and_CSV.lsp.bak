@@ -1,0 +1,809 @@
+;;; ==========================================================================
+;;; 파일명: TSP_6D_Main_and_CSV.lsp
+;;; 구  분: 메인 명령어(C:TSP), 실시간 리드로우, CSV 입출력 및 파이썬 연동 (Part D)
+;;; 역  할: C:TSP 메인 상태 머신, 실시간 평면 갱신(tsp-redraw-realtime-plan), 도면 N치 드래그 추출, CSV 내보내기/불러오기/매칭, 파이썬(GeoX) 다이렉트 연동, SUB-ZONES 전개 [C:TSP, *error*]
+;;; 포함 함수: C:TSP, *error*
+;;; --------------------------------------------------------------------------
+;;; [안내] 이 파일은 TSP.lsp(메인 로더)에 의해 자동으로 로드되는 하위 모듈입니다.
+;;;        코드 수정 시 전체 파일을 합칠 필요 없이 이 파일만 단독 패치하면 됩니다.
+;;; ==========================================================================
+
+;;;;==========================================================================
+;;; Command: TSP
+;;; Description: 가시설 평면/단면 통합 작도 메인 명령어 (Export/Import 기능 통합)
+;;;;==========================================================================
+(defun C:TSP (/ old-layer old-err dcl-path boundary-ent boundary-orient step status sel loop-program loop-draw seg-data section-draw-flag opt soil-src valid-sources idx s-data src-num src-idx perform-draw input-valid default-src save-chk loop-save saved-list exit-ok save-res target-name saved-name user-start-pt vertices poly-orient start-idx dist-start dist-end saved-start-pt use-saved last-ent handle group-name dict group-exists has-brace-y ans g-brace i new-list missing-brace-list b-data curr-len prev-idx prev-data prev-len limits new-brace abort-draw rem-count res ans2 mseg midx check-data draw-seg draw-cor proceed-draw choice-res ans-cor brace-res selected-idx dcl-id user-choice copied-keep-data copied-need-new-start pre-geo-verts pre-geo-orient pm-match pm-ok)
+  (setvar "cmdecho" 0)
+
+  (setq old-layer (getvar "CLAYER"))
+
+  (setq old-err *error*)
+  (defun *error* (msg)
+    (if old-layer (setvar "CLAYER" old-layer))
+    (setvar "cmdecho" 1)
+    (if (and msg (not (wcmatch (strcase msg) "*BREAK*,*CANCEL*,*QUIT*")))
+      (princ (strcat "\n오류 발생: " msg))
+      (princ "\n명령이 취소되었습니다.")
+    )
+    (setq *error* old-err)
+    (princ)
+  )
+
+  (princ "\n========================================")
+  (princ "\nTSP - Temporary Structure Plan")
+  (princ "\n========================================\n")
+  (setq *tsp-wall-type* "HPILE")
+  (setq dcl-path (create-tsp-dcl))
+
+  ;; 사용자의 선택에 따른 분기 (가상 상태 머신 적용)
+  (setq *is-imported-data* nil)
+  (setq next-step "MAIN_MENU") ; 시작 상태를 메인 메뉴로 설정
+
+  (while next-step
+    (cond
+      ((= next-step "MAIN_MENU")
+        ;; [메인 메뉴 호출 로직] - 상태 머신 내부로 이동하여 루프 가능하도록 수정
+        (setq dcl-id (load_dialog dcl-path))
+        (if (not (new_dialog "tsp_main_menu" dcl-id))
+          (progn (alert "메인 메뉴 DCL 로드 실패") (exit))
+        )
+        (setq user-choice "CANCEL")
+        (action_tile "btn_run" "(setq user-choice \"RUN\") (done_dialog 1)")
+        (action_tile "btn_export" "(setq user-choice \"EXPORT\") (done_dialog 2)")
+        (action_tile "btn_import" "(setq user-choice \"IMPORT\") (done_dialog 3)")
+        (action_tile "btn_load_dwg" "(setq user-choice \"LOAD_DWG\") (done_dialog 4)")
+        (action_tile "cancel" "(setq user-choice \"CANCEL\") (done_dialog 0)")
+        (start_dialog)
+        (unload_dialog dcl-id)
+        (setq next-step user-choice)
+      )
+      ((= next-step "EXPORT")
+       (tsp-export-to-csv)
+       (setq next-step "MAIN_MENU")
+      )
+      ((= next-step "IMPORT")
+       (if (tsp-import-from-csv)
+         (setq next-step "RUN")
+         (setq next-step "MAIN_MENU")
+       )
+      )
+      ((= next-step "LOAD_DWG")
+       (if (tsp-import-from-drawing)
+         (setq next-step "RUN")
+         (setq next-step "MAIN_MENU")
+       )
+      )
+      ((= next-step "RUN")
+        (setq next-step nil)
+        ;; ----- 기존 도면 작업 루프 원본 유지 -----
+      (setq step 0)
+      (setq loop-program T)
+      (setq *tsp-data-dirty* nil)
+      (setq *tsp-realtime-entities* '())
+      (setq *tsp-last-draw-state* nil) ;; CSV Import 등에서 오염된 draw-state 캐시 강제 초기화
+
+      (setq status (scale-dialog-callback dcl-path))
+
+      (cond
+        ((= status 0) ; 취소
+          (setq loop-program nil)
+        )
+        ((= status 4) ; 이전(Back)
+          (setq loop-program nil)
+          (setq next-step "MAIN_MENU") ; 메인 메뉴로 돌아가도록 루프 상태 변경
+        )
+        (t ; 확인(1) - 사용자가 입력한 최신 스케일 값을 백업하여 자동 로드 시 덮어쓰기 방지
+          (setq user-scale-sec *tsp-scale-section*)
+          (setq user-scale-plan *tsp-scale-plan*)
+          (setq loop-program T)
+        )
+      )
+
+      (setq *tsp-data-dirty* nil)
+      (if loop-program
+        (progn
+          (if *is-imported-data*
+            (if *tsp-section-only-mode*
+              (progn
+                (setq boundary-ent "SECTION_ONLY")
+                (princ "\n[시스템] 단면도 전용 모드로 도면 작업을 진행합니다.")
+              )
+              (progn
+                (setq boundary-ent *tsp-imported-ent*)
+                (princ "\n[시스템] 불러온 데이터를 기반으로 도면 작업을 이어서 진행합니다.")
+              )
+            )
+            (progn
+              (setq boundary-ent nil)
+              (while (not boundary-ent)
+                (initget "Section Exit")
+                (setq sel (entsel "\n'STEP 1' 전체 구간의 경계선(Polyline)을 선택하세요 [단면도만 작도(S)/종료(Exit)]: "))
+                (cond
+                  ((= sel "Exit") (princ "\n명령을 종료합니다.") (setq boundary-ent "CANCEL"))
+                  ((= sel "Section") (setq boundary-ent "SECTION_ONLY"))
+                  ((/= sel nil) (setq boundary-ent (car sel)))
+                  ((= sel nil) (princ "\n선택되지 않았습니다. 다시 선택해주세요."))
+                  ((= (getvar "ERRNO") 7) (princ "\n빈 공간입니다. 다시 선택하세요.") (setvar "ERRNO" 0))
+                  (t (princ "\n선택 취소됨.") (setq boundary-ent "CANCEL"))
+                )
+              )
+            )
+          )
+          (cond
+            ((= boundary-ent "SECTION_ONLY")
+             (setq *tsp-boundary-ent* nil)
+             (setq *tsp-boundary-orient* nil)
+             (if (not *is-imported-data*)
+               (progn
+                 (initget "Csv Manual")
+                 (setq sec-init-opt (getkword "\n[단면도만 작도] 초기 데이터 준비 방식을 선택하세요 [CSV불러오기(C)/직접입력(M)] <C>: "))
+                 (if (null sec-init-opt) (setq sec-init-opt "Csv"))
+                 (if (= sec-init-opt "Csv")
+                   (if (not (tsp-apply-csv-to-current-segments))
+                     (progn
+                       (reset-globals-to-defaults)
+                       (setq *tsp-current-project-name* (tsp-generate-default-project-name))
+                       (setq *segment-list* (tsp-init-dummy-segments 1))
+                     )
+                   )
+                   (progn
+                     (setq dummy-cnt (getint "\n생성할 세그먼트(단면) 개수를 입력하세요 <1>: "))
+                     (if (or (null dummy-cnt) (< dummy-cnt 1)) (setq dummy-cnt 1))
+                     (reset-globals-to-defaults)
+                     (setq *tsp-current-project-name* (tsp-generate-default-project-name))
+                     (setq *segment-list* (tsp-init-dummy-segments dummy-cnt))
+                   )
+                 )
+               )
+             )
+             (setq *tsp-section-only-mode* nil)
+             (setq loop-draw T)
+             (while loop-draw
+               (setq status (manager-dialog-callback dcl-path))
+               (cond
+                 ((= status 0)
+                   (setq exit-ok T)
+                   (if *tsp-data-dirty*
+                     (progn
+                       (setq save-res (tsp-save-confirm-dialog))
+                       (cond
+                         ((= save-res 1)
+                           ;; [예] 새 이름으로 저장 : 기존 프로젝트는 그대로 보존
+                           (setq target-name (tsp-project-save-name-prompt (strcat *tsp-current-project-name* "_edited")))
+                           (if target-name
+                             (progn
+                               (setq saved-name (tsp-save-project-data (tsp-sanitize-project-name target-name)))
+                               (if (and (boundp (quote *tsp-boundary-ent*)) *tsp-boundary-ent*)
+                                 (tsp-pm-tag-boundary *tsp-boundary-ent* saved-name)
+                               )
+                               (setq *tsp-data-dirty* nil)
+                               (princ (strcat "\n[알림] 새 프로젝트 '" saved-name "' (으)로 저장되었습니다."))
+                             )
+                             (progn
+                               (setq exit-ok nil)
+                               (princ "\n[알림] 이름 입력이 취소되어 종료를 중단합니다.")
+                             )
+                           )
+                         )
+                         ((= save-res 2)
+                           ;; [아니오] 현재 프로젝트명으로 덮어쓰기
+                           (setq saved-name (tsp-save-project-data *tsp-current-project-name*))
+                           (if (and (boundp (quote *tsp-boundary-ent*)) *tsp-boundary-ent*)
+                             (tsp-pm-tag-boundary *tsp-boundary-ent* saved-name)
+                           )
+                           (setq *tsp-data-dirty* nil)
+                           (princ (strcat "\n[알림] 현재 프로젝트 '" saved-name "' 에 덮어쓰기 저장되었습니다."))
+                         )
+                         (t
+                           ;; [취소] 저장하지 않고 종료 중단 (설정창으로 복귀)
+                           (setq exit-ok nil)
+                           (princ "\n[알림] 저장이 취소되어 종료를 중단합니다.")
+                         )
+                       )
+                     )
+                     (princ "\n[알림] 변경된 내용이 없어 종료합니다.")
+                   )
+                   (if exit-ok
+                     (progn
+                       (setq loop-draw nil)
+                       (princ "\nTSP 명령을 종료합니다.")
+                     )
+                   )
+                 )
+                 ((= status 5)
+                  (setq proceed-draw T perform-draw T)
+                  (if (or (not *tsp-target-draw-flag*) (null *tsp-soil-layers*) (= *tsp-soil-layers* '()))
+                    (progn
+                      (initget "Input Copy Skip Return")
+                      (setq opt (getkword "\n선택한 세그먼트에 지반 정보가 없거나 '단면생성 N'입니다. 작업 선택 [입력(Input)/복사(Copy)/생략(Skip)/되돌리기(Return)] <Skip>: "))
+                      (cond
+                        ((= opt "Input") (if (= (soil-dialog-callback dcl-path) 1) (princ "\n지반 정보 입력 완료.") (progn (princ "\n입력이 취소되었습니다.") (setq perform-draw nil))))
+                        ((= opt "Copy")
+                         (setq valid-sources '() idx 0)
+                         (foreach seg *segment-list* (setq s-data (cdr (assoc 'SOIL-DATA seg))) (if (and s-data (/= s-data '())) (setq valid-sources (append valid-sources (list (1+ idx))))) (setq idx (1+ idx)))
+                         (if valid-sources
+                           (progn
+                             (princ (strcat "\n복사 가능한 세그먼트 번호: " (vl-princ-to-string valid-sources)))
+                             (setq input-valid nil default-src (car valid-sources))
+                             (while (not input-valid)
+                               (setq src-num (getint (strcat "\n지반 정보를 가져올 세그먼트 번호를 입력하세요 [기본값: " (itoa default-src) "]: ")))
+                               (if (null src-num) (setq src-num default-src))
+                               (if (vl-position src-num valid-sources)
+                                 (progn (setq input-valid T src-idx (1- src-num)) (setq *tsp-soil-layers* (cdr (assoc 'SOIL-DATA (nth src-idx *segment-list*)))) (princ (strcat "\n" (itoa src-num) "번 세그먼트의 지반 정보를 적용했습니다.")))
+                                 (princ "\n잘못된 번호입니다.")
+                               )
+                             )
+                           )
+                           (progn (alert "지반 정보가 입력된 세그먼트가 하나도 없습니다.") (setq perform-draw nil))
+                         )
+                        )
+                        ((= opt "Return") (setq perform-draw nil))
+                        (t (princ "\n지반 정보 없이 구조물 단면만 그립니다."))
+                      )
+                    )
+                  )
+                  (if perform-draw
+                    (if (draw-section-ground-line dcl-path selected-idx)
+                      (princ "\n단면도 작도 완료.")
+                      (progn (princ "\n단면도 작도 취소됨.") (setq proceed-draw nil))
+                    )
+                  )
+                  (if proceed-draw
+                    (progn
+                      (initget "Yes No")
+                      (setq choice-res (vl-catch-all-apply 'getkword (list "\n설정창으로 돌아가시겠습니까? [Yes(Y)/No(N)] <Y>: ")))
+                      (if (vl-catch-all-error-p choice-res)
+                        (setq loop-draw nil)
+                        (if (= choice-res "No") (setq loop-draw nil))
+                      )
+                    )
+                  )
+                 )
+                 ((= status 16)
+                  (if (not (boundp 'drg-run-elevation-with-tsp))
+                    (if (findfile "DRG.LSP") (load (findfile "DRG.LSP")))
+                  )
+                  (if (boundp 'drg-run-elevation-with-tsp)
+                    (drg-run-elevation-with-tsp *segment-list* *tsp-boundary-ent* *tsp-boundary-orient*)
+                    (alert "DRG.LSP 파일을 찾을 수 없거나 로드되지 않았습니다.")
+                  )
+                  (initget "Yes No")
+                  (setq choice-res (vl-catch-all-apply 'getkword (list "\n설정창으로 돌아가시겠습니까? [Yes(Y)/No(N)] <Y>: ")))
+                  (if (vl-catch-all-error-p choice-res)
+                    (setq loop-draw nil)
+                    (if (= choice-res "No") (setq loop-draw nil))
+                  )
+                 )
+               )
+             )
+            )
+            ((and boundary-ent (/= boundary-ent "CANCEL"))
+             (if *is-imported-data*
+               (progn
+                 (setq boundary-orient *tsp-imported-orient*)
+                 (setq *tsp-boundary-ent* boundary-ent)
+                 (setq *tsp-boundary-orient* boundary-orient)
+               )
+               (progn
+                 (tsp-fix-mirrored-polyline boundary-ent)
+                 (setq boundary-orient (determine-boundary-orientation boundary-ent))
+                 (setq *tsp-boundary-ent* boundary-ent)
+                 (setq *tsp-boundary-orient* boundary-orient)
+               )
+             )
+             (if boundary-orient
+               (progn
+                 (setq vertices (extract-vertices boundary-ent))
+                 (tsp-zoom-to-right-half vertices)
+                 (if (not *is-imported-data*)
+                    (progn
+                      (setq saved-start-pt (vlax-ldata-get boundary-ent "TSP_START_PT"))
+                      (setq saved-start-idx (vlax-ldata-get boundary-ent "TSP_START_IDX"))
+                      (setq user-start-pt nil)
+                      (setq use-saved nil)
+                      (setq is-copied-ent nil)
+                      (if saved-start-pt
+                        (progn
+                          (setq temp-idx (tsp-get-closest-vertex-index vertices saved-start-pt))
+                          (if (> (distance (nth temp-idx vertices) saved-start-pt) 10.0)
+                            (setq is-copied-ent T)
+                          )
+                        )
+                      )
+                      (if saved-start-pt
+                        (if (and is-copied-ent (not saved-start-idx))
+                          (progn
+                            (princ "\n[시스템] 복사된 경계선이 감지되었습니다. 이전 절대좌표 방식으로는 시작점이 틀어지므로 새로 지정해야 합니다.")
+                            ;; [복사본 복원 질문] 곧바로 초기화하지 않고 사용자에게 확인
+                            ;;  - Yes: 모서리 편집/프로젝트 설정 유지 (형상 매칭으로 복원), 시작점만 새로 지정
+                            ;;  - No : 기존과 동일하게 새 프로젝트로 초기화
+                            (initget "Yes No")
+                            (setq copied-keep-data (getkword "\n 이 경계선(복사본)에서 이전에 작업한 프로젝트 설정을 불러올까요? [Yes(Y)/No(N)] <Y>: "))
+                            (if (= copied-keep-data "No")
+                              (setq use-saved nil)
+                              (progn
+                                (setq use-saved T)
+                                (setq copied-need-new-start T)
+                                (princ "\n[시스템] 저장된 프로젝트 설정을 유지합니다. 시작점(No.1)만 새로 지정해 주세요.")
+                              )
+                            )
+                          )
+                          (progn
+                            (initget "Yes No")
+                            (if (= (getkword "\n 이전에 사용된 시작점이 있습니다. 그대로 사용하시겠습니까? [Yes(Y)/No(N)] <Y>: ") "No")
+                              (progn
+                                (setq use-saved nil)
+                                (vlax-ldata-delete boundary-ent "TSP_ORIENT")
+                                (vlax-ldata-delete boundary-ent "TSP_CV_OFFSETS")
+                                (vlax-ldata-delete boundary-ent "TSP_PROJ_NAME")
+                                (setq *tsp-imported-orient* nil)
+                                (setq *tsp-saved-orient* nil)
+                                (princ "\n[알림] 시작점과 함께 파일설치 위치(방향) 및 모서리 편집 설정도 초기화됩니다.")
+                                (if (not (is-closed-polyline boundary-ent))
+                                  (setq boundary-orient (determine-boundary-orientation boundary-ent))
+                                )
+                                (setq *tsp-boundary-orient* boundary-orient)
+                              )
+                              (setq use-saved T)
+                            )
+                          )
+                        )
+                      )
+                      (if use-saved
+                        (progn
+                          (if copied-need-new-start
+                            (progn
+                              ;; [복사본] 절대좌표가 어긋났으므로 시작점만 새로 지정받고 ldata 갱신
+                              (setq user-start-pt (getpoint "\n세그먼트 시작점(No.1)이 될 위치를 클릭하세요: "))
+                              (if user-start-pt
+                                (progn
+                                  (setq user-start-pt (trans user-start-pt 1 0))
+                                  (vlax-ldata-put boundary-ent "TSP_START_PT" user-start-pt)
+                                )
+                              )
+                            )
+                            (setq user-start-pt saved-start-pt)
+                          )
+                          (if (and is-copied-ent saved-start-idx)
+                            (princ "\n[시스템] 복사된 객체입니다. 저장된 기하학적 인덱스(Index)를 사용하여 시작점 순서를 완벽히 유지합니다.")
+                          )
+                        )
+                        (progn
+                          (reset-globals-to-defaults)
+                          (setq *segment-list* nil)
+                          (setq *tsp-current-project-name* "")
+                          (princ "\n[시스템] 새로운 시작점이 지정되어 기존 세그먼트 설정 및 프로젝트 이름이 초기화됩니다.")
+                          (setq user-start-pt (getpoint "\n세그먼트 시작점(No.1)이 될 위치를 클릭하세요: "))
+                          (if user-start-pt
+                            (progn
+                              (setq user-start-pt (trans user-start-pt 1 0))
+                              (vlax-ldata-put boundary-ent "TSP_START_PT" user-start-pt)
+                            )
+                          )
+                        )
+                      )
+                      (if (is-closed-polyline boundary-ent)
+                        (progn
+                          (setq poly-orient (get-polygon-orientation vertices))
+                          (if (= poly-orient 1)
+                            (progn
+                              (setq vertices (reverse vertices))
+                              (setq boundary-orient (- boundary-orient))
+                              (setq *tsp-boundary-orient* boundary-orient)
+                            )
+                          )
+                          (if user-start-pt
+                            (progn
+                              (if (and use-saved is-copied-ent saved-start-idx)
+                                (setq start-idx saved-start-idx)
+                                (setq start-idx (tsp-get-closest-vertex-index vertices user-start-pt))
+                              )
+                              (setq vertices (tsp-shift-vertex-list vertices start-idx))
+                              (vlax-ldata-put boundary-ent "TSP_START_IDX" start-idx)
+                            )
+                          )
+                        )
+                        (progn
+                          (if user-start-pt
+                            (progn
+                              (setq dist-start (distance (car vertices) user-start-pt))
+                              (setq dist-end (distance (last vertices) user-start-pt))
+                              (if (< dist-end dist-start)
+                                (progn
+                                  (setq vertices (reverse vertices))
+                                  (setq boundary-orient (- boundary-orient))
+                                  (setq *tsp-boundary-orient* boundary-orient)
+                                )
+                              )
+                            )
+                          )
+                        )
+                      )
+                      ;; [180도 근사(5도 이내) 절점 자동 제외 및 사용자 모서리 편집 복원/실행]
+                      (setq raw-vert-cnt (length vertices) pre-geo-verts vertices pre-geo-orient boundary-orient)
+                      (if (and use-saved (tsp-load-custom-vertices-ldata boundary-ent))
+                        (progn
+                          (setq vertices (tsp-load-custom-vertices-ldata boundary-ent))
+                          ;; [방향 정합성 보정] 개방형 경계선에서 복원된 모서리 구성이 이전 작업 순서의
+                          ;; 역방향이면 파일설치 위치(방향)도 함께 반전해야 벽체가 반대편에 생성되지 않음
+                          (if (and (not (is-closed-polyline boundary-ent))
+                                   pre-geo-verts pre-geo-orient
+                                   (> (length pre-geo-verts) 1) (> (length vertices) 1)
+                                   (< (distance (car pre-geo-verts) (last vertices))
+                                      (distance (car pre-geo-verts) (car vertices))))
+                            (progn
+                              (setq boundary-orient (- pre-geo-orient))
+                              (setq *tsp-boundary-orient* boundary-orient)
+                              (princ "\n[시스템] 저장된 모서리 구성이 역방향 정렬이어서 파일설치 위치(방향)를 함께 보정했습니다.")
+                            )
+                          )
+                          (princ (strcat "\n[시스템] 이전에 설정된 모서리 구성(정점 " (itoa (length vertices)) "개)을 불러왔습니다."))
+                        )
+                        (progn
+                          (setq vertices (tsp-filter-collinear-vertices vertices (is-closed-polyline boundary-ent) 5.0))
+                          (if (> (- raw-vert-cnt (length vertices)) 0)
+                            (princ (strcat "\n[시스템] 180도에 근사(5도 이내)한 절점 " (itoa (- raw-vert-cnt (length vertices))) "개가 모서리에서 자동 제외되었습니다."))
+                          )
+                        )
+                      )
+                      ;; 모든 경계선 선택 시마다 사용자에게 세그먼트(모서리) 편집 여부 확인 (Enter 시 즉시 통과)
+                      (setq vertices (tsp-interactive-edit-corners boundary-ent boundary-orient vertices))
+                      ;; 모서리 편집이 최종 확정된 vertices 기준으로 프로젝트 자동매칭 수행
+                      (setq pm-match (if use-saved (tsp-pm-auto-select-project boundary-ent vertices dcl-path) nil))
+                      (if pm-match
+                        (progn
+                          (reset-globals-to-defaults)
+                          (setq *segment-list* nil)
+                        )
+                        (progn
+                          (reset-globals-to-defaults)
+                          (setq *segment-list* nil)
+                          (setq *tsp-current-project-name* (tsp-generate-default-project-name))
+                          (princ (strcat "\n[시스템] 새 프로젝트 '" *tsp-current-project-name* "' (으)로 시작합니다."))
+                        )
+                      )
+                      (init-segment-data boundary-ent boundary-orient vertices)
+                     (if pm-match
+                       (progn
+                         (setq pm-ok (tsp-load-project-data (car pm-match)))
+                         (if pm-ok
+                           (progn
+                             (tsp-pm-tag-boundary boundary-ent (car pm-match))
+                             (setq *tsp-data-dirty* nil)
+                             (princ (strcat "\n[시스템] 프로젝트 '" (car pm-match) "' 를 경계선에서 자동으로 불러왔습니다."))
+                           )
+                           (progn
+                             (setq *tsp-current-project-name* (tsp-generate-default-project-name))
+                             (princ (strcat "\n[시스템] 자동 불러오기에 실패하여 새 프로젝트 '" *tsp-current-project-name* "' (으)로 시작합니다."))
+                           )
+                         )
+                       )
+                     )
+                   )
+                 )
+                 (setq handle (tsp-get-entity-handle boundary-ent))
+                 (setq group-name (strcat "TSP_GRP_" handle))
+                 (setq dict (dictsearch (namedobjdict) "ACAD_GROUP"))
+                 (setq group-exists (if (and dict (dictsearch (cdr (assoc -1 dict)) group-name)) T nil))
+                 (if (not group-exists)
+                   (progn
+                     (setq last-ent (entlast))
+                     (draw-segment-numbers boundary-ent boundary-orient vertices)
+                     (tsp-group-last-entities last-ent boundary-ent)
+                   )
+                   (princ "\n[알림] 기존 평면도를 유지한 상태로 설정창에 진입합니다.")
+                 )
+                 (tsp-redraw-realtime-plan boundary-ent boundary-orient)
+                 (setq loop-draw T)
+                 (while loop-draw
+                   (setq status (manager-dialog-callback dcl-path))
+                   (cond
+                     ((= status 0)
+                       (setq exit-ok T)
+                       (if *tsp-data-dirty*
+                         (progn
+                           (setq save-res (tsp-save-confirm-dialog))
+                           (cond
+                             ((= save-res 1)
+                               ;; [예] 새 이름으로 저장 : 기존 프로젝트는 그대로 보존
+                               (setq target-name (tsp-project-save-name-prompt (strcat *tsp-current-project-name* "_edited")))
+                               (if target-name
+                                 (progn
+                                   (setq saved-name (tsp-save-project-data (tsp-sanitize-project-name target-name)))
+                                   (if (and (boundp (quote *tsp-boundary-ent*)) *tsp-boundary-ent*)
+                                     (tsp-pm-tag-boundary *tsp-boundary-ent* saved-name)
+                                   )
+                                   (setq *tsp-data-dirty* nil)
+                                   (princ (strcat "\n[알림] 새 프로젝트 '" saved-name "' (으)로 저장되었습니다."))
+                                 )
+                                 (progn
+                                   (setq exit-ok nil)
+                                   (princ "\n[알림] 이름 입력이 취소되어 종료를 중단합니다.")
+                                 )
+                               )
+                             )
+                             ((= save-res 2)
+                               ;; [아니오] 현재 프로젝트명으로 덮어쓰기
+                               (setq saved-name (tsp-save-project-data *tsp-current-project-name*))
+                               (if (and (boundp (quote *tsp-boundary-ent*)) *tsp-boundary-ent*)
+                                 (tsp-pm-tag-boundary *tsp-boundary-ent* saved-name)
+                               )
+                               (setq *tsp-data-dirty* nil)
+                               (princ (strcat "\n[알림] 현재 프로젝트 '" saved-name "' 에 덮어쓰기 저장되었습니다."))
+                             )
+                             (t
+                               ;; [취소] 저장하지 않고 종료 중단 (설정창으로 복귀)
+                               (setq exit-ok nil)
+                               (princ "\n[알림] 저장이 취소되어 종료를 중단합니다.")
+                             )
+                           )
+                         )
+                         (princ "\n[알림] 변경된 내용이 없어 종료합니다.")
+                       )
+                       (if exit-ok
+                         (progn
+                           (setq loop-draw nil)
+                           (princ "\nTSP 명령을 종료합니다.")
+                         )
+                       )
+                     )
+                     ((= status 5)
+                      (setq check-data (nth selected-idx *segment-list*))
+                      (setq b-data (cdr (assoc 'CORNER-BRACE check-data)))
+                      (setq draw-seg T draw-cor nil)
+                      (setq proceed-draw T)
+                      (if (and b-data (= (car b-data) "Y"))
+                        (progn
+                          (setq choice-res (section-choice-dialog-callback dcl-path))
+                          (if choice-res
+                            (progn
+                              (setq draw-seg (car choice-res) draw-cor (cadr choice-res))
+                              (if draw-cor
+                                (progn
+                                  (if (null (cadr b-data))
+                                    (progn
+                                      (initget "Input Skip Return")
+                                      (setq ans-cor (getkword "\n선택한 모서리에 사보강재(Corner Strut) 정보가 없습니다. 작업선택 [입력(Input)/생략(Skip)/되돌리기(Return)] <Input>: "))
+                                      (if (null ans-cor) (setq ans-cor "Input"))
+                                      (cond
+                                        ((= ans-cor "Input")
+                                         (setq limits (tsp-calculate-brace-limit selected-idx))
+                                         (setq brace-res (brace-dialog-callback dcl-path check-data limits 0))
+                                         (if (and (listp brace-res) (or (= (car brace-res) "COMP") (= (car brace-res) "NEXT")))
+                                           (progn
+                                             (setq new-brace (cadr brace-res))
+                                             (setq check-data (subst (cons 'CORNER-BRACE new-brace) (assoc 'CORNER-BRACE check-data) check-data))
+                                             (setq check-data (subst (cons 'UPGRADE-WALE (caddr brace-res)) (assoc 'UPGRADE-WALE check-data) check-data))
+                                             (setq *segment-list* (update-list-item *segment-list* selected-idx check-data))
+                                             (setq b-data new-brace)
+                                             (if (and new-brace (cadr new-brace) (> (length (cadr new-brace)) 0))
+                                               (alert "모서리 단면도 작도는 아직 작업중입니다.")
+                                               (princ "\n사보강재(Corner Strut) 정보가 입력되지 않았습니다.")
+                                             )
+                                           )
+                                           (princ "\n입력이 취소되었습니다.")
+                                         )
+                                        )
+                                        ((= ans-cor "Skip")
+                                         (princ "\n모서리 단면도 생성을 생략합니다.")
+                                        )
+                                        ((= ans-cor "Return")
+                                         (setq proceed-draw nil draw-seg nil)
+                                        )
+                                      )
+                                    )
+                                    (alert "모서리 단면도 작도는 아직 작업중입니다.")
+                                  )
+                                )
+                              )
+                            )
+                            (setq proceed-draw nil draw-seg nil)
+                          )
+                        )
+                      )
+                      (if (and proceed-draw draw-seg)
+                        (progn
+                          (setq perform-draw T)
+                          (if (or (not *tsp-target-draw-flag*) (null *tsp-soil-layers*) (= *tsp-soil-layers* '()))
+                            (progn
+                              (initget "Input Copy Skip Return")
+                              (setq opt (getkword "\n선택한 세그먼트에 지반 정보가 없거나 '단면생성 N'입니다. 작업 선택 [입력(Input)/복사(Copy)/생략(Skip)/되돌리기(Return)] <Skip>: "))
+                              (cond
+                                ((= opt "Input") (if (= (soil-dialog-callback dcl-path) 1) (princ "\n지반 정보 입력 완료.") (progn (princ "\n입력이 취소되었습니다.") (setq perform-draw nil))))
+                                ((= opt "Copy")
+                                 (setq valid-sources '() idx 0)
+                                 (foreach seg *segment-list* (setq s-data (cdr (assoc 'SOIL-DATA seg))) (if (and s-data (/= s-data '())) (setq valid-sources (append valid-sources (list (1+ idx))))) (setq idx (1+ idx)))
+                                 (if valid-sources
+                                   (progn
+                                     (princ (strcat "\n복사 가능한 세그먼트 번호: " (vl-princ-to-string valid-sources)))
+                                     (setq input-valid nil default-src (car valid-sources))
+                                     (while (not input-valid)
+                                       (setq src-num (getint (strcat "\n지반 정보를 가져올 세그먼트 번호를 입력하세요 [기본값: " (itoa default-src) "]: ")))
+                                       (if (null src-num) (setq src-num default-src))
+                                       (if (vl-position src-num valid-sources)
+                                         (progn (setq input-valid T src-idx (1- src-num)) (setq *tsp-soil-layers* (cdr (assoc 'SOIL-DATA (nth src-idx *segment-list*)))) (princ (strcat "\n" (itoa src-num) "번 세그먼트의 지반 정보를 적용했습니다.")))
+                                         (princ "\n잘못된 번호입니다.")
+                                       )
+                                     )
+                                   )
+                                   (progn (alert "지반 정보가 입력된 세그먼트가 하나도 없습니다.") (setq perform-draw nil))
+                                 )
+                                )
+                                ((= opt "Return") (setq perform-draw nil))
+                                (t (princ "\n지반 정보 없이 구조물 단면만 그립니다."))
+                              )
+                            )
+                          )
+                          (if perform-draw
+                            (progn
+                              (if (draw-section-ground-line dcl-path selected-idx)
+                                (princ "\n단면도 작도 완료.")
+                                (progn
+                                  (princ "\n단면도 작도 취소됨.")
+                                  (setq proceed-draw nil)
+                                )
+                              )
+                            )
+                          )
+                        )
+                      )
+                      (if proceed-draw
+                        (progn
+                          (initget "Yes No")
+                          (setq choice-res (vl-catch-all-apply 'getkword (list "\n설정창으로 돌아가시겠습니까? [Yes(Y)/No(N)] <Y>: ")))
+                          (if (vl-catch-all-error-p choice-res)
+                            (setq loop-draw nil)
+                            (if (= choice-res "No") (setq loop-draw nil))
+                          )
+                        )
+                      )
+                     )
+                     ((= status 6)
+                      (setq abort-draw nil)
+                      (setq missing-brace-list '())
+                      (setq i 0)
+                      (while (< i (length *segment-list*))
+                        (setq seg-data (nth i *segment-list*))
+                        (setq b-data (cdr (assoc 'CORNER-BRACE seg-data)))
+                        (if (and b-data (= (car b-data) "Y") (null (cadr b-data)))
+                          (setq missing-brace-list (append missing-brace-list (list i)))
+                        )
+                        (setq i (1+ i))
+                      )
+                      (if (> (length missing-brace-list) 0)
+                        (progn
+                          (initget "Yes No")
+                          (setq ans (getkword (strcat "\n사보강재(Corner Strut) 설정이 누락된 모서리가 " (itoa (length missing-brace-list)) "곳 있습니다. 추가하시겠습니까? [Yes(Y)/No(N)] <Y>: ")))
+                          (if (or (null ans) (= ans "Yes"))
+                            (progn
+                              (while (and (> (length missing-brace-list) 0) (not abort-draw))
+                                (setq idx (car missing-brace-list))
+                                (setq missing-brace-list (cdr missing-brace-list))
+                                (setq seg-data (nth idx *segment-list*))
+                                (setq limits (tsp-calculate-brace-limit idx))
+                                (setq rem-count (1+ (length missing-brace-list)))
+                                (setq res (brace-dialog-callback dcl-path seg-data limits rem-count))
+                                (cond
+                                  ((and (listp res) (= (car res) "NEXT"))
+                                   (setq new-brace (cadr res))
+                                   (if (and new-brace (cadr new-brace) (> (length (cadr new-brace)) 0))
+                                     (progn
+                                       (setq seg-data (subst (cons 'CORNER-BRACE new-brace) (assoc 'CORNER-BRACE seg-data) seg-data))
+                                       (setq seg-data (subst (cons 'UPGRADE-WALE (caddr res)) (assoc 'UPGRADE-WALE seg-data) seg-data))
+                                       (setq *segment-list* (update-list-item *segment-list* idx seg-data))
+                                     )
+                                     (progn
+                                       (princ (strcat "\n[" (itoa (cdr (assoc 'ID seg-data))) "번 모서리] 데이터가 비어있어 순서를 맨 뒤로 미룹니다."))
+                                       (setq missing-brace-list (append missing-brace-list (list idx)))
+                                     )
+                                   )
+                                  )
+                                  ((and (listp res) (= (car res) "COMP"))
+                                   (setq new-brace (cadr res))
+                                   (if (and new-brace (cadr new-brace) (> (length (cadr new-brace)) 0))
+                                     (progn
+                                       (setq seg-data (subst (cons 'CORNER-BRACE new-brace) (assoc 'CORNER-BRACE seg-data) seg-data))
+                                       (setq seg-data (subst (cons 'UPGRADE-WALE (caddr res)) (assoc 'UPGRADE-WALE seg-data) seg-data))
+                                       (setq *segment-list* (update-list-item *segment-list* idx seg-data))
+                                     )
+                                     (progn
+                                       ;; 빈 창에서 완료를 눌러 건너뛸 때도 "Y (미입력)" 상태를 보존하여 추후 복사/입력이 가능하도록 유지
+                                       (princ (strcat "\n[" (itoa (cdr (assoc 'ID seg-data))) "번 모서리] 데이터가 비어있어 이번 작도에서 사보강재를 생략합니다. (Y 미입력 상태 유지)"))
+                                     )
+                                   )
+                                   (if (> (length missing-brace-list) 0)
+                                     (progn
+                                       (initget "Yes No")
+                                       (setq ans2 (getkword (strcat "\n아직 사보강재(Corner Strut)가 입력되지 않은 세그먼트가 " (itoa (length missing-brace-list)) "곳 남았습니다. 이대로 설정을 종료하시겠습니까? (Yes:종료 / No:마저입력) [Yes/No] <No>: ")))
+                                       (if (= ans2 "Yes")
+                                         (setq missing-brace-list '())
+                                       )
+                                     )
+                                   )
+                                  )
+                                  (t
+                                    (princ "\n입력이 취소되었습니다. 평면도 생성을 중단합니다.")
+                                    (setq abort-draw T)
+                                  )
+                                )
+                              )
+                            )
+                            (progn
+                              ;; 추가를 건너뛸 때 기본적으로 "Y (미입력)" 상태를 유지하되, 사용자가 원할 때만 "N"으로 확정
+                              (initget "Keep Disable")
+                              (setq ans2 (getkword "\n미입력 모서리의 사보강재 가능 상태(Y)를 나중에 입력/복사할 수 있도록 유지하시겠습니까? [유지(Keep)/사보강재없음확정(Disable)] <Keep>: "))
+                              (if (= ans2 "Disable")
+                                (progn
+                                  (princ "\n미입력 모서리를 사보강재 없음(N)으로 확정하고 작도합니다.")
+                                  (foreach idx missing-brace-list
+                                    (setq seg-data (nth idx *segment-list*))
+                                    (setq seg-data (subst (cons 'CORNER-BRACE (list "N" nil)) (assoc 'CORNER-BRACE seg-data) seg-data))
+                                    (setq *segment-list* (update-list-item *segment-list* idx seg-data))
+                                  )
+                                )
+                                (princ "\n사보강재(Corner Strut) 추가를 건너뛰고 미입력(Y) 상태를 유지한 채 평면도를 작도합니다.")
+                              )
+                            )
+                          )
+                        )
+                      )
+                      (if (not abort-draw)
+                        (progn
+                          (princ "\n모든 데이터가 확인되었습니다. 최종 평면도를 갱신합니다.")
+                          (if (and *tsp-boundary-ent* *tsp-boundary-orient*)
+                            (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*)
+                          )
+                        )
+                      )
+                      (if (not abort-draw)
+                        (if *tsp-cancel-flag*
+                          (setq *tsp-cancel-flag* nil)
+                          (progn
+                            (initget "Yes No")
+                            (setq user-ans (vl-catch-all-apply 'getkword (list "\n설정창으로 다시 돌아가시겠습니까? [Yes(Y)/No(N)] <Y>: ")))
+                            (if (vl-catch-all-error-p user-ans)
+                              (setq loop-draw nil)
+                              (if (= user-ans "No") (setq loop-draw nil))
+                            )
+                          )
+                        )
+                      )
+                     )
+                     ((= status 16)
+                      (if (not (boundp 'drg-run-elevation-with-tsp))
+                        (if (findfile "DRG.LSP") (load (findfile "DRG.LSP")))
+                      )
+                      (if (boundp 'drg-run-elevation-with-tsp)
+                        (drg-run-elevation-with-tsp *segment-list* *tsp-boundary-ent* *tsp-boundary-orient*)
+                        (alert "DRG.LSP 파일을 찾을 수 없거나 로드되지 않았습니다.")
+                      )
+                      (initget "Yes No")
+                      (setq user-ans (vl-catch-all-apply 'getkword (list "\n설정창으로 다시 돌아가시겠습니까? [Yes(Y)/No(N)] <Y>: ")))
+                      (if (vl-catch-all-error-p user-ans)
+                        (setq loop-draw nil)
+                        (if (= user-ans "No") (setq loop-draw nil))
+                      )
+                     )
+                   )
+                 )
+               )
+             )
+            )
+          )
+        )
+      )
+      ;; ----- 도면 작업 루프 원본 끝 -----
+    )
+    ((= next-step "CANCEL")
+       (princ "\nTSP 명령어가 취소되었습니다.")
+       (setq next-step nil)
+     )
+    )
+  )
+
+  (if old-layer (setvar "CLAYER" old-layer))
+  (setq *error* old-err)
+
+  (setvar "cmdecho" 1)
+  (princ)
+)

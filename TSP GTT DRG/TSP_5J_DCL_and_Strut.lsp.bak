@@ -1,0 +1,1116 @@
+;;; ==========================================================================
+;;; 파일명: TSP_5J_DCL_and_Strut.lsp
+;;; 구  분: DCL 다이얼로그 UI, 세그먼트 매니저 및 버팀보/앵커/까치발 수동 작도 (Part J)
+;;; 역  할: 전체 DCL 생성, 세그먼트 매니저/마법사/대시보드, 지반/범례/벽체/사보강재/지보재 콜백, 수동 버팀보/까치발/연속보강재/앵커편심각/중간말뚝 작도 및 제어 [brace-dialog-callback, tsp-brace-stage-edit-dialog, tsp-extract-corner-brace-stages, tsp-pack-corner-brace-stages, tsp-clean-manual-posts-for-deleted-brace]
+;;; 포함 함수: brace-dialog-callback, tsp-brace-stage-edit-dialog, tsp-extract-corner-brace-stages, tsp-pack-corner-brace-stages, tsp-clean-manual-posts-for-deleted-brace
+;;; --------------------------------------------------------------------------
+;;; [안내] 이 파일은 TSP.lsp(메인 로더)에 의해 자동으로 로드되는 하위 모듈입니다.
+;;;        코드 수정 시 전체 파일을 합칠 필요 없이 이 파일만 단독 패치하면 됩니다.
+;;; ==========================================================================
+
+;;;;==========================================================================
+;;;; defun tsp-extract-corner-brace-stages : CORNER-BRACE 데이터에서 단별 사보강재 목록 추출
+;;;;   - 신버전("MULTI"): (nth 12 p-brace) 에 저장된 ((이름 깊이 b-rows slender is-manual interval enable margin post-enable post-side post-layout post-invert) ...) 반환
+;;;;   - 구버전(단일 설정): (cadr p-brace) 가 있으면 1단 목록으로 자동 마이그레이션하여 반환
+;;;;==========================================================================
+(defun tsp-extract-corner-brace-stages (p-brace seg-data / stages sup-list def-d b-rows slender is-man intv enab marg p-en p-sd p-lay p-inv)
+  (cond
+    ((or (null p-brace) (/= (car p-brace) "Y")) '())
+    ((and (> (length p-brace) 12) (= (nth 11 p-brace) "MULTI") (listp (nth 12 p-brace)))
+     (nth 12 p-brace)
+    )
+    ((and (cadr p-brace) (listp (cadr p-brace)) (> (length (cadr p-brace)) 0))
+     (setq sup-list (if seg-data (cdr (assoc 'SUPPORT-LIST seg-data)) nil))
+     (setq def-d (if (and sup-list (listp (car sup-list)) (> (length (car sup-list)) 3))
+                   (float (cadddr (car sup-list)))
+                   1.5))
+     (setq b-rows (cadr p-brace))
+     (setq slender (if (> (length p-brace) 2) (nth 2 p-brace) "1"))
+     (setq is-man  (if (> (length p-brace) 3) (nth 3 p-brace) "0"))
+     (setq intv    (if (> (length p-brace) 4) (nth 4 p-brace) "0.0"))
+     (setq enab    (if (> (length p-brace) 5) (nth 5 p-brace) "1"))
+     (setq marg    (if (> (length p-brace) 6) (nth 6 p-brace) "50"))
+     (setq p-en    (if (> (length p-brace) 7) (nth 7 p-brace) "0"))
+     (setq p-sd    (if (> (length p-brace) 8) (nth 8 p-brace) "L"))
+     (setq p-lay   (if (> (length p-brace) 9) (nth 9 p-brace) "1"))
+     (setq p-inv   (if (> (length p-brace) 10) (nth 10 p-brace) "0"))
+     (list (list "Corner_1" def-d b-rows slender is-man intv enab marg p-en p-sd p-lay p-inv))
+    )
+    (t '())
+  )
+)
+
+;;;;==========================================================================
+;;;; defun tsp-sort-corner-brace-stages : 설치깊이(m) 오름차순으로 사보강재 단 목록 정렬
+;;;;==========================================================================
+(defun tsp-sort-corner-brace-stages (stages / )
+  (vl-sort stages '(lambda (a b) (< (float (nth 1 a)) (- (float (nth 1 b)) 1e-4))))
+)
+
+;;;;==========================================================================
+;;;; defun tsp-pack-corner-brace-stages : 단별 사보강재 목록(stages)을 CORNER-BRACE 저장 포맷으로 패키징
+;;;;   - 대표 1단 데이터를 인덱스 1~10에 그대로 유지하여 기존 모든 모듈과 100% 호환 보장
+;;;;   - 인덱스 11에 "MULTI", 인덱스 12에 정렬된 전체 stages 리스트 저장
+;;;;==========================================================================
+(defun tsp-pack-corner-brace-stages (stages / sorted s0)
+  (setq sorted (tsp-sort-corner-brace-stages stages))
+  (if (null sorted)
+    (list "Y" nil)
+    (progn
+      (setq s0 (car sorted))
+      (list "Y"
+            (nth 2 s0) ; 대표 1단 b-rows
+            (nth 3 s0) ; slender
+            (nth 4 s0) ; is-manual
+            (nth 5 s0) ; interval
+            (nth 6 s0) ; enable
+            (nth 7 s0) ; margin
+            (nth 8 s0) ; post-enable
+            (nth 9 s0) ; post-side
+            (nth 10 s0) ; post-layout
+            (nth 11 s0) ; post-invert
+            "MULTI"
+            sorted)
+    )
+  )
+)
+
+;;;;==========================================================================
+;;;; defun tsp-brace-stage-edit-dialog : 개별 단 사보강재 세부 설정 다이얼로그 (설치깊이 입력 포함)
+;;;;==========================================================================
+(defun tsp-brace-stage-edit-dialog (dcl-path temp-seg-data limits existing-stage def-name def-depth cur-upg-chk cur-upg-spec user-upg-pts /
+                                    dcl-id result seg-id-str cur-wale-spec cur-wale-vals cur-wale-h
+                                    cur-idx prev-idx seg-prev seg-cur p-corner p-prev p-next a1 a2 delta internal-angle-deg
+                                    hard-limit soft-limit full-brace-list std-len jack-list conn-list slender-list
+                                    stage-name stage-depth-str temp-b-rows
+                                    init-slender init-is-manual init-interval init-enable init-margin
+                                    init-post-enable init-post-side init-post-layout init-post-invert
+                                    user-input-dist user-brace-spec user-brace-jack user-brace-conn
+                                    user-chk-upgrade user-upg-spec is-conn-touched initial-conn-idx last-row-conn last-conn-idx
+                                    orig-seg-data did-temp-draw loop-brace ret-val save-ui-state-str
+                                    get-auto-spec update-upgrade-ui update-stiffener-ui update-brace-list validate-and-close
+                                    prev-wale-spec prev-wale-vals prev-wale-h adj-max-h adj-max-spec last-auto-max-spec is-init-phase
+                                    input-dist num-b-rows prev-dist abs-dist is-dbl-sel min-req do-proceed tmp-id idx res-spec res-custom tmp-spec res-jack res-conn
+                                    sel-idx-str sel-indices sel-idx next-b-row next-dist cur-abs-dist i new-list
+                                    tmp-upg tmp-stage tmp-brace tmp-seg tmp-id-num)
+  (setq seg-id-str (itoa (if (assoc 'ID temp-seg-data) (cdr (assoc 'ID temp-seg-data)) 0)))
+  (setq cur-wale-spec (cdr (assoc 'WALE-SPEC temp-seg-data)))
+  (setq cur-wale-vals (if (= cur-wale-spec "User-defined") (cdr (assoc 'WALE-CUSTOM temp-seg-data)) (parse-h-spec cur-wale-spec)))
+  (setq cur-wale-h (if cur-wale-vals (nth 0 cur-wale-vals) 300))
+
+  (setq cur-idx (1- (if (assoc 'ID temp-seg-data) (cdr (assoc 'ID temp-seg-data)) 1)))
+  (setq prev-idx (if (= cur-idx 0) (1- (length *segment-list*)) (1- cur-idx)))
+  (setq seg-prev (if (and (>= prev-idx 0) (< prev-idx (length *segment-list*))) (nth prev-idx *segment-list*) nil))
+  (setq seg-cur temp-seg-data)
+
+  (setq p-corner (cdr (assoc 'V-START seg-cur)))
+  (setq p-prev (if seg-prev (cdr (assoc 'V-START seg-prev)) nil))
+  (setq p-next (cdr (assoc 'V-END seg-cur)))
+
+  (setq internal-angle-deg 90.0)
+  (if (and p-corner p-prev p-next)
+    (progn
+      (setq a1 (angle p-corner p-prev))
+      (setq a2 (angle p-corner p-next))
+      (setq delta (abs (- a1 a2)))
+      (if (> delta pi) (setq delta (- (* 2.0 pi) delta)))
+      (setq internal-angle-deg (* delta (/ 180.0 pi)))
+    )
+  )
+
+  (setq hard-limit (car limits))
+  (setq soft-limit (cadr limits))
+  (setq full-brace-list (append *tsp-std-wall-list* (mapcar '(lambda (x) (vl-string-subst "2H " "H " x)) *tsp-std-wall-list*)))
+
+  (defun get-auto-spec (base-spec base-custom target-dist is-mod / limit-val act-wale-h real-d real-t-L l-m)
+    (setq limit-val (if (= (get_tile "slenderness_limit") "0") 100.0 120.0))
+    (setq act-wale-h cur-wale-h)
+    (if (= (get_tile "chk_upgrade_wale") "1")
+      (setq act-wale-h (nth 0 (parse-h-spec (nth (atoi (get_tile "upgrade_wale_spec")) *tsp-std-wall-list*))))
+    )
+    (setq real-d (max 0.0 (- target-dist (/ act-wale-h 1000.0))))
+    (setq real-t-L (* real-d (sqrt (* 2.0 (- 1.0 (cos (* internal-angle-deg (/ pi 180.0))))))))
+    (setq l-m (tsp-calc-unsupported-length base-custom limit-val))
+
+    (if (and (> real-t-L 25.0) (wcmatch base-spec "*H*"))
+      (if (not *tsp-brace-buckle-warned*)
+        (progn
+          (alert (strcat "경고: 사보강재의 예상 길이(" (rtos real-t-L 2 1) "m)가 자중 좌굴 한계(25m)를 초과합니다.\n안전성에 유의하여 작도를 진행합니다."))
+          (setq *tsp-brace-buckle-warned* T)
+        )
+      )
+    )
+
+    (if (and (> real-t-L l-m) (wcmatch base-spec "H *"))
+      (if is-mod
+        (progn
+          (if (not *tsp-warned-flag*)
+            (progn
+              (alert "경고: 사보강재의 최대 길이가 세장비 허용 한계를 초과합니다!\n안전을 위해 맞버팀대(2H)가 권장되나, 사용자의 요청에 의해 1겹(H)으로 강제 적용됩니다.\n구조 검토를 반드시 확인하세요.")
+              (setq *tsp-warned-flag* T)
+            )
+          )
+          base-spec
+        )
+        (vl-string-subst "2H " "H " base-spec)
+      )
+      base-spec
+    )
+  )
+
+  (if existing-stage
+    (progn
+      (setq stage-name (if (nth 0 existing-stage) (nth 0 existing-stage) def-name))
+      (setq stage-depth-str (rtos (float (if (nth 1 existing-stage) (nth 1 existing-stage) def-depth)) 2 2))
+      (setq temp-b-rows (nth 2 existing-stage))
+      (setq init-slender (if (> (length existing-stage) 3) (nth 3 existing-stage) "1"))
+      (setq init-is-manual (if (> (length existing-stage) 4) (nth 4 existing-stage) "0"))
+      (setq init-interval (if (> (length existing-stage) 5) (nth 5 existing-stage) "0.0"))
+      (setq init-enable (if (> (length existing-stage) 6) (nth 6 existing-stage) "1"))
+      (setq init-margin (if (> (length existing-stage) 7) (nth 7 existing-stage) "50"))
+      (setq init-post-enable (if (> (length existing-stage) 8) (nth 8 existing-stage) "0"))
+      (setq init-post-side (if (> (length existing-stage) 9) (nth 9 existing-stage) "L"))
+      (setq init-post-layout (if (> (length existing-stage) 10) (nth 10 existing-stage) "1"))
+      (setq init-post-invert (if (> (length existing-stage) 11) (nth 11 existing-stage) "0"))
+    )
+    (progn
+      (setq stage-name def-name)
+      (setq stage-depth-str (rtos (float def-depth) 2 2))
+      (setq temp-b-rows '())
+      (setq init-slender "1" init-is-manual "0" init-interval "0.0" init-enable "1" init-margin "50")
+      (setq init-post-enable "0" init-post-side "L" init-post-layout "1" init-post-invert "0")
+    )
+  )
+
+  (setq user-input-dist nil user-brace-spec nil user-brace-jack nil user-brace-conn nil)
+  (setq user-chk-upgrade cur-upg-chk user-upg-spec cur-upg-spec)
+  (setq orig-seg-data (nth cur-idx *segment-list*))
+  (setq did-temp-draw nil)
+
+  (defun tsp-clean-manual-posts-for-deleted-brace (del-indices / new-added new-deleted pt min-d best-idx idx d_m b_dist ptA ptB line-ang dist-to-line check-id rec-cat seg-id-num)
+    (if (and p-corner a1 a2)
+      (progn
+        (setq seg-id-num (if (assoc 'ID temp-seg-data) (cdr (assoc 'ID temp-seg-data)) 0))
+        (setq new-added '())
+        (foreach rec *tsp-temp-added-posts*
+          (setq pt (nth 0 rec))
+          (setq check-id (if (> (length rec) 7) (nth 7 rec) -1))
+          (setq rec-cat (if (> (length rec) 8) (nth 8 rec) "STRUT"))
+          (if (and (= check-id seg-id-num) (= rec-cat "BRACE"))
+            (progn
+              (setq min-d 1e99 best-idx -1 idx 0)
+              (foreach row temp-b-rows
+                (setq d_m (nth 2 row) b_dist (* d_m 1000.0))
+                (setq ptA (polar p-corner a1 b_dist) ptB (polar p-corner a2 b_dist))
+                (setq line-ang (angle ptA ptB))
+                (setq dist-to-line (abs (- (* (- (car pt) (car ptA)) (sin line-ang)) (* (- (cadr pt) (cadr ptA)) (cos line-ang)))))
+                (if (< dist-to-line min-d) (progn (setq min-d dist-to-line best-idx idx)))
+                (setq idx (1+ idx))
+              )
+              (if (not (vl-position best-idx del-indices))
+                (setq new-added (append new-added (list rec)))
+              )
+            )
+            (setq new-added (append new-added (list rec)))
+          )
+        )
+        (setq *tsp-temp-added-posts* new-added)
+
+        (setq new-deleted '())
+        (foreach pt *tsp-temp-deleted-posts*
+          (if (< (distance p-corner pt) 50000.0)
+            (progn
+              (setq min-d 1e99 best-idx -1 idx 0)
+              (foreach row temp-b-rows
+                (setq d_m (nth 2 row) b_dist (* d_m 1000.0))
+                (setq ptA (polar p-corner a1 b_dist) ptB (polar p-corner a2 b_dist))
+                (setq line-ang (angle ptA ptB))
+                (setq dist-to-line (abs (- (* (- (car pt) (car ptA)) (sin line-ang)) (* (- (cadr pt) (cadr ptA)) (cos line-ang)))))
+                (if (< dist-to-line min-d) (progn (setq min-d dist-to-line best-idx idx)))
+                (setq idx (1+ idx))
+              )
+              (if (and (< min-d 1500.0) (vl-position best-idx del-indices))
+                nil
+                (setq new-deleted (append new-deleted (list pt)))
+              )
+            )
+            (setq new-deleted (append new-deleted (list pt)))
+          )
+        )
+        (setq *tsp-temp-deleted-posts* new-deleted)
+      )
+    )
+  )
+
+  (setq loop-brace T ret-val nil)
+  (setq *tsp-brace-buckle-warned* nil)
+
+  (while loop-brace
+    (setq dcl-id (load_dialog dcl-path))
+    (if (new_dialog "tsp_brace_single" dcl-id)
+      (progn
+        (setq save-ui-state-str
+          "(progn
+             (setq stage-name (get_tile \"brace_stage_name\"))
+             (setq stage-depth-str (get_tile \"brace_stage_depth\"))
+             (setq user-input-dist (get_tile \"brace_dist\"))
+             (setq user-brace-spec (get_tile \"brace_spec\"))
+             (setq user-brace-jack (get_tile \"brace_jack\"))
+             (setq user-brace-conn (get_tile \"brace_conn\"))
+             (setq user-chk-upgrade (get_tile \"chk_upgrade_wale\"))
+             (setq user-upg-spec (get_tile \"upgrade_wale_spec\"))
+             (setq init-slender (get_tile \"slenderness_limit\"))
+             (setq init-is-manual (get_tile \"chk_manual_interval\"))
+             (setq init-interval (get_tile \"stiffener_interval\"))
+             (setq init-enable (get_tile \"chk_stiffener_enable\"))
+             (setq init-margin (get_tile \"stiffener_margin\"))
+             (setq init-post-enable (get_tile \"chk_post_enable\"))
+             (setq init-post-side (if (= (get_tile \"post_side_R\") \"1\") \"R\" \"L\"))
+             (setq init-post-layout (get_tile \"post_layout_mode\"))
+             (setq init-post-invert (get_tile \"chk_post_invert\"))
+           )"
+        )
+
+        (set_tile "brace_dlg_title" (strcat seg-id-str "번 모서리 사보강재 세부 설정 (" stage-name ")"))
+        (set_tile "brace_info" (strcat "▶ 절대 한계: " (rtos hard-limit 2 2) "m / 권장(50%): " (rtos soft-limit 2 2) "m"))
+        (set_tile "brace_stage_name" stage-name)
+        (set_tile "brace_stage_depth" stage-depth-str)
+
+        ;; 세부 설정창에서는 하단 [다음] 버튼을 숨기고 [완료(확인)] / [취소]에 집중
+        (mode_tile "accept" 1)
+
+        (start_list "brace_spec")
+        (mapcar 'add_list (append full-brace-list '("User-defined")))
+        (end_list)
+        (setq std-len (length full-brace-list))
+        (setq jack-list '("잭 없음" "스크류잭" "유압잭"))
+        (start_list "brace_jack") (mapcar 'add_list jack-list) (end_list)
+        (setq conn-list '("" "화타쐐기 없음" "화타쐐기 TYPE-G1"))
+        (start_list "brace_conn") (mapcar 'add_list conn-list) (end_list)
+
+        (setq slender-list '("100 (표준 기준)" "120 (최대 예외 한계)"))
+        (start_list "slenderness_limit") (mapcar 'add_list slender-list) (end_list)
+
+        (set_tile "chk_stiffener_enable" init-enable)
+        (set_tile "slenderness_limit" init-slender)
+        (set_tile "chk_manual_interval" init-is-manual)
+        (set_tile "stiffener_interval" init-interval)
+        (set_tile "stiffener_margin" init-margin)
+        (set_tile "chk_post_enable" init-post-enable)
+        (if (= init-post-side "R") (set_tile "post_side_R" "1") (set_tile "post_side_L" "1"))
+        (start_list "post_layout_mode") (mapcar 'add_list '("전체 배치" "교차 배치")) (end_list)
+        (set_tile "post_layout_mode" init-post-layout)
+        (set_tile "chk_post_invert" init-post-invert)
+        (if (= init-post-layout "1") (mode_tile "chk_post_invert" 0) (mode_tile "chk_post_invert" 1))
+
+        (action_tile "post_layout_mode" (strcat "(progn (setq init-post-layout $value) (if (= $value \"1\") (mode_tile \"chk_post_invert\" 0) (progn (mode_tile \"chk_post_invert\" 1) (set_tile \"chk_post_invert\" \"0\") (setq init-post-invert \"0\"))) " save-ui-state-str "(done_dialog 7))"))
+        (action_tile "chk_post_invert" (strcat "(progn (setq init-post-invert $value) " save-ui-state-str "(done_dialog 7))"))
+
+        (start_list "upgrade_wale_spec") (mapcar 'add_list *tsp-std-wall-list*) (end_list)
+
+        (setq prev-wale-spec (if seg-prev (cdr (assoc 'WALE-SPEC seg-prev)) nil))
+        (setq prev-wale-vals (if (and prev-wale-spec (= prev-wale-spec "User-defined")) (cdr (assoc 'WALE-CUSTOM seg-prev)) (if prev-wale-spec (parse-h-spec prev-wale-spec) nil)))
+        (setq prev-wale-h (if prev-wale-vals (nth 0 prev-wale-vals) 300))
+
+        (set_tile "chk_upgrade_wale" (if user-chk-upgrade user-chk-upgrade "0"))
+        (set_tile "upgrade_wale_spec" (if user-upg-spec user-upg-spec "2"))
+
+        (defun update-upgrade-ui (/ max-h max-spec check-h b-idx check-vals spec-idx req-h req-spec)
+          (setq max-h 0 max-spec nil)
+          (foreach b temp-b-rows
+            (setq check-h (nth 0 (cadr b)))
+            (if (> check-h max-h) (progn (setq max-h check-h) (setq max-spec (car b))))
+          )
+          (setq b-idx (atoi (get_tile "brace_spec")))
+          (if (< b-idx std-len)
+            (progn
+              (setq check-vals (parse-h-spec (vl-string-subst "H " "2H " (nth b-idx full-brace-list))))
+              (if (and check-vals (> (nth 0 check-vals) max-h))
+                (progn (setq max-h (nth 0 check-vals)) (setq max-spec (nth b-idx full-brace-list)))
+              )
+            )
+            (progn
+              (setq check-vals (list (atoi (get_tile "brace_h")) 0 0 0))
+              (if (> (nth 0 check-vals) max-h)
+                (progn (setq max-h (nth 0 check-vals)) (setq max-spec "User-defined"))
+              )
+            )
+          )
+          (setq req-h (max max-h cur-wale-h (if prev-wale-spec prev-wale-h 0)))
+          (setq req-spec cur-wale-spec)
+          (if (and prev-wale-spec (= req-h prev-wale-h)) (setq req-spec prev-wale-spec))
+          (if (= req-h max-h) (setq req-spec max-spec))
+          (mode_tile "chk_upgrade_wale" 0)
+          (mode_tile "upgrade_wale_spec" 0)
+          (if (or (> max-h cur-wale-h) (and prev-wale-spec (/= prev-wale-h cur-wale-h)))
+            (if (not (equal last-auto-max-spec req-spec))
+              (progn
+                (set_tile "chk_upgrade_wale" "1")
+                (if (and req-spec (/= req-spec "User-defined") (setq spec-idx (vl-position req-spec *tsp-std-wall-list*)))
+                  (set_tile "upgrade_wale_spec" (itoa spec-idx))
+                )
+                (setq last-auto-max-spec req-spec)
+              )
+            )
+            (setq last-auto-max-spec nil)
+          )
+        )
+
+        (defun update-stiffener-ui (/ limit-val is-manual b-custom max-dist L-max real-dist real-total-L num-div req-interval str-L ang-rad last-row is-enabled active-wale-h upg-idx)
+          (setq is-enabled (get_tile "chk_stiffener_enable"))
+          (if (= is-enabled "0")
+            (progn
+              (mode_tile "slenderness_limit" 1)
+              (mode_tile "chk_manual_interval" 1)
+              (mode_tile "stiffener_interval" 1)
+              (mode_tile "stiffener_margin" 1)
+              (set_tile "stiffener_info" "보강재 배열 생성 생략 (사보강재 메인 프레임만 생성)")
+            )
+            (progn
+              (mode_tile "slenderness_limit" 0)
+              (mode_tile "chk_manual_interval" 0)
+              (mode_tile "stiffener_margin" 0)
+              (setq limit-val (if (= (get_tile "slenderness_limit") "0") 100.0 120.0))
+              (setq is-manual (get_tile "chk_manual_interval"))
+              (if (= is-manual "1") (mode_tile "stiffener_interval" 0) (mode_tile "stiffener_interval" 1))
+              (if (and temp-b-rows (> (length temp-b-rows) 0))
+                (progn
+                  (setq last-row (last temp-b-rows))
+                  (setq b-custom (nth 1 last-row))
+                  (setq max-dist (nth 2 last-row))
+                  (setq ang-rad (* internal-angle-deg (/ pi 180.0)))
+                  (setq active-wale-h cur-wale-h)
+                  (if (= (get_tile "chk_upgrade_wale") "1")
+                    (progn
+                      (setq upg-idx (atoi (get_tile "upgrade_wale_spec")))
+                      (if (< upg-idx (length *tsp-std-wall-list*))
+                        (setq active-wale-h (nth 0 (parse-h-spec (nth upg-idx *tsp-std-wall-list*))))
+                      )
+                    )
+                  )
+                  (setq real-dist (max 0.0 (- max-dist (/ active-wale-h 1000.0))))
+                  (setq real-total-L (* real-dist (sqrt (* 2.0 (- 1.0 (cos ang-rad))))))
+                  (setq L-max (tsp-calc-unsupported-length b-custom limit-val))
+                  (setq num-div (fix (+ (/ real-total-L L-max) 0.9999)))
+                  (if (< num-div 1) (setq num-div 1))
+                  (setq req-interval (/ real-total-L num-div))
+                  (setq str-L (strcat "최대 사보강재 길이: " (rtos real-total-L 2 3) "m / 허용: " (rtos L-max 2 1) "m"))
+                  (if (> num-div 1)
+                    (set_tile "stiffener_info" (strcat str-L " -> " (itoa num-div) "등분 (" (rtos req-interval 2 2) "m)"))
+                    (set_tile "stiffener_info" (strcat str-L " -> 보강재 불필요"))
+                  )
+                  (if (= is-manual "0")
+                    (set_tile "stiffener_interval" (rtos req-interval 2 2))
+                  )
+                )
+                (set_tile "stiffener_info" "사보강재(Corner Strut)를 먼저 추가하세요.")
+              )
+            )
+          )
+        )
+
+        (defun update-brace-list (/ i prev item spec m-dist rel-dist disp tag-str b-jack b-conn prev-conn last-conn-idx last-row-conn)
+          (start_list "brace_list")
+          (setq i 0 prev 0.0 prev-conn "화타쐐기 없음")
+          (foreach item temp-b-rows
+            (setq spec (car item) m-dist (nth 2 item) b-jack (nth 3 item) b-conn (nth 4 item))
+            (if (or (null b-jack) (= b-jack ""))
+              (setq b-jack (if (= i 0) "잭 없음" "스크류잭"))
+            )
+            (if (null b-conn) (setq b-conn prev-conn))
+            (setq prev-conn b-conn)
+            (setq rel-dist (- m-dist prev))
+            (if (> m-dist hard-limit)
+              (setq tag-str "  [!] 절대 한계 초과")
+              (if (> m-dist soft-limit) (setq tag-str "  [!] 권장 한계 초과") (setq tag-str ""))
+            )
+            (if (= i 0)
+              (setq disp (strcat (itoa (1+ i)) "열: " spec " (" b-jack ") [" b-conn "] / " (rtos m-dist 2 2) "m" tag-str))
+              (setq disp (strcat (itoa (1+ i)) "열: " spec " (" b-jack ") [" b-conn "] / +" (rtos rel-dist 2 2) "m (누적 " (rtos m-dist 2 2) "m)" tag-str))
+            )
+            (add_list disp)
+            (setq prev m-dist i (1+ i))
+          )
+          (end_list)
+          (if (> (length temp-b-rows) 0)
+            (set_tile "brace_list" (itoa (1- (length temp-b-rows))))
+            (set_tile "brace_list" "")
+          )
+          (update-stiffener-ui)
+          (if (= (length temp-b-rows) 0)
+            (progn
+              (set_tile "brace_conn" "1")
+              (setq is-conn-touched nil)
+            )
+            (if (not is-conn-touched)
+              (progn
+                (setq last-row-conn (nth 4 (last temp-b-rows)))
+                (setq last-conn-idx (if last-row-conn (vl-position (if (= last-row-conn "마감철판 직결") "" last-row-conn) conn-list) 1))
+                (if (null last-conn-idx) (setq last-conn-idx 1))
+                (set_tile "brace_conn" (itoa last-conn-idx))
+              )
+            )
+          )
+        )
+
+        (update-brace-list)
+
+        (if user-input-dist
+          (set_tile "brace_dist" user-input-dist)
+          (if (>= hard-limit 1.5) (set_tile "brace_dist" "1.5") (set_tile "brace_dist" "1.0"))
+        )
+        (set_tile "brace_spec" (if user-brace-spec user-brace-spec "2"))
+        ;; 1열 추가 대기 상태(목록 0개)이면 기본값 "잭 없음"("0"), 2열 이상 추가 대기 상태이면 기본값 "스크류잭"("1")
+        (set_tile "brace_jack"
+          (if user-brace-jack
+            user-brace-jack
+            (if (= (length temp-b-rows) 0) "0" "1")
+          )
+        )
+
+        (setq initial-conn-idx "1")
+        (if (> (length temp-b-rows) 0)
+          (progn
+            (setq last-row-conn (nth 4 (last temp-b-rows)))
+            (setq last-conn-idx (if last-row-conn (vl-position (if (= last-row-conn "마감철판 직결") "" last-row-conn) conn-list) 1))
+            (if (null last-conn-idx) (setq last-conn-idx 1))
+            (setq initial-conn-idx (itoa last-conn-idx))
+          )
+        )
+        (set_tile "brace_conn" (if user-brace-conn user-brace-conn initial-conn-idx))
+
+        (mode_tile "brace_h" 1) (mode_tile "brace_b" 1) (mode_tile "brace_tw" 1) (mode_tile "brace_tf" 1)
+        (action_tile "brace_spec"
+          (strcat
+            "(if (= (atoi $value) std-len) "
+            "  (progn (mode_tile \"brace_h\" 0)(mode_tile \"brace_b\" 0)(mode_tile \"brace_tw\" 0)(mode_tile \"brace_tf\" 0)) "
+            "  (progn (mode_tile \"brace_h\" 1)(mode_tile \"brace_b\" 1)(mode_tile \"brace_tw\" 1)(mode_tile \"brace_tf\" 1))) "
+            "(if (wcmatch (nth (atoi $value) full-brace-list) \"2H *\") "
+            "  (if (< (atof (get_tile \"brace_dist\")) 2.0) (set_tile \"brace_dist\" \"2.0\"))) "
+            "(update-upgrade-ui)"
+          )
+        )
+        (action_tile "brace_h" "(update-upgrade-ui)")
+        (action_tile "brace_conn" "(setq is-conn-touched T)")
+        (action_tile "chk_stiffener_enable" "(update-stiffener-ui)")
+        (action_tile "slenderness_limit" "(update-stiffener-ui)")
+        (action_tile "chk_manual_interval" "(update-stiffener-ui)")
+
+        (setq is-init-phase T)
+        (update-upgrade-ui)
+        (setq is-init-phase nil)
+
+        (action_tile "btn_measure" (strcat "(progn " save-ui-state-str "(done_dialog 5))"))
+
+        (action_tile "btn_add"
+          (strcat
+            "(progn (setq input-dist (atof (get_tile \"brace_dist\"))) (setq num-b-rows (length temp-b-rows)) (setq prev-dist (if (> num-b-rows 0) (nth 2 (last temp-b-rows)) 0.0)) (setq abs-dist (+ prev-dist input-dist)) "
+            "(setq is-dbl-sel (wcmatch (if (< (atoi (get_tile \"brace_spec\")) std-len) (nth (atoi (get_tile \"brace_spec\")) full-brace-list) \"\") \"2H *\")) "
+            "(setq min-req (if is-dbl-sel (if (= num-b-rows 0) 1.5 1.2) (if (= num-b-rows 0) 1.0 0.8))) "
+            "(if (< input-dist min-req) "
+            "  (if is-dbl-sel "
+            "    (if (= num-b-rows 0) (alert (strcat \"맞버팀대(2H) 1열은 코너부 간섭을 피하기 위해 최소 \" (rtos min-req 2 1) \"m 이상 이격해야 합니다.\")) (alert (strcat \"맞버팀대(2H) 다중열 설치 시 부재 간 간섭 방지를 위해 최소 \" (rtos min-req 2 1) \"m 이상 이격해야 합니다.\"))) "
+            "    (if (= num-b-rows 0) (alert (strcat \"1열 사보강재(Corner Strut)는 여유 공간을 위해 최소 \" (rtos min-req 2 1) \"m 이상 이격해야 합니다.\")) (alert (strcat \"여러 열 설치 시 부재 간 간섭 방지를 위해 최소 \" (rtos min-req 2 1) \"m 이상 이격해야 합니다.\"))) "
+            "  ) "
+            "(progn (setq do-proceed T) (if (> abs-dist hard-limit) (progn (setq tmp-id (load_dialog dcl-path)) (if (new_dialog \"tsp_brace_hard_warn\" tmp-id) (progn (if (< hard-limit min-req) (progn (set_tile \"warn_msg1\" (strcat \"물리적 여유 공간(\" (rtos hard-limit 2 2) \"m)이 최소 기준(\" (rtos min-req 2 1) \"m) 부족입니다.\")) (set_tile \"warn_msg2\" \"시공 불가 예상 구간이나, 이대로 강제 돌파(적용)하시겠습니까?\"))) (action_tile \"accept\" \"(done_dialog 1)\") (action_tile \"cancel\" \"(done_dialog 0)\") (if (= (start_dialog) 0) (setq do-proceed nil)))) (unload_dialog tmp-id)) "
+            "(if (> abs-dist soft-limit) (progn (setq tmp-id (load_dialog dcl-path)) (if (new_dialog \"tsp_brace_warn\" tmp-id) (progn (action_tile \"accept\" \"(done_dialog 1)\") (action_tile \"cancel\" \"(done_dialog 0)\") (if (= (start_dialog) 0) (setq do-proceed nil)))) (unload_dialog tmp-id)))) "
+            "(if do-proceed (progn (setq idx (atoi (get_tile \"brace_spec\"))) (if (< idx std-len) (progn (setq res-spec (nth idx full-brace-list)) (setq res-custom (parse-h-spec (vl-string-subst \"H \" \"2H \" res-spec)))) (progn (setq res-spec \"User-defined\") (setq res-custom (list (atoi (get_tile \"brace_h\")) (atoi (get_tile \"brace_b\")) (atoi (get_tile \"brace_tw\")) (atoi (get_tile \"brace_tf\")))))) "
+            "(setq tmp-spec (get-auto-spec res-spec res-custom abs-dist nil)) "
+            "(if (and (wcmatch tmp-spec \"2H *\") (not (wcmatch res-spec \"2H *\")) (< input-dist 2.0)) "
+            "  (progn "
+            "    (setq input-dist 2.0) "
+            "    (setq abs-dist (+ prev-dist input-dist)) "
+            "    (set_tile \"brace_dist\" \"2.0\") "
+            "    (alert \"세장비 허용 한계를 초과하여 맞버팀대(2H)로 자동 전환되었으며, 공간 확보를 위해 이격거리가 2.0m로 자동 보정되었습니다.\") "
+            "  ) "
+            ") "
+            "(setq res-spec tmp-spec) "
+            "(setq res-jack (nth (atoi (get_tile \"brace_jack\")) jack-list)) (setq res-conn (nth (atoi (get_tile \"brace_conn\")) conn-list)) (setq temp-b-rows (append temp-b-rows (list (list res-spec res-custom abs-dist res-jack res-conn)))) (update-brace-list) (update-upgrade-ui) (set_tile \"brace_jack\" \"1\") "
+            save-ui-state-str
+            "(done_dialog 7))))))"
+          )
+        )
+
+        (action_tile "btn_mod"
+          (strcat
+            "(progn (setq *tsp-warned-flag* nil *tsp-brace-buckle-warned* nil) (setq sel-idx-str (get_tile \"brace_list\")) (setq sel-indices (if (and sel-idx-str (/= sel-idx-str \"\")) (tsp-parse-space-string sel-idx-str) nil)) "
+            "(if sel-indices (progn "
+            "(setq idx (atoi (get_tile \"brace_spec\"))) (if (< idx std-len) (progn (setq res-spec (nth idx full-brace-list)) (setq res-custom (parse-h-spec (vl-string-subst \"H \" \"2H \" res-spec)))) (progn (setq res-spec \"User-defined\") (setq res-custom (list (atoi (get_tile \"brace_h\")) (atoi (get_tile \"brace_b\")) (atoi (get_tile \"brace_tw\")) (atoi (get_tile \"brace_tf\")))))) "
+            "(setq res-jack (nth (atoi (get_tile \"brace_jack\")) jack-list)) (setq res-conn (nth (atoi (get_tile \"brace_conn\")) conn-list)) "
+            "(if (= (length sel-indices) 1) (progn "
+            "(setq sel-idx (car sel-indices)) (setq input-dist (atof (get_tile \"brace_dist\"))) (setq prev-dist (if (> sel-idx 0) (nth 2 (nth (1- sel-idx) temp-b-rows)) 0.0)) (setq abs-dist (+ prev-dist input-dist)) "
+            "(setq is-dbl-sel (wcmatch res-spec \"2H *\")) "
+            "(setq min-req (if is-dbl-sel (if (= sel-idx 0) 1.5 1.2) (if (= sel-idx 0) 1.0 0.8))) "
+            "(setq next-b-row (if (< (1+ sel-idx) (length temp-b-rows)) (nth (1+ sel-idx) temp-b-rows) nil)) (setq next-dist (if next-b-row (nth 2 next-b-row) nil)) "
+            "(if (< input-dist min-req) "
+            "  (if is-dbl-sel "
+            "    (if (= sel-idx 0) (alert (strcat \"맞버팀대(2H) 1열은 코너부 간섭을 피하기 위해 최소 \" (rtos min-req 2 1) \"m 이상 이격해야 합니다.\")) (alert (strcat \"맞버팀대(2H) 다중열 설치 시 부재 간 간섭 방지를 위해 최소 \" (rtos min-req 2 1) \"m 이상 이격해야 합니다.\"))) "
+            "    (if (= sel-idx 0) (alert (strcat \"1열 사보강재(Corner Strut)는 여유 공간을 위해 최소 \" (rtos min-req 2 1) \"m 이상 이격해야 합니다.\")) (alert (strcat \"여러 열 설치 시 부재 간 간섭 방지를 위해 최소 \" (rtos min-req 2 1) \"m 이상 이격해야 합니다.\"))) "
+            "  ) "
+            "(if (and next-dist (< (- next-dist abs-dist) 0.8)) (alert \"수정 시 다음 열과의 간격이 0.8m 미만이 되어 간섭이 발생합니다. 다음 열을 먼저 수정하거나 거리를 조절하세요.\") (progn (setq do-proceed T) (if (> abs-dist hard-limit) (progn (setq tmp-id (load_dialog dcl-path)) (if (new_dialog \"tsp_brace_hard_warn\" tmp-id) (progn (if (< hard-limit min-req) (progn (set_tile \"warn_msg1\" (strcat \"물리적 여유 공간(\" (rtos hard-limit 2 2) \"m)이 최소 기준(\" (rtos min-req 2 1) \"m) 부족입니다.\")) (set_tile \"warn_msg2\" \"시공 불가 예상 구간이나, 이대로 강제 돌파(적용)하시겠습니까?\"))) (action_tile \"accept\" \"(done_dialog 1)\") (action_tile \"cancel\" \"(done_dialog 0)\") (if (= (start_dialog) 0) (setq do-proceed nil)))) (unload_dialog tmp-id)) "
+            "(if (> abs-dist soft-limit) (progn (setq tmp-id (load_dialog dcl-path)) (if (new_dialog \"tsp_brace_warn\" tmp-id) (progn (action_tile \"accept\" \"(done_dialog 1)\") (action_tile \"cancel\" \"(done_dialog 0)\") (if (= (start_dialog) 0) (setq do-proceed nil)))) (unload_dialog tmp-id)))) "
+            "(if do-proceed (progn (setq tmp-spec (get-auto-spec res-spec res-custom abs-dist T)) (setq i 0 new-list '()) (foreach item temp-b-rows (if (= i sel-idx) (setq new-list (append new-list (list (list tmp-spec res-custom abs-dist res-jack res-conn)))) (setq new-list (append new-list (list item)))) (setq i (1+ i))) (setq temp-b-rows new-list) (update-brace-list) (update-upgrade-ui) "
+            save-ui-state-str
+            "(done_dialog 7))))))) "
+            "(progn (setq i 0 new-list '()) (foreach item temp-b-rows (if (vl-position i sel-indices) (progn (setq cur-abs-dist (nth 2 item)) (setq tmp-spec (get-auto-spec res-spec res-custom cur-abs-dist T)) (setq new-list (append new-list (list (list tmp-spec res-custom cur-abs-dist res-jack res-conn))))) (setq new-list (append new-list (list item)))) (setq i (1+ i))) (setq temp-b-rows new-list) (update-brace-list) (update-upgrade-ui) "
+            save-ui-state-str
+            "(done_dialog 7))) "
+            ") (alert \"수정할 항목을 선택하세요!\")))"
+          )
+        )
+
+        (action_tile "btn_del"
+          (strcat "(progn (setq sel-idx-str (get_tile \"brace_list\")) (if (and sel-idx-str (/= sel-idx-str \"\")) (progn (setq sel-indices (tsp-parse-space-string sel-idx-str)) (tsp-clean-manual-posts-for-deleted-brace sel-indices) (setq new-list '() i 0) (foreach item temp-b-rows (if (not (vl-position i sel-indices)) (setq new-list (append new-list (list item)))) (setq i (1+ i))) (setq temp-b-rows new-list) (update-brace-list) (update-upgrade-ui) " save-ui-state-str "(done_dialog 7)) (alert \"삭제할 항목을 선택하세요!\")))")
+        )
+
+        (defun validate-and-close (done_val / limit-val b-custom L-max input-int d-val)
+          (setq stage-name (get_tile "brace_stage_name"))
+          (setq stage-depth-str (get_tile "brace_stage_depth"))
+          (setq d-val (atof stage-depth-str))
+          (setq user-chk-upgrade (get_tile "chk_upgrade_wale"))
+          (setq user-upg-spec (get_tile "upgrade_wale_spec"))
+          (setq init-enable (get_tile "chk_stiffener_enable"))
+          (setq init-slender (get_tile "slenderness_limit"))
+          (setq init-is-manual (get_tile "chk_manual_interval"))
+          (setq init-interval (get_tile "stiffener_interval"))
+          (setq init-margin (get_tile "stiffener_margin"))
+          (setq init-post-enable (get_tile "chk_post_enable"))
+          (setq init-post-side (if (= (get_tile "post_side_R") "1") "R" "L"))
+          (setq init-post-layout (get_tile "post_layout_mode"))
+          (setq init-post-invert (get_tile "chk_post_invert"))
+
+          (cond
+            ((or (= stage-name "") (<= d-val 0.0))
+             (alert "단 이름과 설치깊이(0m 초과)를 정확히 입력하세요.")
+            )
+            ((= (length temp-b-rows) 0)
+             (alert "최소 1개 열 이상의 사보강재를 [추가] 버튼으로 목록에 넣으세요.")
+            )
+            ((and (= init-enable "1") (= init-is-manual "1"))
+             (setq limit-val (if (= init-slender "0") 100.0 120.0))
+             (setq b-custom (nth 1 (last temp-b-rows)))
+             (setq L-max (tsp-calc-unsupported-length b-custom limit-val))
+             (setq input-int (atof init-interval))
+             (if (and (> input-int 0.01) (> input-int L-max))
+               (alert (strcat "입력한 수동 간격(" (rtos input-int 2 2) "m)이 세장비 허용 한계(" (rtos L-max 2 2) "m)를 초과하여 구조적으로 위험합니다. 값을 낮춰주세요."))
+               (done_dialog done_val)
+             )
+            )
+            (t (done_dialog done_val))
+          )
+        )
+
+        (action_tile "btn_post_add" (strcat "(progn " save-ui-state-str "(done_dialog 97))"))
+        (action_tile "btn_post_del" (strcat "(progn " save-ui-state-str "(done_dialog 98))"))
+        (action_tile "btn_post_reset" (strcat "(progn " save-ui-state-str "(done_dialog 99))"))
+        (action_tile "btn_sel_upg_limit" (strcat "(progn " save-ui-state-str "(done_dialog 96))"))
+        (action_tile "btn_reset_upg_limit" (strcat "(progn " save-ui-state-str "(done_dialog 95))"))
+
+        (action_tile "btn_comp" "(validate-and-close 1)")
+        (action_tile "cancel" "(done_dialog 0)")
+
+        (setq result (start_dialog))
+        (unload_dialog dcl-id)
+
+        (cond
+          ((= result 1)
+           (setq ret-val
+             (list
+               (list stage-name (atof stage-depth-str) temp-b-rows init-slender init-is-manual init-interval init-enable init-margin init-post-enable init-post-side init-post-layout init-post-invert)
+               user-chk-upgrade
+               user-upg-spec
+               user-upg-pts
+             )
+           )
+           (setq loop-brace nil)
+          )
+          ((= result 96)
+           (princ "\n[시스템] H-pile 단면 선택 모드 진입...")
+           (setq sel (vl-catch-all-apply 'entsel (list "\nH-pile단면 선택 (선택한 H-pile까지 띠장 상향) [취소: ESC]: ")))
+           (if (and (not (vl-catch-all-error-p sel)) sel)
+             (progn
+               (setq ent (car sel) pt (cdr (assoc 10 (entget ent))))
+               (if pt
+                 (progn
+                   (setq dx (- (car pt) (car p-corner)) dy (- (cadr pt) (cadr p-corner)))
+                   (setq d1 (if a1 (+ (* dx (cos a1)) (* dy (sin a1))) -1.0))
+                   (setq perp1 (if a1 (abs (- (* dy (cos a1)) (* dx (sin a1)))) 1e99))
+                   (setq d2 (if a2 (+ (* dx (cos a2)) (* dy (sin a2))) -1.0))
+                   (setq perp2 (if a2 (abs (- (* dy (cos a2)) (* dx (sin a2)))) 1e99))
+                   (setq side nil)
+                   (if (and (> d1 0) (< perp1 1000.0)) (setq side 'PREV))
+                   (if (and (> d2 0) (< perp2 1000.0))
+                     (if side (if (< perp2 perp1) (setq side 'NEXT)) (setq side 'NEXT))
+                   )
+                   (if side
+                     (progn
+                       (setq user-upg-pts (vl-remove-if '(lambda (x) (= (car x) side)) user-upg-pts))
+                       (setq user-upg-pts (append user-upg-pts (list (list side pt))))
+                       (princ "\n[성공] 띠장 상향 범위가 수동으로 지정되었습니다.")
+                     )
+                     (alert "선택한 객체가 현재 모서리의 인접 세그먼트 구간 내에 있지 않습니다.")
+                   )
+                 )
+               )
+             )
+           )
+          )
+          ((= result 95)
+           (setq user-upg-pts '())
+           (princ "\n[초기화] 수동 지정된 상향 범위가 해제되었습니다.")
+          )
+          ((or (= result 5) (= result 7) (= result 97) (= result 98) (= result 99))
+           (setq tmp-upg (if (= user-chk-upgrade "1") (list "Y" (nth (atoi user-upg-spec) *tsp-std-wall-list*) user-upg-pts) nil))
+           (setq tmp-stage (list stage-name (atof stage-depth-str) temp-b-rows init-slender init-is-manual init-interval init-enable init-margin init-post-enable init-post-side init-post-layout init-post-invert))
+           (setq tmp-brace (if (> (length temp-b-rows) 0) (tsp-pack-corner-brace-stages (list tmp-stage)) (list "Y" nil)))
+           (setq tmp-seg (subst (cons 'CORNER-BRACE tmp-brace) (assoc 'CORNER-BRACE temp-seg-data) temp-seg-data))
+           (setq tmp-seg (subst (cons 'UPGRADE-WALE tmp-upg) (assoc 'UPGRADE-WALE tmp-seg) tmp-seg))
+           (setq *segment-list* (update-list-item *segment-list* cur-idx tmp-seg))
+           (if (and *tsp-boundary-ent* *tsp-boundary-orient*)
+             (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*)
+           )
+           (cond
+             ((= result 5)
+              (if tsp-pause-for-measurement (tsp-pause-for-measurement))
+             )
+             ((= result 97)
+              (setq tmp-id-num (if (assoc 'ID temp-seg-data) (cdr (assoc 'ID temp-seg-data)) 0))
+              (if (boundp 'tsp-manual-add-post) (tsp-manual-add-post tmp-id-num "BRACE"))
+             )
+             ((= result 98)
+              (setq tmp-id-num (if (assoc 'ID temp-seg-data) (cdr (assoc 'ID temp-seg-data)) 0))
+              (if (boundp 'tsp-manual-delete-post) (tsp-manual-delete-post tmp-id-num "BRACE"))
+             )
+             ((= result 99)
+              (setq tmp-id-num (if (assoc 'ID temp-seg-data) (cdr (assoc 'ID temp-seg-data)) 0))
+              (if (boundp 'tsp-delete-manual-post-by-segment) (tsp-delete-manual-post-by-segment tmp-id-num "BRACE"))
+             )
+           )
+           (setq *segment-list* (update-list-item *segment-list* cur-idx orig-seg-data))
+           (setq did-temp-draw T)
+          )
+          (t
+           (setq ret-val nil loop-brace nil)
+          )
+        )
+      )
+      (progn (if dcl-id (unload_dialog dcl-id)) (setq ret-val nil loop-brace nil))
+    )
+  )
+  ret-val
+)
+
+;;;;==========================================================================
+;;;; defun brace-dialog-callback : 사보강재 정의(단별 설치깊이 목록) 창 및 세부 설정 연동 메인 콜백
+;;;;==========================================================================
+(defun brace-dialog-callback (dcl-path temp-seg-data limits rem-count /
+                              dcl-id result seg-id-str init-data init-upg user-upg-pts
+                              cur-wale-spec cur-wale-vals cur-wale-h cur-idx prev-idx seg-prev seg-cur
+                              p-corner p-prev p-next a1 a2 delta internal-angle-deg
+                              warn-id warn-res skip-brace hard-limit soft-limit
+                              old-view-ctr old-view-size zoom-h scr-size aspect-ratio view-w target-cx target-cy
+                              temp-stages dlg-name orig-seg-data did-temp-draw
+                              prev-wale-spec prev-wale-vals prev-wale-h adj-max-h adj-max-spec
+                              user-chk-upgrade user-upg-spec upg-idx sel-stage-idx
+                              update-stage-list refresh-plan-preview loop-def ret-val
+                              sup-list next-idx def-d stage-res new-stage i new-stages
+                              src-stage copy-stage ed-res tmp-upg tmp-brace tmp-seg
+                              sel ent pt dx dy d1 perp1 d2 perp2 side user-res-upg)
+  (setq seg-id-str (itoa (if (assoc 'ID temp-seg-data) (cdr (assoc 'ID temp-seg-data)) 0)))
+  (setq init-data (cdr (assoc 'CORNER-BRACE temp-seg-data)))
+  (setq init-upg (cdr (assoc 'UPGRADE-WALE temp-seg-data)))
+  (setq user-upg-pts (if (and init-upg (> (length init-upg) 2)) (nth 2 init-upg) '()))
+  (setq cur-wale-spec (cdr (assoc 'WALE-SPEC temp-seg-data)))
+  (setq cur-wale-vals (if (= cur-wale-spec "User-defined") (cdr (assoc 'WALE-CUSTOM temp-seg-data)) (parse-h-spec cur-wale-spec)))
+  (setq cur-wale-h (if cur-wale-vals (nth 0 cur-wale-vals) 300))
+
+  (setq cur-idx (1- (if (assoc 'ID temp-seg-data) (cdr (assoc 'ID temp-seg-data)) 1)))
+  (setq prev-idx (if (= cur-idx 0) (1- (length *segment-list*)) (1- cur-idx)))
+  (setq seg-prev (if (and (>= prev-idx 0) (< prev-idx (length *segment-list*))) (nth prev-idx *segment-list*) nil))
+  (setq seg-cur temp-seg-data)
+
+  (setq p-corner (cdr (assoc 'V-START seg-cur)))
+  (setq p-prev (if seg-prev (cdr (assoc 'V-START seg-prev)) nil))
+  (setq p-next (cdr (assoc 'V-END seg-cur)))
+
+  (setq internal-angle-deg 90.0)
+  (if (and p-corner p-prev p-next)
+    (progn
+      (setq a1 (angle p-corner p-prev))
+      (setq a2 (angle p-corner p-next))
+      (setq delta (abs (- a1 a2)))
+      (if (> delta pi) (setq delta (- (* 2.0 pi) delta)))
+      (setq internal-angle-deg (* delta (/ 180.0 pi)))
+    )
+  )
+
+  (princ (strcat "\n " seg-id-str "번 모서리의 실제 계산된 사이각: " (rtos internal-angle-deg 2 2) "도"))
+
+  (setq temp-stages (tsp-extract-corner-brace-stages init-data temp-seg-data))
+
+  (setq skip-brace nil warn-res 0)
+  (if (and (= (length temp-stages) 0) (>= internal-angle-deg 119.5))
+    (progn
+      (setq warn-id (load_dialog dcl-path))
+      (if (and warn-id (new_dialog "tsp_brace_angle_warn" warn-id))
+        (progn
+          (set_tile "angle_msg" (strcat "코너 각도가 " (rtos internal-angle-deg 2 1) "도 입니다."))
+          (action_tile "btn_skip" "(done_dialog 1)")
+          (action_tile "btn_cont" "(done_dialog 2)")
+          (setq warn-res (start_dialog))
+          (unload_dialog warn-id)
+        )
+        (if warn-id (unload_dialog warn-id))
+      )
+      (if (/= warn-res 2) (setq skip-brace T))
+    )
+  )
+
+  (if skip-brace
+    (list (if (and rem-count (= rem-count 1)) "COMP" "NEXT") '("N" nil) init-upg)
+    (progn
+      (setq hard-limit (car limits))
+      (setq soft-limit (cadr limits))
+
+      (setq old-view-ctr (getvar "VIEWCTR"))
+      (setq old-view-size (getvar "VIEWSIZE"))
+      (if p-corner
+        (progn
+          (setq zoom-h (* (if (> hard-limit 1.0) hard-limit 5.0) 1000.0 3.0))
+          (setq scr-size (getvar "SCREENSIZE"))
+          (setq aspect-ratio (/ (car scr-size) (cadr scr-size)))
+          (setq view-w (* zoom-h aspect-ratio))
+          (setq target-cx (- (car p-corner) (* view-w 0.3)))
+          (setq target-cy (cadr p-corner))
+          (command "_.ZOOM" "_C" (list target-cx target-cy) zoom-h)
+        )
+      )
+
+      (setq dlg-name (if (and rem-count (= rem-count 0)) "tsp_brace_def_single" "tsp_brace_def"))
+      (setq orig-seg-data (nth cur-idx *segment-list*))
+      (setq did-temp-draw nil)
+
+      (setq *tsp-temp-added-posts* (vlax-ldata-get "TSP_DICT" "ADDED_POSTS"))
+      (if (not *tsp-temp-added-posts*) (setq *tsp-temp-added-posts* '()))
+      (setq *tsp-temp-deleted-posts* (vlax-ldata-get "TSP_DICT" "DELETED_POSTS"))
+      (if (not *tsp-temp-deleted-posts*) (setq *tsp-temp-deleted-posts* '()))
+      (setq *tsp-use-temp-posts* T)
+
+      (setq prev-wale-spec (if seg-prev (cdr (assoc 'WALE-SPEC seg-prev)) nil))
+      (setq prev-wale-vals (if (and prev-wale-spec (= prev-wale-spec "User-defined")) (cdr (assoc 'WALE-CUSTOM seg-prev)) (if prev-wale-spec (parse-h-spec prev-wale-spec) nil)))
+      (setq prev-wale-h (if prev-wale-vals (nth 0 prev-wale-vals) 300))
+      (setq adj-max-h (max cur-wale-h prev-wale-h))
+      (setq adj-max-spec (if (> prev-wale-h cur-wale-h) prev-wale-spec cur-wale-spec))
+
+      (if init-upg
+        (progn
+          (setq user-chk-upgrade (if (= (car init-upg) "Y") "1" "0"))
+          (setq upg-idx (vl-position (cadr init-upg) *tsp-std-wall-list*))
+          (setq user-upg-spec (if upg-idx (itoa upg-idx) "2"))
+        )
+        (if (and prev-wale-spec (/= prev-wale-h cur-wale-h))
+          (progn
+            (setq user-chk-upgrade "1")
+            (setq upg-idx (if (and adj-max-spec (/= adj-max-spec "User-defined")) (vl-position adj-max-spec *tsp-std-wall-list*) nil))
+            (setq user-upg-spec (if upg-idx (itoa upg-idx) "2"))
+          )
+          (setq user-chk-upgrade "0" user-upg-spec "2")
+        )
+      )
+
+      (defun refresh-plan-preview ( / tmp-upg tmp-brace tmp-seg)
+        (setq tmp-upg (if (= user-chk-upgrade "1") (list "Y" (nth (atoi user-upg-spec) *tsp-std-wall-list*) user-upg-pts) nil))
+        (setq tmp-brace (if (> (length temp-stages) 0) (tsp-pack-corner-brace-stages temp-stages) (list "Y" nil)))
+        (setq tmp-seg (subst (cons 'CORNER-BRACE tmp-brace) (assoc 'CORNER-BRACE temp-seg-data) temp-seg-data))
+        (setq tmp-seg (subst (cons 'UPGRADE-WALE tmp-upg) (assoc 'UPGRADE-WALE tmp-seg) tmp-seg))
+        (setq *segment-list* (update-list-item *segment-list* cur-idx tmp-seg))
+        (if (and *tsp-boundary-ent* *tsp-boundary-orient*)
+          (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*)
+        )
+        (setq *segment-list* (update-list-item *segment-list* cur-idx orig-seg-data))
+        (setq did-temp-draw T)
+      )
+
+      (setq sel-stage-idx 0)
+      (setq loop-def T ret-val nil)
+
+      (while loop-def
+        (setq temp-stages (tsp-sort-corner-brace-stages temp-stages))
+        (setq dcl-id (load_dialog dcl-path))
+        (if (new_dialog dlg-name dcl-id)
+          (progn
+            (set_tile "brace_def_title" (strcat seg-id-str "번 모서리 사보강재(Corner Strut) 정의"))
+            (set_tile "brace_def_info" (strcat "▶ 코너 내각: " (rtos internal-angle-deg 2 1) "°  |  절대 한계: " (rtos hard-limit 2 2) "m  |  권장(50%): " (rtos soft-limit 2 2) "m"))
+
+            (start_list "upgrade_wale_spec") (mapcar 'add_list *tsp-std-wall-list*) (end_list)
+            (set_tile "chk_upgrade_wale" user-chk-upgrade)
+            (set_tile "upgrade_wale_spec" user-upg-spec)
+
+            (defun update-stage-list ( / idx st s-name s-depth b-rows r-cnt r0 spec0 d-list-str disp)
+              (start_list "brace_stage_list")
+              (setq idx 1)
+              (foreach st temp-stages
+                (setq s-name (nth 0 st) s-depth (float (nth 1 st)) b-rows (nth 2 st))
+                (setq r-cnt (length b-rows))
+                (setq r0 (car b-rows))
+                (setq spec0 (if r0 (car r0) "-"))
+                (setq d-list-str "")
+                (foreach r b-rows
+                  (setq d-list-str (if (= d-list-str "") (strcat (rtos (nth 2 r) 2 2) "m") (strcat d-list-str ", " (rtos (nth 2 r) 2 2) "m")))
+                )
+                (setq disp (strcat (itoa idx) "단 [" s-name "]   설치깊이: " (rtos s-depth 2 2) "m   |   " (itoa r-cnt) "열 (" spec0 " / 이격: " d-list-str ")"))
+                (add_list disp)
+                (setq idx (1+ idx))
+              )
+              (end_list)
+              (if (> (length temp-stages) 0)
+                (progn
+                  (if (>= sel-stage-idx (length temp-stages)) (setq sel-stage-idx (1- (length temp-stages))))
+                  (if (< sel-stage-idx 0) (setq sel-stage-idx 0))
+                  (set_tile "brace_stage_list" (itoa sel-stage-idx))
+                )
+                (set_tile "brace_stage_list" "")
+              )
+            )
+
+            (update-stage-list)
+
+            (action_tile "brace_stage_list" "(setq sel-stage-idx (atoi $value))")
+            (action_tile "chk_upgrade_wale" "(setq user-chk-upgrade $value)")
+            (action_tile "upgrade_wale_spec" "(setq user-upg-spec $value)")
+
+            (action_tile "btn_stage_add" "(progn (setq user-chk-upgrade (get_tile \"chk_upgrade_wale\")) (setq user-upg-spec (get_tile \"upgrade_wale_spec\")) (done_dialog 11))")
+            (action_tile "btn_stage_mod"
+              "(progn
+                 (if (> (length temp-stages) 0)
+                   (progn (setq sel-stage-idx (atoi (get_tile \"brace_stage_list\"))) (setq user-chk-upgrade (get_tile \"chk_upgrade_wale\")) (setq user-upg-spec (get_tile \"upgrade_wale_spec\")) (done_dialog 12))
+                   (alert \"수정할 사보강재 단이 없습니다. 먼저 [추가] 버튼을 눌러 생성하세요.\")
+                 )
+               )"
+            )
+            (action_tile "btn_stage_copy"
+              "(progn
+                 (if (> (length temp-stages) 0)
+                   (progn (setq sel-stage-idx (atoi (get_tile \"brace_stage_list\"))) (setq user-chk-upgrade (get_tile \"chk_upgrade_wale\")) (setq user-upg-spec (get_tile \"upgrade_wale_spec\")) (done_dialog 13))
+                   (alert \"복사할 원본 사보강재 단이 없습니다. 먼저 [추가] 버튼을 눌러 생성하세요.\")
+                 )
+               )"
+            )
+            (action_tile "btn_stage_del"
+              "(progn
+                 (if (> (length temp-stages) 0)
+                   (progn
+                     (setq sel-stage-idx (atoi (get_tile \"brace_stage_list\")))
+                     (setq i 0 new-stages '())
+                     (foreach st temp-stages
+                       (if (/= i sel-stage-idx) (setq new-stages (append new-stages (list st))))
+                       (setq i (1+ i))
+                     )
+                     (setq temp-stages new-stages)
+                     (update-stage-list)
+                     (done_dialog 14)
+                   )
+                   (alert \"삭제할 항목이 없습니다.\")
+                 )
+               )"
+            )
+            (action_tile "btn_stage_clear"
+              "(progn
+                 (setq temp-stages '())
+                 (update-stage-list)
+                 (done_dialog 14)
+               )"
+            )
+
+            (action_tile "btn_sel_upg_limit" "(progn (setq user-chk-upgrade (get_tile \"chk_upgrade_wale\")) (setq user-upg-spec (get_tile \"upgrade_wale_spec\")) (done_dialog 96))")
+            (action_tile "btn_reset_upg_limit" "(progn (setq user-chk-upgrade (get_tile \"chk_upgrade_wale\")) (setq user-upg-spec (get_tile \"upgrade_wale_spec\")) (done_dialog 95))")
+            (action_tile "btn_measure" "(progn (setq user-chk-upgrade (get_tile \"chk_upgrade_wale\")) (setq user-upg-spec (get_tile \"upgrade_wale_spec\")) (done_dialog 5))")
+
+            (action_tile "btn_comp" "(progn (setq user-chk-upgrade (get_tile \"chk_upgrade_wale\")) (setq user-upg-spec (get_tile \"upgrade_wale_spec\")) (done_dialog 1))")
+            (action_tile "accept" (if (and rem-count (= rem-count 1))
+                                    "(progn (setq user-chk-upgrade (get_tile \"chk_upgrade_wale\")) (setq user-upg-spec (get_tile \"upgrade_wale_spec\")) (done_dialog 1))"
+                                    "(progn (setq user-chk-upgrade (get_tile \"chk_upgrade_wale\")) (setq user-upg-spec (get_tile \"upgrade_wale_spec\")) (done_dialog 2))"))
+            (action_tile "cancel" "(done_dialog 0)")
+
+            (setq result (start_dialog))
+            (unload_dialog dcl-id)
+
+            (cond
+              ;; 11: 새 사보강재 단 추가
+              ((= result 11)
+               (setq next-idx (1+ (length temp-stages)))
+               (setq sup-list (cdr (assoc 'SUPPORT-LIST temp-seg-data)))
+               (setq def-d
+                 (cond
+                   ((and sup-list (>= (length sup-list) next-idx))
+                    (float (cadddr (nth (1- next-idx) sup-list)))
+                   )
+                   ((> (length temp-stages) 0)
+                    (+ (float (nth 1 (last temp-stages))) 2.5)
+                   )
+                   (t 1.5)
+                 )
+               )
+               (setq ed-res (tsp-brace-stage-edit-dialog dcl-path temp-seg-data limits nil (strcat "Corner_" (itoa next-idx)) def-d user-chk-upgrade user-upg-spec user-upg-pts))
+               (if ed-res
+                 (progn
+                   (setq new-stage (nth 0 ed-res)
+                         user-chk-upgrade (nth 1 ed-res)
+                         user-upg-spec (nth 2 ed-res)
+                         user-upg-pts (nth 3 ed-res))
+                   (setq temp-stages (tsp-sort-corner-brace-stages (append temp-stages (list new-stage))))
+                   (setq sel-stage-idx (vl-position new-stage temp-stages))
+                   (if (null sel-stage-idx) (setq sel-stage-idx (1- (length temp-stages))))
+                   (refresh-plan-preview)
+                 )
+               )
+              )
+
+              ;; 12: 선택한 사보강재 단 수정
+              ((= result 12)
+               (setq src-stage (nth sel-stage-idx temp-stages))
+               (setq ed-res (tsp-brace-stage-edit-dialog dcl-path temp-seg-data limits src-stage (nth 0 src-stage) (nth 1 src-stage) user-chk-upgrade user-upg-spec user-upg-pts))
+               (if ed-res
+                 (progn
+                   (setq new-stage (nth 0 ed-res)
+                         user-chk-upgrade (nth 1 ed-res)
+                         user-upg-spec (nth 2 ed-res)
+                         user-upg-pts (nth 3 ed-res))
+                   (setq temp-stages (update-list-item temp-stages sel-stage-idx new-stage))
+                   (setq temp-stages (tsp-sort-corner-brace-stages temp-stages))
+                   (setq sel-stage-idx (vl-position new-stage temp-stages))
+                   (if (null sel-stage-idx) (setq sel-stage-idx 0))
+                   (refresh-plan-preview)
+                 )
+               )
+              )
+
+              ;; 13: 선택한 사보강재 단 복사 추가 (방식 A: 기존 설정 그대로 열고 설치깊이/이름만 기본 제안)
+              ((= result 13)
+               (setq src-stage (nth sel-stage-idx temp-stages))
+               (setq next-idx (1+ (length temp-stages)))
+               (setq sup-list (cdr (assoc 'SUPPORT-LIST temp-seg-data)))
+               (setq def-d
+                 (if (and sup-list (>= (length sup-list) next-idx) (> (float (cadddr (nth (1- next-idx) sup-list))) (float (nth 1 src-stage))))
+                   (float (cadddr (nth (1- next-idx) sup-list)))
+                   (+ (float (nth 1 (last temp-stages))) 2.5)
+                 )
+               )
+               (setq copy-stage (cons (strcat "Corner_" (itoa next-idx)) (cons def-d (cddr src-stage))))
+               (setq ed-res (tsp-brace-stage-edit-dialog dcl-path temp-seg-data limits copy-stage (nth 0 copy-stage) def-d user-chk-upgrade user-upg-spec user-upg-pts))
+               (if ed-res
+                 (progn
+                   (setq new-stage (nth 0 ed-res)
+                         user-chk-upgrade (nth 1 ed-res)
+                         user-upg-spec (nth 2 ed-res)
+                         user-upg-pts (nth 3 ed-res))
+                   (setq temp-stages (tsp-sort-corner-brace-stages (append temp-stages (list new-stage))))
+                   (setq sel-stage-idx (vl-position new-stage temp-stages))
+                   (if (null sel-stage-idx) (setq sel-stage-idx (1- (length temp-stages))))
+                   (refresh-plan-preview)
+                 )
+               )
+              )
+
+              ;; 14: 삭제/초기화 후 평면도 미리보기 갱신
+              ((= result 14)
+               (refresh-plan-preview)
+              )
+
+              ;; 96: 띠장 상향 범위 H-Pile 수동 선택
+              ((= result 96)
+               (princ "\n[시스템] H-pile 단면 선택 모드 진입...")
+               (setq sel (vl-catch-all-apply 'entsel (list "\nH-pile단면 선택 (선택한 H-pile까지 띠장 상향) [취소: ESC]: ")))
+               (if (and (not (vl-catch-all-error-p sel)) sel)
+                 (progn
+                   (setq ent (car sel) pt (cdr (assoc 10 (entget ent))))
+                   (if pt
+                     (progn
+                       (setq dx (- (car pt) (car p-corner)) dy (- (cadr pt) (cadr p-corner)))
+                       (setq d1 (if a1 (+ (* dx (cos a1)) (* dy (sin a1))) -1.0))
+                       (setq perp1 (if a1 (abs (- (* dy (cos a1)) (* dx (sin a1)))) 1e99))
+                       (setq d2 (if a2 (+ (* dx (cos a2)) (* dy (sin a2))) -1.0))
+                       (setq perp2 (if a2 (abs (- (* dy (cos a2)) (* dx (sin a2)))) 1e99))
+                       (setq side nil)
+                       (if (and (> d1 0) (< perp1 1000.0)) (setq side 'PREV))
+                       (if (and (> d2 0) (< perp2 1000.0))
+                         (if side (if (< perp2 perp1) (setq side 'NEXT)) (setq side 'NEXT))
+                       )
+                       (if side
+                         (progn
+                           (setq user-upg-pts (vl-remove-if '(lambda (x) (= (car x) side)) user-upg-pts))
+                           (setq user-upg-pts (append user-upg-pts (list (list side pt))))
+                           (princ "\n[성공] 띠장 상향 범위가 수동으로 지정되었습니다.")
+                           (refresh-plan-preview)
+                         )
+                         (alert "선택한 객체가 현재 모서리의 1번 또는 2번 세그먼트 구간 내에 있지 않습니다.")
+                       )
+                     )
+                   )
+                 )
+               )
+              )
+
+              ;; 95: 상향 범위 초기화
+              ((= result 95)
+               (setq user-upg-pts '())
+               (princ "\n[초기화] 수동 지정된 상향 범위가 해제되었습니다.")
+               (refresh-plan-preview)
+              )
+
+              ;; 5: 도면에서 확인/측정
+              ((= result 5)
+               (refresh-plan-preview)
+               (if tsp-pause-for-measurement
+                 (tsp-pause-for-measurement)
+                 (alert "TSP - 도면 제어 모듈이 로드되지 않았습니다.")
+               )
+              )
+
+              ;; 1: 완료 (COMP)
+              ((= result 1)
+               (setq user-res-upg (if (= user-chk-upgrade "1") (list "Y" (nth (atoi user-upg-spec) *tsp-std-wall-list*) user-upg-pts) nil))
+               (setq ret-val (list "COMP" (tsp-pack-corner-brace-stages temp-stages) user-res-upg))
+               (setq loop-def nil)
+              )
+
+              ;; 2: 다음 모서리 (NEXT)
+              ((= result 2)
+               (setq user-res-upg (if (= user-chk-upgrade "1") (list "Y" (nth (atoi user-upg-spec) *tsp-std-wall-list*) user-upg-pts) nil))
+               (setq ret-val (list "NEXT" (tsp-pack-corner-brace-stages temp-stages) user-res-upg))
+               (setq loop-def nil)
+              )
+
+              ;; 0: 취소
+              (t
+               (setq ret-val nil loop-def nil)
+              )
+            )
+          )
+          (progn (if dcl-id (unload_dialog dcl-id)) (setq ret-val nil loop-def nil))
+        )
+      )
+
+      (if ret-val
+        (progn
+          (vlax-ldata-put "TSP_DICT" "ADDED_POSTS" *tsp-temp-added-posts*)
+          (vlax-ldata-put "TSP_DICT" "DELETED_POSTS" *tsp-temp-deleted-posts*)
+        )
+      )
+      (setq *tsp-use-temp-posts* nil)
+
+      (if (and old-view-ctr old-view-size)
+        (command "_.ZOOM" "_C" old-view-ctr old-view-size)
+      )
+
+      (if (or (null ret-val) did-temp-draw)
+        (if (and *tsp-boundary-ent* *tsp-boundary-orient*)
+          (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*)
+        )
+      )
+
+      ret-val
+    )
+  )
+)
+

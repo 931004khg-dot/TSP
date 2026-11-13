@@ -1,0 +1,593 @@
+;;; ==========================================================================
+;;; 파일명: TSP_2A_Geometry.lsp
+;;; 구  분: 기하학 좌표 계산, 모서리 편집 및 세그먼트 초기화 (Part A)
+;;; 역  할: 폴리라인 정점 추출, CW/CCW 방향 및 오목/볼록 판별, 코너 H-Pile 회전각 계산, 대화형 모서리 추가/삭제 편집(D/A), 세그먼트 리스트 초기화 [extract-vertices, get-polygon-orientation, is-closed-polyline, is-corner-convex, get-dist-point-to-segment 외 12개]
+;;; 포함 함수: extract-vertices, get-polygon-orientation, is-closed-polyline, is-corner-convex, get-dist-point-to-segment, calc-orientation-by-closest-segment, determine-boundary-orientation, calc-hpile-vertices, tsp-get-closest-vertex-index, tsp-shift-vertex-list, tsp-filter-collinear-vertices, tsp-save-custom-vertices-ldata, tsp-load-custom-vertices-ldata, tsp-draw-corner-edit-preview, tsp-get-corner-idx-from-ent, tsp-insert-vertex-on-ordered-list, tsp-interactive-edit-corners
+;;; --------------------------------------------------------------------------
+;;; [안내] 이 파일은 TSP.lsp(메인 로더)에 의해 자동으로 로드되는 하위 모듈입니다.
+;;;        코드 수정 시 전체 파일을 합칠 필요 없이 이 파일만 단독 패치하면 됩니다.
+;;; ==========================================================================
+
+;;; ==========================================================================
+;;; [SECTION 3] 기하학 및 좌표 계산 (Geometry Utils)
+;;; ==========================================================================
+
+;;;;==========================================================================
+;;;; defun extract-vertices : 엔티티(LWPOLYLINE 등)에서 정점 좌표(Vertex) 리스트 추출
+;;;;==========================================================================
+(defun extract-vertices (ent / ent-data vertices item elev pt-ocs pt-wcs first-pt last-pt)
+  (setq ent-data (entget ent))
+  (setq elev (cdr (assoc 38 ent-data)))
+  (if (null elev) (setq elev 0.0))
+  (setq vertices '())
+  (foreach item ent-data
+    (if (= (car item) 10)
+      (progn
+        ;; LWPOLYLINE의 DXF 10은 OCS 좌표이므로, 이를 WCS 절대좌표로 안전하게 변환
+        (setq pt-ocs (list (nth 1 item) (nth 2 item) elev))
+        (setq pt-wcs (trans pt-ocs ent 0))
+        ;; Z축을 0으로 평탄화하여 2D 평면 연산 시 오차 및 안팎 뒤집힘 완벽 방지
+        ;; [Phase 1] O(N) 최적화: cons로 앞에 붙임
+        (setq vertices (cons (list (car pt-wcs) (cadr pt-wcs) 0.0) vertices))
+      )
+    )
+  )
+  ;; [Phase 1] 리스트를 원래 순서로 뒤집기
+  (setq vertices (reverse vertices))
+
+  ;; 폐합 여부 확인 후 중복 정점 제거
+  (if (and (> (length vertices) 1)
+           (setq first-pt (car vertices))
+           (setq last-pt (last vertices))
+           (equal first-pt last-pt 0.01))
+    (setq vertices (reverse (cdr (reverse vertices))))
+  )
+  vertices
+)
+
+;;;;==========================================================================
+;;;; defun get-polygon-orientation : 폴리곤의 방향(CW/CCW) 판별 (1: CCW, -1: CW)
+;;;;==========================================================================
+(defun get-polygon-orientation (vertices / signed-area i n x1 y1 x2 y2)
+  (setq signed-area 0.0)
+  (setq n (length vertices))
+  (setq i 0)
+  (while (< i n)
+    (setq x1 (car (nth i vertices)))
+    (setq y1 (cadr (nth i vertices)))
+    (setq x2 (car (nth (if (= i (1- n)) 0 (1+ i)) vertices)))
+    (setq y2 (cadr (nth (if (= i (1- n)) 0 (1+ i)) vertices)))
+    (setq signed-area (+ signed-area (* (- x1 x2) (+ y1 y2))))
+    (setq i (1+ i))
+  )
+  (if (> signed-area 0) 1 -1)
+)
+
+;;;;==========================================================================
+;;;; defun is-closed-polyline : 폴리라인이 폐합되었는지 확인 (Flag 70 또는 시작점=끝점)
+;;;;==========================================================================
+(defun is-closed-polyline (ent / ent-data closed-flag vertices first-pt last-pt)
+  (setq ent-data (entget ent))
+  (setq closed-flag (cdr (assoc 70 ent-data)))
+  (if (and closed-flag (= 1 (logand 1 closed-flag)))
+    T
+    (progn
+      (setq vertices '())
+      (foreach item ent-data
+        (if (= (car item) 10) (setq vertices (append vertices (list (cdr item)))))
+      )
+      (if (>= (length vertices) 2)
+        (equal (car vertices) (last vertices) 0.1)
+        nil
+      )
+    )
+  )
+)
+
+;;;;==========================================================================
+;;;; defun is-corner-convex : 코너가 볼록한지 오목한지 판별 (외적 활용)
+;;;;==========================================================================
+(defun is-corner-convex (prev-pt curr-pt next-pt orientation / v1x v1y v2x v2y cross-product)
+  (setq v1x (- (car curr-pt) (car prev-pt)))
+  (setq v1y (- (cadr curr-pt) (cadr prev-pt)))
+  (setq v2x (- (car next-pt) (car curr-pt)))
+  (setq v2y (- (cadr next-pt) (cadr curr-pt)))
+  (setq cross-product (- (* v1x v2y) (* v1y v2x)))
+  (if (= orientation 1)
+    (> cross-product 0)
+    (< cross-product 0)
+  )
+)
+
+;;;;==========================================================================
+;;;; defun get-dist-point-to-segment : 점과 선분 사이의 최단 거리 계산
+;;;;==========================================================================
+(defun get-dist-point-to-segment (pt p1 p2 / x0 y0 x1 y1 x2 y2 dx dy t-param closest-x closest-y)
+  (setq x0 (car pt) y0 (cadr pt))
+  (setq x1 (car p1) y1 (cadr p1))
+  (setq x2 (car p2) y2 (cadr p2))
+  (setq dx (- x2 x1) dy (- y2 y1))
+  (if (and (= dx 0) (= dy 0))
+    (distance pt p1)
+    (progn
+      ;; 투영 계수 t 계산 (내적 활용)
+      (setq t-param (/ (+ (* (- x0 x1) dx) (* (- y0 y1) dy)) (+ (* dx dx) (* dy dy))))
+      ;; 선분 범위 내로 클램핑 (0 <= t <= 1)
+      (if (< t-param 0) (setq t-param 0))
+      (if (> t-param 1) (setq t-param 1))
+      ;; 가장 가까운 점 좌표
+      (setq closest-x (+ x1 (* t-param dx)))
+      (setq closest-y (+ y1 (* t-param dy)))
+      (distance pt (list closest-x closest-y))
+    )
+  )
+)
+
+;;;;==========================================================================
+;;;; defun calc-orientation-by-closest-segment : 가상 연장선을 포함한 최적 방향 판별
+;;;;==========================================================================
+(defun calc-orientation-by-closest-segment (vertices user-pt / min-dist best-segment i p1 p2 p-prev p-next ext-len virt-start virt-end ext-segments dist cross-z)
+  (setq ext-len 100000.0) ;; 충분히 긴 연장 길이
+  ;; 1. 가상 연장점 생성
+  (setq p1 (nth 0 vertices))
+  (setq p2 (nth 1 vertices))
+  (setq virt-start (polar p1 (angle p2 p1) ext-len)) ;; 시작점 뒤로 연장
+  (setq p-prev (nth (- (length vertices) 2) vertices))
+  (setq p-next (last vertices))
+  (setq virt-end (polar p-next (angle p-prev p-next) ext-len)) ;; 끝점 앞으로 연장
+  ;; 2. 전체 세그먼트 리스트 구성 (가상 시작 -> 본체 -> 가상 끝)
+  (setq ext-segments (list (list virt-start (car vertices)))) ;; 가상 시작 세그먼트
+  (setq i 0)
+  (while (< i (1- (length vertices)))
+    (setq ext-segments (append ext-segments (list (list (nth i vertices) (nth (1+ i) vertices)))))
+    (setq i (1+ i))
+  )
+  (setq ext-segments (append ext-segments (list (list (last vertices) virt-end)))) ;; 가상 끝 세그먼트
+  ;; 3. 가장 가까운 세그먼트 찾기
+  (setq min-dist 1e99)
+  (setq best-segment nil)
+  (foreach seg ext-segments
+    (setq dist (get-dist-point-to-segment user-pt (car seg) (cadr seg)))
+    (if (< dist min-dist)
+      (progn
+        (setq min-dist dist)
+        (setq best-segment seg)
+      )
+    )
+  )
+  ;; 4. 선택된 세그먼트 기준으로 외적(방향) 계산
+  (if best-segment
+    (progn
+      (setq p1 (car best-segment))
+      (setq p2 (cadr best-segment))
+      (setq cross-z (- (* (- (car p2) (car p1)) (- (cadr user-pt) (cadr p1)))
+                       (* (- (cadr p2) (cadr p1)) (- (car user-pt) (car p1)))))
+      ;; 토류판(바깥쪽)과 띠장(안쪽)이 클릭한 방향에 맞게 정확히 생성되도록 부호 정상화
+      (if (> cross-z 0) -1 1)
+    )
+    1 ;; 예외 시 기본값
+  )
+)
+
+;;;;==========================================================================
+;;;; defun determine-boundary-orientation : 경계선의 내부/외부 방향을 사용자 입력(가상 연장선 적용) 또는 자동 판별
+;;;;==========================================================================
+(defun determine-boundary-orientation (boundary-ent / vertices pt1 pt2 user-pt boundary-orient old-osmode saved-orient)
+  (princ "\n[방향 판별] 경계선 분석 중...")
+  (setq vertices (extract-vertices boundary-ent))
+  (if (is-closed-polyline boundary-ent)
+    ;; [폐합된 경우] - 기존 로직 유지 (면적 부호로 판별)
+    (progn
+      (setq boundary-orient (get-polygon-orientation vertices))
+      (princ (if (= boundary-orient 1) "\n- 폐합선: CCW (내부가 왼쪽)" "\n- 폐합선: CW (내부가 오른쪽)"))
+      (setq *tsp-imported-orient* boundary-orient)
+      boundary-orient
+    )
+    (progn
+      ;; [개방된 경우]
+      ;; 1순위: 해당 폴리라인 객체 자체에 새겨진 방향 데이터(TSP_ORIENT)가 있는지 확인 (이전 작업 내역 복구)
+      (setq saved-orient (vlax-ldata-get boundary-ent "TSP_ORIENT"))
+
+      (if saved-orient
+        (progn
+          (princ "\n[알림] 경계선에 이전에 설정된 파일설치 위치(방향)가 있어 자동으로 적용합니다.")
+          (setq boundary-orient saved-orient)
+          (setq *tsp-imported-orient* boundary-orient)
+          boundary-orient
+        )
+        ;; 2순위: 엑셀(CSV) 불러오기 시 읽어들인 글로벌 방향 데이터 확인
+        (if (and (boundp '*tsp-saved-orient*) *tsp-saved-orient*)
+          (progn
+            (princ "\n[알림] 내보내기 된 데이터에서 파일설치 위치(방향)를 자동으로 적용했습니다.")
+            (setq boundary-orient *tsp-saved-orient*)
+            (setq *tsp-imported-orient* boundary-orient)
+            (setq *tsp-saved-orient* nil) ; 1회용 소모 처리
+            ;; 폴리라인에 데이터를 새겨 다음 실행 시 1순위로 패스되게 함
+            (vlax-ldata-put boundary-ent "TSP_ORIENT" boundary-orient)
+            boundary-orient
+          )
+          ;; 3순위: 데이터가 전혀 없으면 사용자에게 직접 클릭을 요청 (최초 작업 시)
+          (progn
+            (setq old-osmode (getvar "OSMODE"))
+            (setvar "OSMODE" 0)
+            (princ "\n파일설치 위치(Outside) 선택 (객체스냅 임시해제) : ")
+            (setq user-pt (getpoint))
+            (setvar "OSMODE" old-osmode)
+            (if user-pt
+              (progn
+                (setq user-pt (trans user-pt 1 0))
+                (setq boundary-orient (calc-orientation-by-closest-segment vertices user-pt))
+                (setq *tsp-imported-orient* boundary-orient)
+                ;; 폴리라인에 데이터를 새겨 다음 실행 시 클릭을 생략하게 함
+                (vlax-ldata-put boundary-ent "TSP_ORIENT" boundary-orient)
+                boundary-orient
+              )
+              (progn (princ "\n선택 취소됨.") nil)
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;;;;==========================================================================
+;;;; defun calc-hpile-vertices : 중심점 기준으로 H-Pile 형상 점 좌표 계산 (12개 정점 + 4개 Fillet)
+;;;;==========================================================================
+(defun calc-hpile-vertices (center-pt h b tw tf / cx cy half-h half-b half-tw fillet-r)
+  (setq cx (car center-pt))
+  (setq cy (cadr center-pt))
+  (setq half-h (/ h 2.0) half-b (/ b 2.0) half-tw (/ tw 2.0) fillet-r (* tw 2.0))
+  (list
+    (list (+ cx half-b) (+ cy half-h))                  ; pt1
+    (list (+ cx half-b) (+ cy (- half-h tf)))           ; pt2
+    (list (+ cx half-tw fillet-r) (+ cy (- half-h tf))) ; pt3a
+    (list (+ cx half-tw) (+ cy (- half-h tf fillet-r))) ; pt3b
+    (list (+ cx half-tw) (- cy (- half-h tf fillet-r))) ; pt9a
+    (list (+ cx half-tw fillet-r) (- cy (- half-h tf))) ; pt9b
+    (list (+ cx half-b) (- cy (- half-h tf)))           ; pt8
+    (list (+ cx half-b) (- cy half-h))                  ; pt7
+    (list (- cx half-b) (- cy half-h))                  ; pt12
+    (list (- cx half-b) (- cy (- half-h tf)))           ; pt11
+    (list (- cx half-tw fillet-r) (- cy (- half-h tf))) ; pt10a
+    (list (- cx half-tw) (- cy (- half-h tf fillet-r))) ; pt10b
+    (list (- cx half-tw) (+ cy (- half-h tf fillet-r))) ; pt4a
+    (list (- cx half-tw fillet-r) (+ cy (- half-h tf))) ; pt4b
+    (list (- cx half-b) (+ cy (- half-h tf)))           ; pt5
+    (list (- cx half-b) (+ cy half-h))                  ; pt6
+  )
+)
+
+;;;;==========================================================================
+;;;; defun tsp-get-closest-vertex-index : 정점 리스트 재배열
+;;;;==========================================================================
+(defun tsp-get-closest-vertex-index (vertices pt / i min-dist best-idx dist p)
+  (setq i 0 min-dist 1e99 best-idx 0)
+  (foreach p vertices
+    (setq dist (distance p pt))
+    (if (< dist min-dist)
+      (progn (setq min-dist dist) (setq best-idx i))
+    )
+    (setq i (1+ i))
+  )
+  best-idx
+)
+
+;;;;==========================================================================
+;;;; defun tsp-shift-vertex-list :
+;;;;==========================================================================
+(defun tsp-shift-vertex-list (vertices idx / i len new-list)
+  (setq len (length vertices))
+  (setq new-list '())
+  ;; 1. idx부터 끝까지 추가
+  (setq i idx)
+  (while (< i len)
+    (setq new-list (append new-list (list (nth i vertices))))
+    (setq i (1+ i))
+  )
+  ;; 2. 처음부터 idx 전까지 추가
+  (setq i 0)
+  (while (< i idx)
+    (setq new-list (append new-list (list (nth i vertices))))
+    (setq i (1+ i))
+  )
+  new-list
+)
+
+;;;;==========================================================================
+;;;; defun tsp-filter-collinear-vertices : 180도 근사(꺾임각 tol-deg 이내) 절점을 자동 제외하여 반환
+;;;;==========================================================================
+(defun tsp-filter-collinear-vertices (verts is-closed tol-deg / tol-rad changed cur-verts n i prev-pt curr-pt next-pt ang1 ang2 diff new-verts min-verts)
+  (setq tol-rad (* tol-deg (/ pi 180.0)))
+  (setq min-verts (if is-closed 3 2))
+  (setq cur-verts verts)
+  (setq changed T)
+  (while (and changed (> (length cur-verts) min-verts))
+    (setq changed nil)
+    (setq n (length cur-verts))
+    (setq new-verts '())
+    (setq i 0)
+    (while (< i n)
+      (if (and (not is-closed) (or (= i 0) (= i (1- n))))
+        ;; 개방형 경계선의 양 끝점(시점/종점)은 항상 보존
+        (setq new-verts (append new-verts (list (nth i cur-verts))))
+        (progn
+          (setq prev-pt (if (> (length new-verts) 0)
+                          (last new-verts)
+                          (nth (if (= i 0) (1- n) (1- i)) cur-verts)))
+          (setq curr-pt (nth i cur-verts))
+          (setq next-pt (nth (if (= i (1- n)) 0 (1+ i)) cur-verts))
+          (setq ang1 (angle prev-pt curr-pt))
+          (setq ang2 (angle curr-pt next-pt))
+          (setq diff (abs (- ang1 ang2)))
+          (if (> diff pi) (setq diff (- (* 2.0 pi) diff)))
+          (if (and (< diff tol-rad) (> (+ (length new-verts) (- n i)) min-verts))
+            (setq changed T)
+            (setq new-verts (append new-verts (list curr-pt)))
+          )
+        )
+      )
+      (setq i (1+ i))
+    )
+    (setq cur-verts new-verts)
+  )
+  cur-verts
+)
+
+;;;;==========================================================================
+;;;; defun tsp-save-custom-vertices-ldata : 편집된 모서리 정점들을 원본 0번 정점 기준 상대 오프셋으로 저장 (복사본 경계선 호환)
+;;;;==========================================================================
+(defun tsp-save-custom-vertices-ldata (boundary-ent verts / raw-verts base-pt offsets)
+  (setq raw-verts (extract-vertices boundary-ent))
+  (if (and boundary-ent raw-verts verts)
+    (progn
+      (setq base-pt (car raw-verts))
+      (setq offsets (mapcar '(lambda (v) (list (- (car v) (car base-pt)) (- (cadr v) (cadr base-pt)) 0.0)) verts))
+      (vlax-ldata-put boundary-ent "TSP_CV_OFFSETS" offsets)
+    )
+  )
+)
+
+;;;;==========================================================================
+;;;; defun tsp-load-custom-vertices-ldata : 저장된 상대 오프셋으로부터 현재 경계선 위치에 맞는 모서리 정점 리스트 복원
+;;;;==========================================================================
+(defun tsp-load-custom-vertices-ldata (boundary-ent / raw-verts base-pt offsets)
+  (setq offsets (if boundary-ent (vlax-ldata-get boundary-ent "TSP_CV_OFFSETS") nil))
+  (setq raw-verts (if boundary-ent (extract-vertices boundary-ent) nil))
+  (if (and offsets raw-verts (>= (length offsets) 2))
+    (progn
+      (setq base-pt (car raw-verts))
+      (mapcar '(lambda (off) (list (+ (car base-pt) (car off)) (+ (cadr base-pt) (cadr off)) 0.0)) offsets)
+    )
+    nil
+  )
+)
+
+;;;;==========================================================================
+;;;; defun tsp-draw-corner-edit-preview : 모서리 편집 중 현재 모서리 번호(_지시)와 세그먼트 번호(_번호)를 임시로 화면에 표시
+;;;;==========================================================================
+(defun tsp-draw-corner-edit-preview (boundary-ent boundary-orient verts prev-ents / e mark-ent is-closed n num-segs i temp-segs new-ents nxt ss-old j)
+  ;; 1. 이전 임시 번호표 객체 삭제
+  (foreach e prev-ents
+    (if (and e (entget e)) (vl-catch-all-apply 'entdel (list e)))
+  )
+  ;; 2. 혹시 남아있는 TSP_CORNER_IDX 태그 객체들도 안전하게 정리
+  (setq ss-old (ssget "X" '((8 . "_지시") (-3 ("TSP_CORNER_IDX")))))
+  (if ss-old
+    (progn
+      (setq j 0)
+      (while (< j (sslength ss-old))
+        (vl-catch-all-apply 'entdel (list (ssname ss-old j)))
+        (setq j (1+ j))
+      )
+    )
+  )
+  ;; 3. 레이어가 없을 때 entmake로 인해 (entlast) 체인이 끊어지는 현상을 막기 위해 레이어를 반드시 먼저 생성!
+  (create-layer-if-not-exists "_번호" "2")
+  (create-layer-if-not-exists "_지시" "2")
+
+  (setq is-closed (is-closed-polyline boundary-ent))
+  (setq n (length verts))
+  (setq num-segs (if is-closed n (1- n)))
+  ;; draw-corner-numbers가 참조하는 임시 세그먼트 및 카운트 구성
+  (setq temp-segs '() *tsp-segment-pile-counts* '() i 0)
+  (while (< i num-segs)
+    (setq temp-segs
+      (append temp-segs
+        (list
+          (list
+            (cons 'ID (1+ i))
+            (cons 'IS-DEFINED T)
+            (cons 'WALL-TYPE "HPILE")
+            (cons 'V-START (nth i verts))
+            (cons 'V-END (nth (if is-closed (rem (1+ i) n) (1+ i)) verts))
+          )
+        )
+      )
+    )
+    (setq *tsp-segment-pile-counts* (append *tsp-segment-pile-counts* (list 0)))
+    (setq i (1+ i))
+  )
+  (setq *segment-list* temp-segs)
+  ;; 레이어 생성이 완료된 후 mark-ent 확보
+  (setq mark-ent (entlast))
+  (draw-segment-numbers boundary-ent boundary-orient verts)
+  (draw-corner-numbers boundary-ent boundary-orient verts)
+  (setq new-ents '())
+  (setq nxt (if mark-ent (entnext mark-ent) (entnext)))
+  (while nxt
+    (setq new-ents (append new-ents (list nxt)))
+    (setq nxt (entnext nxt))
+  )
+  (vla-regen (vla-get-activedocument (vlax-get-acad-object)) 1)
+  new-ents
+)
+
+;;;;==========================================================================
+;;;; defun tsp-get-corner-idx-from-ent : 클릭한 _지시 객체로부터 모서리 인덱스를 추출 (XDATA 우선, 없을 시 최근접 정점 탐색)
+;;;;==========================================================================
+(defun tsp-get-corner-idx-from-ent (ent pick-pt verts / ed xd xvals idx min-d best-i i d ref-pt)
+  (setq ed (entget ent '("TSP_CORNER_IDX")))
+  (setq xd (assoc -3 ed))
+  (setq idx nil)
+  (if xd
+    (progn
+      (setq xvals (cdr (car (cdr xd))))
+      (if (assoc 1070 xvals)
+        (setq idx (cdr (assoc 1070 xvals)))
+      )
+    )
+  )
+  (if (and (null idx) verts)
+    (progn
+      (setq ref-pt (if (assoc 10 ed) (cdr (assoc 10 ed)) pick-pt))
+      (if ref-pt
+        (progn
+          (setq min-d 1e99 best-i 0 i 0)
+          (foreach v verts
+            (setq d (distance (list (car ref-pt) (cadr ref-pt)) (list (car v) (cadr v))))
+            (if (< d min-d) (setq min-d d best-i i))
+            (setq i (1+ i))
+          )
+          (setq idx best-i)
+        )
+      )
+    )
+  )
+  idx
+)
+
+;;;;==========================================================================
+;;;; defun tsp-insert-vertex-on-ordered-list : 정렬된 모서리 리스트(verts)에서 클릭한 점(pt-on-pl)이 속한 세그먼트 구간 사이에 정점 삽입
+;;;;==========================================================================
+(defun tsp-insert-vertex-on-ordered-list (verts is-closed pt-on-pl / n num-segs min-d best-seg i p1 p2 d new-verts)
+  (setq n (length verts))
+  (setq num-segs (if is-closed n (1- n)))
+  (setq min-d 1e99 best-seg 0 i 0)
+  (while (< i num-segs)
+    (setq p1 (nth i verts))
+    (setq p2 (nth (if is-closed (rem (1+ i) n) (1+ i)) verts))
+    (setq d (get-dist-point-to-segment pt-on-pl p1 p2))
+    (if (< d min-d)
+      (setq min-d d best-seg i)
+    )
+    (setq i (1+ i))
+  )
+  (setq new-verts '() i 0)
+  (while (< i n)
+    (setq new-verts (append new-verts (list (nth i verts))))
+    (if (= i best-seg)
+      (setq new-verts (append new-verts (list (list (car pt-on-pl) (cadr pt-on-pl) 0.0))))
+    )
+    (setq i (1+ i))
+  )
+  new-verts
+)
+
+;;;;==========================================================================
+;;;; defun tsp-interactive-edit-corners : 경계선 선택 후 모서리(세그먼트) 삭제(D) / 추가(A) 대화형 편집 루프
+;;;;==========================================================================
+(defun tsp-interactive-edit-corners (boundary-ent boundary-orient verts / is-closed min-verts preview-ents main-loop kw sub-loop sel ent pick-pt c-idx i new-verts pt-pick pt-on-pl dup-found old-osmode orig-seg-backup)
+  (setq orig-seg-backup *segment-list*)
+  ;; 기존 작도 그룹이 화면에 남아 있다면 혼선을 막기 위해 잠시 정리
+  (tsp-clear-drawing-group boundary-ent)
+  (setq is-closed (is-closed-polyline boundary-ent))
+  (setq min-verts (if is-closed 3 2))
+  (setq preview-ents (tsp-draw-corner-edit-preview boundary-ent boundary-orient verts '()))
+
+  (setq main-loop T)
+  (while main-loop
+    (initget "Delete Add D d A a")
+    (setq kw (vl-catch-all-apply 'getkword (list "\n세그먼트를 편집하시겠습니까? [모서리삭제(D)/모서리추가(A)/완료(Enter)] <완료>: ")))
+    (cond
+      ((or (vl-catch-all-error-p kw) (null kw))
+       (setq main-loop nil)
+      )
+      ;; [모서리 삭제 모드]
+      ((or (= (strcase kw) "DELETE") (= (strcase kw) "D"))
+       (setq sub-loop T)
+       (while sub-loop
+         (setq sel (vl-catch-all-apply 'entsel (list "\n[모서리 삭제] 삭제할 모서리의 번호표(_지시 객체)를 클릭하세요 (종료: Enter/ESC): ")))
+         (cond
+           ((or (vl-catch-all-error-p sel) (null sel))
+            (setq sub-loop nil)
+           )
+           ((listp sel)
+            (setq ent (car sel))
+            (setq pick-pt (trans (cadr sel) 1 0))
+            (if (/= (strcase (cdr (assoc 8 (entget ent)))) "_지시")
+              (princ "\n[알림] 모서리 번호표(_지시 레이어 객체)를 정확히 클릭해주세요.")
+              (if (<= (length verts) min-verts)
+                (alert (strcat "최소 " (itoa min-verts) "개의 모서리(정점)는 남아있어야 합니다."))
+                (progn
+                  (setq c-idx (tsp-get-corner-idx-from-ent ent pick-pt verts))
+                  (if (and c-idx (not is-closed) (or (= c-idx 0) (= c-idx (1- (length verts)))))
+                    (alert "열린 경계선의 양 끝점(시작점/끝점) 모서리는 삭제할 수 없습니다.")
+                    (if (and c-idx (>= c-idx 0) (< c-idx (length verts)))
+                      (progn
+                        (setq new-verts '() i 0)
+                        (foreach v verts
+                          (if (/= i c-idx) (setq new-verts (append new-verts (list v))))
+                          (setq i (1+ i))
+                        )
+                        (setq verts new-verts)
+                        (setq preview-ents (tsp-draw-corner-edit-preview boundary-ent boundary-orient verts preview-ents))
+                        (princ (strcat "\n>> " (itoa (1+ c-idx)) "번 모서리가 삭제되어 세그먼트 번호가 재정렬되었습니다. (현재 세그먼트 수: " (itoa (if is-closed (length verts) (1- (length verts)))) "개)"))
+                      )
+                    )
+                  )
+                )
+              )
+            )
+           )
+         )
+       )
+      )
+      ;; [모서리 추가 모드]
+      ((or (= (strcase kw) "ADD") (= (strcase kw) "A"))
+       (setq sub-loop T)
+       (while sub-loop
+         (setq old-osmode (getvar "OSMODE"))
+         (setvar "OSMODE" 545) ;; 끝점(1) + 중간점(2) + 교차점(32) + 근처점(512) 스냅 지원
+         (setq pt-pick (vl-catch-all-apply 'getpoint (list "\n[모서리 추가] 경계선 위의 추가할 모서리 위치를 클릭하세요 (종료: Enter/ESC): ")))
+         (setvar "OSMODE" old-osmode)
+         (cond
+           ((or (vl-catch-all-error-p pt-pick) (null pt-pick))
+            (setq sub-loop nil)
+           )
+           ((listp pt-pick)
+            (setq pt-pick (trans pt-pick 1 0))
+            (setq pt-on-pl (vlax-curve-getClosestPointTo boundary-ent pt-pick))
+            (if (null pt-on-pl)
+              (princ "\n[알림] 경계선 위의 유효한 점을 찾을 수 없습니다.")
+              (progn
+                (setq pt-on-pl (list (car pt-on-pl) (cadr pt-on-pl) 0.0))
+                (setq dup-found nil)
+                (foreach v verts
+                  (if (< (distance v pt-on-pl) 100.0) (setq dup-found T))
+                )
+                (if dup-found
+                  (princ "\n[알림] 이미 모서리로 등록된 위치(반경 100mm 이내)입니다.")
+                  (progn
+                    (setq verts (tsp-insert-vertex-on-ordered-list verts is-closed pt-on-pl))
+                    (setq preview-ents (tsp-draw-corner-edit-preview boundary-ent boundary-orient verts preview-ents))
+                    (princ (strcat "\n>> 선택한 위치에 새 모서리가 추가되어 번호가 재정렬되었습니다. (현재 세그먼트 수: " (itoa (if is-closed (length verts) (1- (length verts)))) "개)"))
+                  )
+                )
+              )
+            )
+           )
+         )
+       )
+      )
+    )
+  )
+
+  ;; 임시 번호표 객체를 정리하고 확정된 모서리 정점 리스트를 경계선에 영구 저장
+  (foreach e preview-ents
+    (if (and e (entget e)) (vl-catch-all-apply 'entdel (list e)))
+  )
+  (setq *segment-list* orig-seg-backup)
+  (tsp-save-custom-vertices-ldata boundary-ent verts)
+  verts
+)
