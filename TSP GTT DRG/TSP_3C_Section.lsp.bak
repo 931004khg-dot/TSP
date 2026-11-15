@@ -1,0 +1,510 @@
+;;; ==========================================================================
+;;; 파일명: TSP_3C_Section.lsp
+;;; 구  분: 단면도 및 지반 주상도 작도 (Part C)
+;;; 역  할: 단면 띠장/유압잭/스크류잭 블록 정의, 지하수위 기호, 지반 주상도 및 N치 작도, H-Pile+토류판/CIP 수직 단면도, 단면 지보재/브래킷/숏크리트/그라우팅 작도 [draw-section-cip, make-layer-if-not-exist, create-strut-jack-block, create-strut-screw-jack-block, tsp-load-subzone-to-globals]
+;;; 포함 함수: draw-section-cip, make-layer-if-not-exist, create-strut-jack-block, create-strut-screw-jack-block, tsp-load-subzone-to-globals
+;;; --------------------------------------------------------------------------
+;;; [안내] 이 파일은 TSP.lsp(메인 로더)에 의해 자동으로 로드되는 하위 모듈입니다.
+;;;        코드 수정 시 전체 파일을 합칠 필요 없이 이 파일만 단독 패치하면 됩니다.
+;;; ==========================================================================
+
+;;;;==========================================================================
+;;;; defun draw-section-cip : CIP 단면도 생성
+;;;;==========================================================================
+;; 변수명 통일: exc-depth -> max-depth
+(defun draw-section-cip (start-pt side max-depth embed-depth support-list / total-depth h-b h-h h-t1 h-t2 cip-dia grout-dia wale-insert-x bracket-width p1 p2 p3 p4 obj-grout obj-grout-hatch obj-cip s-item s-type s-depth ins-y pt-ins br-p1 br-p2 br-p3 br-p4 hp-layer old-osmode wale-data wale-h wale-b wale-tw wale-tf wale-layer-name wale-dir wale-rot-angle wale-offset wale-upper-insert-pt wale-lower-insert-pt s-ang s-free s-bond ang-rad draw-ang pt-free-end pt-bond-end out-ang p1-x p1-y pt-p1 p2-x p2-y pt-p2 pt-p1-h pt-p2-h face-ang pt-meet p-head-center p-head-1 p-head-2 p-head-3 p-head-4 pt-anchor-start s-jack-type jack-block-name jack-insert-x pt-jack-ins jack-rot s-sec-str strut-data strut-h strut-tf half-h y-top y-top-in y-bot y-bot-in x-jack-end ep-thick x-ep-end stiff-len stiff-thick x-stiff-end x-strut-end stiff-y-top stiff-y-bot bulge-val cx cy real-cx x-left x-right dir-x exc-y pt-exc-start pt-exc-end x-grout-start x-grout-end water-lvl rock-depth grout-depth-mm)
+
+  ;; OSNAP 끄기 (작도 중 스냅 간섭 방지)
+  (setq old-osmode (getvar "OSMODE"))
+  (setvar "OSMODE" 0)
+
+  ;; 1. 제원 및 치수 설정
+  (setq total-depth (* (+ max-depth embed-depth) 1000.0))
+
+  ;; 방향 변수 및 좌표 분리
+  (setq cx (car start-pt) cy (cadr start-pt))
+  (setq dir-x -1.0) (setq wale-dir 1.0)
+  (if (= side "R") (progn (setq dir-x 1.0) (setq wale-dir -1.0)))
+
+  ;; CIP 및 그라우팅 규격
+  (setq cip-dia (if (type *tsp-cip-dia*) *tsp-cip-dia* (atof (if *tsp-cip-dia* *tsp-cip-dia* "500"))))
+  (setq grout-dia (if (and *tsp-cip-grouting-idx* (= *tsp-cip-grouting-idx* "1")) 600.0 200.0))
+
+  ;; 실제 중심축(real-cx) 계산
+  (setq real-cx (+ cx (* (/ cip-dia 2.0) dir-x)))
+
+  ;; 굴착바닥고 생성 로직
+  (setq exc-y (- cy (* max-depth 1000.0)))
+  (setq pt-exc-start (list cx exc-y 0.0))
+  (if (= side "L")
+    (setq pt-exc-end (polar pt-exc-start 0.0 30000.0))
+    (setq pt-exc-end (polar pt-exc-start pi 30000.0))
+  )
+
+  ;; 도면층 자동 생성 내부 함수
+  (defun make-layer-if-not-exist (layname col)
+    (if (not (tblsearch "LAYER" layname))
+      (command "_.-layer" "_m" layname "_c" col "" "")
+    )
+  )
+
+  (make-layer-if-not-exist "_지반선" "8")
+  (entmake (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline") (cons 8 "_지반선") (cons 62 8) '(90 . 2) '(70 . 0) (cons 10 pt-exc-start) (cons 10 pt-exc-end)))
+
+  ;; H-Pile 규격 추출
+  (setq h-b  (nth 0 *tsp-h-pile-size*)
+        h-h  (nth 1 *tsp-h-pile-size*)
+        h-t1 (nth 2 *tsp-h-pile-size*)
+        h-t2 (nth 3 *tsp-h-pile-size*))
+
+  (setq wale-insert-x cx)
+  (setq bracket-width (/ (- cip-dia h-h) 2.0))
+
+  ;; 2. 지하수위 판별 및 암반 심도 탐색 (공용 함수 사용)
+  (setq water-lvl 999.0)
+  (if (and (boundp '*tsp-water-chk*) (= *tsp-water-chk* "1") (boundp '*tsp-water-depth*))
+    (cond
+      ((numberp *tsp-water-depth*) (setq water-lvl *tsp-water-depth*))
+      ((= (type *tsp-water-depth*) 'STR) (setq water-lvl (atof *tsp-water-depth*)))
+    )
+  )
+
+  (setq rock-start-depth (tsp-get-rock-start-depth))
+
+  ;; 3. CIP 하단 심도 결정 (숏크리트 적용 여부 판별)
+  (setq cip-bottom-mm total-depth) ; 기본값: 전체 심도
+  (setq shotcrete-bot-y nil)
+
+  (if rock-start-depth
+    (progn
+      ;; 사용자 입력 암반 근입 깊이 (문자열->실수 변환, 단위: mm)
+      ;; *tsp-cip-rock-embed* 에서 *tsp-rock-embed* 공통 변수로 통일
+      (setq user-embed-mm (if (and (boundp '*tsp-rock-embed*) *tsp-rock-embed* (/= *tsp-rock-embed* ""))
+                              (atof *tsp-rock-embed*)
+                              500.0))
+
+      (setq rock-y (- cy (* rock-start-depth 1000.0)))
+      (setq calc-cip-bot-y (- rock-y user-embed-mm))
+
+      ;; 근입 깊이를 더한 마감고가 굴착 바닥면(exc-y)을 뚫고 내려가면 굴착 바닥면으로 제한
+      (if (< calc-cip-bot-y exc-y)
+        (setq calc-cip-bot-y exc-y)
+      )
+
+      ;; 굴착 심도가 암반 시작점보다 깊을 때만 숏크리트 적용
+      (if (> max-depth rock-start-depth)
+        (progn
+          (setq cip-bottom-mm (- cy calc-cip-bot-y)) ; 도면용 cy 기준 상대길이로 재변환
+          (setq shotcrete-bot-y exc-y) ; 숏크리트는 CIP 마감선부터 굴착 바닥면까지
+        )
+      )
+    )
+  )
+
+  ;; 4. 그라우팅 단면 작도 (지하수위 있을때 및 그라우팅 "없음(2)"이 아닐 때)
+  (if (and (/= (if *tsp-cip-grouting-idx* *tsp-cip-grouting-idx* "0") "2") (> max-depth water-lvl))
+    (progn
+      (make-layer-if-not-exist "_그라우팅" "5")
+      (setvar "clayer" "_그라우팅")
+
+      (setq x-grout-start (+ real-cx (* (/ h-h 2.0) dir-x)))
+      (setq x-grout-end (+ x-grout-start (* grout-dia dir-x)))
+      ;; 그라우팅도 재계산된 cip-bottom-mm을 따름
+      (setq p1 (list x-grout-end cy))
+      (setq p2 (list x-grout-start cy))
+      (setq p3 (list (car p2) (- cy cip-bottom-mm)))
+      (setq p4 (list (car p1) (- cy cip-bottom-mm)))
+
+      (command "_.pline" p1 p2 p3 p4 "_c")
+      (setq obj-grout (entlast))
+      (setq old-hpannotative (getvar "HPANNOTATIVE"))
+      (if old-hpannotative (setvar "HPANNOTATIVE" 0))
+
+      (command "_.hatch" "AR-SAND" (* 6.0 (get-hatch-scale-factor)) 0 obj-grout "")
+
+      (if old-hpannotative (setvar "HPANNOTATIVE" old-hpannotative))
+      (setq old-hpannotative nil)
+      (setq obj-grout-hatch (entlast))
+    )
+    (progn
+      (setq obj-grout nil)
+      (setq obj-grout-hatch nil)
+    )
+  )
+
+  ;; 5. CIP 콘크리트 단면 작도
+  (make-layer-if-not-exist "_CIP" "7")
+  (setvar "clayer" "_CIP")
+  (setq p1 (list (- real-cx (/ cip-dia 2.0)) cy))
+  (setq p2 (list (+ real-cx (/ cip-dia 2.0)) cy))
+  (setq p3 (list (car p2) (- cy cip-bottom-mm)))
+  (setq p4 (list (car p1) (- cy cip-bottom-mm)))
+
+  (command "_.pline" p1 p2 p3 p4 "_c")
+  (setq obj-cip (entlast))
+  (setq old-hpannotative (getvar "HPANNOTATIVE"))
+  (if old-hpannotative (setvar "HPANNOTATIVE" 0))
+
+  (command "_.hatch" "AR-CONC" (* 6.0 (get-hatch-scale-factor)) 0 obj-cip "")
+
+  (if old-hpannotative (setvar "HPANNOTATIVE" old-hpannotative))
+  (setq old-hpannotative nil)
+
+  (if (and obj-grout obj-grout-hatch)
+    (command "_.draworder" obj-grout obj-grout-hatch "" "_f")
+  )
+
+  ;; 6. H-Pile 단면 작도 (real-cx 기준)
+  (setq hp-layer (strcat "_H-Pile_" (rtos h-b 2 0) "x" (rtos h-h 2 0) "x" (rtos h-t1 2 0) "-" (rtos h-t2 2 0)))
+  (make-layer-if-not-exist hp-layer "3")
+
+  (setq y-top cy)
+  (setq y-bot (- cy total-depth)) ; 내부 심재 H-Pile은 암반 상관없이 무조건 바닥(전체심도)까지
+  (setq x-left (- real-cx (/ h-h 2.0)))
+  (setq x-right (+ real-cx (/ h-h 2.0)))
+
+  (draw-vertical-hpile x-left x-right y-top y-bot h-t2 hp-layer)
+
+  ;; 7. 숏크리트 단면 작도
+  (if shotcrete-bot-y
+    (progn
+      (make-layer-if-not-exist "_숏크리트(shotcrete)" "7")
+      (setvar "clayer" "_숏크리트(shotcrete)")
+      (setq sc-start-y (- cy cip-bottom-mm))
+
+      (setq sc-base-x (+ real-cx (* (/ h-h 2.0) (* dir-x -1.0))))
+
+      (setq pt-sc-start (list sc-base-x sc-start-y 0.0))
+      (setq pt-sc-end (list (+ sc-base-x (* (if (and (boundp '*tsp-shotcrete-thick*) *tsp-shotcrete-thick*) *tsp-shotcrete-thick* 100.0) dir-x)) sc-start-y 0.0))
+
+      (setq pt-sc-bot-end (list (car pt-sc-end) shotcrete-bot-y 0.0))
+      (setq pt-sc-bot-start (list (car pt-sc-start) shotcrete-bot-y 0.0))
+
+      (entmake (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline")
+                     (cons 8 "_숏크리트(shotcrete)") (cons 62 7) '(90 . 4) '(70 . 1)
+                     (cons 10 pt-sc-start) (cons 10 pt-sc-end) (cons 10 pt-sc-bot-end) (cons 10 pt-sc-bot-start)))
+      (setq sc-pl (entlast))
+
+      (if sc-pl
+        (progn
+          (setq old-hpannotative (getvar "HPANNOTATIVE"))
+          (if old-hpannotative (setvar "HPANNOTATIVE" 0))
+          (command "_.hatch" "AR-CONC" (* 2.0 (get-hatch-scale-factor)) 0 sc-pl "")
+          (if old-hpannotative (setvar "HPANNOTATIVE" old-hpannotative))
+        )
+      )
+
+      (make-layer-if-not-exist "_지반선" "8")
+      (entmake (list '(0 . "LINE")
+                     (cons 8 "_지반선")
+                     (cons 62 8)
+                     (cons 10 pt-sc-bot-start)
+                     (cons 11 (list cx shotcrete-bot-y 0.0))))
+    )
+  )
+
+  ;; 5. 지보재 및 브래킷 작도 루프
+  (setq wale-data nil)
+  (if (and *tsp-wale-spec* (= *tsp-wale-spec* "User-defined") *tsp-wale-custom*)
+    (setq wale-data *tsp-wale-custom*)
+    (setq wale-data (parse-h-spec *tsp-wale-spec*))
+  )
+  (if (null wale-data) (setq wale-data '(300 300 10 15)))
+  (setq wale-h (nth 0 wale-data) wale-b (nth 1 wale-data) wale-tw (nth 2 wale-data) wale-tf (nth 3 wale-data))
+
+  (setq wale-layer-name "_띠장(Wale)")
+  (make-layer-if-not-exist wale-layer-name "3")
+  (make-layer-if-not-exist "_앵커(Anchor)" "6")
+  (make-layer-if-not-exist "_버팀보(Strut)" "3")
+  (make-layer-if-not-exist "_브래킷(bracket)" "8")
+
+  (create-strut-jack-block)
+  (create-strut-screw-jack-block)
+
+  (foreach s-item support-list
+    (setq s-type (car s-item))
+    (setq s-depth (cadddr s-item))
+    (setq ins-y (- cy (* s-depth 1000.0)))
+    (setq pt-ins (list wale-insert-x ins-y 0.0))
+    ;; 각 지보재 단별 고유 띠장 규격 추출 (미지정 시 세그먼트 기본 띠장 사용)
+    (setq wale-data (tsp-get-support-item-wale-vals s-item *tsp-wale-spec* *tsp-wale-custom*))
+    (setq wale-h (nth 0 wale-data) wale-b (nth 1 wale-data) wale-tw (nth 2 wale-data) wale-tf (nth 3 wale-data))
+
+    (cond
+      ((wcmatch s-type "앵커*")
+        (setq wale-rot-angle (* -0.5 pi wale-dir))
+        (setq wale-offset (+ 150.0 (/ wale-b 2.0)))
+
+        ;; 앵커용 쌍띠장 브래킷 2개 작도
+        (foreach center-y (list (+ ins-y wale-offset) (- ins-y wale-offset))
+          (setvar "clayer" "_브래킷(Bracket)")
+          (setq br-p1 (list (+ real-cx (* (/ h-h 2.0) wale-dir)) (+ center-y (/ wale-b 2.0))))
+          (setq br-p2 (list wale-insert-x (+ center-y (/ wale-b 2.0))))
+          (setq br-p3 (list (car br-p2) (- center-y (/ wale-b 2.0))))
+          (setq br-p4 (list (car br-p1) (- center-y (/ wale-b 2.0))))
+          (command "_.pline" br-p1 br-p2 br-p3 br-p4 "_c")
+          (command "_.hatch" "ANSI31" (if (= (getvar "MEASUREMENT") 0) 400.0 20.0) 90 (entlast) "")
+        )
+
+        ;; 상/하 띠장 삽입
+        (setq wale-upper-insert-pt (list wale-insert-x (+ ins-y wale-offset) 0.0))
+        (draw-wale-section wale-upper-insert-pt wale-rot-angle wale-layer-name wale-h wale-b wale-tw wale-tf 0.0 bracket-width)
+        (setq wale-lower-insert-pt (list wale-insert-x (- ins-y wale-offset) 0.0))
+        (draw-wale-section wale-lower-insert-pt wale-rot-angle wale-layer-name wale-h wale-b wale-tw wale-tf 0.0 bracket-width)
+
+        ;; 앵커 본체 작도 로직
+        (entmake (list '(0 . "POINT") '(8 . "DEBUG_POINT_ANCHOR") '(62 . 6) (cons 10 pt-ins)))
+        (setq s-ang (nth 4 s-item) s-free (nth 5 s-item) s-bond (nth 6 s-item))
+        (setq ang-rad (* s-ang (/ pi 180.0)))
+        (setq draw-ang (+ pi ang-rad))
+        (setq pt-free-end (polar pt-ins draw-ang (* s-free 1000.0)))
+        (setq pt-bond-end (polar pt-free-end draw-ang (* s-bond 1000.0)))
+        (setq out-ang (+ draw-ang pi))
+        (setq p1-x (+ wale-insert-x (* wale-h wale-dir)))
+        (setq p1-y (+ ins-y wale-offset (/ wale-b 2.0)))
+        (setq pt-p1 (list p1-x p1-y 0.0))
+        (setq p2-x p1-x)
+        (setq p2-y (- ins-y wale-offset (/ wale-b 2.0)))
+        (setq pt-p2 (list p2-x p2-y 0.0))
+        (setq pt-p1-h (list (+ p1-x (* 100.0 wale-dir)) p1-y 0.0))
+        (setq pt-p2-h (list (+ p2-x (* 100.0 wale-dir)) p2-y 0.0))
+        (setq face-ang (+ draw-ang (* wale-dir (/ pi 2.0))))
+        (setq pt-meet (polar pt-p1-h face-ang 400.0))
+        (entmake (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline")
+                       (cons 8 "_앵커(Anchor)") (cons 62 6) '(90 . 5) '(70 . 1)
+                       (cons 10 pt-p1) (cons 10 pt-p1-h) (cons 10 pt-meet) (cons 10 pt-p2-h) (cons 10 pt-p2)))
+        (setq p-head-center (inters pt-ins pt-free-end pt-p1-h pt-meet nil))
+        (if (null p-head-center) (setq p-head-center (polar pt-p1-h (angle pt-p1-h pt-meet) 200.0)))
+        (setq p-head-1 (polar p-head-center face-ang 100.0))
+        (setq p-head-2 (polar p-head-center (+ face-ang pi) 100.0))
+        (setq p-head-3 (polar p-head-2 out-ang 60.0))
+        (setq p-head-4 (polar p-head-1 out-ang 60.0))
+        (entmake (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline")
+                       (cons 8 "_앵커(Anchor)") (cons 62 6) '(90 . 4) '(70 . 1)
+                       (cons 10 p-head-1) (cons 10 p-head-2) (cons 10 p-head-3) (cons 10 p-head-4)))
+        (setq pt-anchor-start (polar p-head-center out-ang 210.0))
+        (entmake (list '(0 . "LINE") (cons 8 "_앵커(Anchor)") (cons 62 6) (cons 10 pt-anchor-start) (cons 11 pt-ins)))
+        (entmake (list '(0 . "LINE") (cons 8 "_앵커(Anchor)") (cons 62 6) (cons 10 pt-ins) (cons 11 pt-free-end)))
+        (entmake (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline")
+                       (cons 8 "_앵커(Anchor)") (cons 62 6) '(90 . 2) '(70 . 0) '(43 . 400.0)
+                       (cons 10 (list (car pt-free-end) (cadr pt-free-end)))
+                       (cons 10 (list (car pt-bond-end) (cadr pt-bond-end)))))
+      )
+
+      ((wcmatch s-type "버팀보*")
+        ;; 버팀보용 단일 브래킷 작도
+        (setvar "clayer" "_브래킷(Bracket)")
+        (setq br-p1 (list (+ real-cx (* (/ h-h 2.0) wale-dir)) (+ ins-y (/ wale-b 2.0))))
+        (setq br-p2 (list wale-insert-x (+ ins-y (/ wale-b 2.0))))
+        (setq br-p3 (list (car br-p2) (- ins-y (/ wale-b 2.0))))
+        (setq br-p4 (list (car br-p1) (- ins-y (/ wale-b 2.0))))
+        (command "_.pline" br-p1 br-p2 br-p3 br-p4 "_c")
+        (command "_.hatch" "ANSI31" (if (= (getvar "MEASUREMENT") 0) 400.0 20.0) 90 (entlast) "")
+
+        ;; 단일 띠장 및 보걸이 삽입
+        (setq wale-rot-angle (* -0.5 pi wale-dir))
+        (draw-wale-section pt-ins wale-rot-angle wale-layer-name wale-h wale-b wale-tw wale-tf 150.0 bracket-width)
+
+        ;; 버팀보 본체 작도 로직
+        (setq s-jack-type (nth 7 s-item))
+        (if (or (null s-jack-type) (= s-jack-type "")) (setq s-jack-type "스크류잭"))
+        (if (equal s-jack-type "스크류잭") (setq jack-block-name "스크류잭") (setq jack-block-name "유압잭"))
+        (setq jack-insert-x (+ wale-insert-x (* wale-h wale-dir)))
+        (setq pt-jack-ins (list jack-insert-x ins-y 0.0))
+        (setq jack-rot (if (> wale-dir 0) 0.0 pi))
+        (entmake (list '(0 . "INSERT") (cons 2 jack-block-name)
+                       (cons 8 (if (equal jack-block-name "스크류잭") "_스크류잭" "_유압잭"))
+                       (cons 62 2) (cons 10 pt-jack-ins) '(41 . 1.0) '(42 . 1.0) '(43 . 1.0) (cons 50 jack-rot)))
+        (setq s-sec-str (nth 6 s-item))
+        (setq strut-data (parse-h-spec s-sec-str))
+        (if (null strut-data) (setq strut-data '(300 300 10 15)))
+        (setq strut-h (nth 0 strut-data) strut-tf (nth 3 strut-data) half-h (/ strut-h 2.0))
+        (setq y-top (+ ins-y half-h) y-top-in (- y-top strut-tf) y-bot (- ins-y half-h) y-bot-in (+ y-bot strut-tf))
+        (setq x-jack-end (+ jack-insert-x (* 583.0 wale-dir)) ep-thick 14.0 x-ep-end (+ x-jack-end (* ep-thick wale-dir)))
+        (setq stiff-len 200.0 stiff-thick 14.0 x-stiff-end (+ x-ep-end (* stiff-len wale-dir)) x-strut-end (+ x-ep-end (* 4000.0 wale-dir)))
+        (entmake (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline")
+                       (cons 8 "_버팀보(Strut)") (cons 62 3) '(90 . 4) '(70 . 1)
+                       (cons 10 (list x-jack-end y-top 0.0)) (cons 10 (list x-ep-end y-top 0.0))
+                       (cons 10 (list x-ep-end y-bot 0.0)) (cons 10 (list x-jack-end y-bot 0.0))))
+        (setq stiff-y-top (+ ins-y (/ stiff-thick 2.0)) stiff-y-bot (- ins-y (/ stiff-thick 2.0)))
+        (entmake (list '(0 . "LINE") (cons 8 "_버팀보(Strut)") (cons 62 3) (cons 10 (list x-ep-end stiff-y-top 0.0)) (cons 11 (list x-stiff-end stiff-y-top 0.0))))
+        (entmake (list '(0 . "LINE") (cons 8 "_버팀보(Strut)") (cons 62 3) (cons 10 (list x-ep-end stiff-y-bot 0.0)) (cons 11 (list x-stiff-end stiff-y-bot 0.0))))
+        (entmake (list '(0 . "LINE") (cons 8 "_버팀보(Strut)") (cons 62 3) (cons 10 (list x-stiff-end stiff-y-top 0.0)) (cons 11 (list x-stiff-end stiff-y-bot 0.0))))
+        (entmake (list '(0 . "LINE") (cons 8 "_버팀보(Strut)") (cons 62 3) (cons 10 (list x-ep-end y-top 0.0)) (cons 11 (list x-strut-end y-top 0.0))))
+        (entmake (list '(0 . "LINE") (cons 8 "_버팀보(Strut)") (cons 62 3) (cons 10 (list x-ep-end y-bot 0.0)) (cons 11 (list x-strut-end y-bot 0.0))))
+        (entmake (list '(0 . "LINE") (cons 8 "_버팀보(Strut)") (cons 62 1) (cons 10 (list x-ep-end y-top-in 0.0)) (cons 11 (list x-strut-end y-top-in 0.0))))
+        (entmake (list '(0 . "LINE") (cons 8 "_버팀보(Strut)") (cons 62 1) (cons 10 (list x-ep-end y-bot-in 0.0)) (cons 11 (list x-strut-end y-bot-in 0.0))))
+        (setq bulge-val (if (> wale-dir 0) 0.5 -0.5))
+        (entmake (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline")
+                       (cons 8 "_버팀보(Strut)") (cons 62 1) '(90 . 5) '(70 . 0)
+                       (cons 10 (list x-strut-end y-top 0.0)) (cons 42 0.0)
+                       (cons 10 (list x-strut-end y-top-in 0.0)) (cons 42 bulge-val)
+                       (cons 10 (list x-strut-end ins-y 0.0)) (cons 42 (- bulge-val))
+                       (cons 10 (list x-strut-end y-bot-in 0.0)) (cons 42 0.0)
+                       (cons 10 (list x-strut-end y-bot 0.0))))
+      )
+    )
+  )
+
+  ;; 시스템 변수 복구
+  (setvar "OSMODE" old-osmode)
+  (princ)
+)
+
+;;;;==========================================================================
+;;;; defun create-strut-jack-block : 유압잭 형상을 블록으로 정의
+;;;;==========================================================================
+(defun create-strut-jack-block (/ block-name layer-name _v _pline)
+  (setq block-name "유압잭")
+  (setq layer-name "_유압잭")
+  ;; 1. 레이어 생성 (노란색: 2번)
+  (create-layer-if-not-exists layer-name "2")
+  ;; 2. 블록 정의 (없는 경우에만 생성)
+  (if (not (tblsearch "BLOCK" block-name))
+    (progn
+      ;; 블록 정의 시작 (기준점 0,0,0)
+      (entmake (list '(0 . "BLOCK") (cons 2 block-name) '(70 . 0) '(10 0.0 0.0 0.0)))
+
+      (defun _v (dx dy) (list dx dy))
+
+;;;;==========================================================================
+;;;; defun _pline : [내부 헬퍼 함수] 폴리라인 생성 (레이어: _유압잭, 색상: ByLayer)
+;;;;==========================================================================
+      (defun _pline (pts closed / lst)
+        (setq lst (list '(0 . "LWPOLYLINE")
+                        '(100 . "AcDbEntity")
+                        '(100 . "AcDbPolyline")
+                        (cons 8 layer-name)  ;; 요청하신 레이어 적용
+                        (cons 62 256)        ;; ByLayer (레이어가 노랑이므로 노랑으로 나옴)
+                        (cons 90 (length pts))
+                        (cons 70 (if closed 1 0))))
+        (foreach p pts
+          (setq lst (append lst (list (cons 10 p))))
+          (if (> (length p) 2) (setq lst (append lst (list (cons 42 (caddr p))))))
+        )
+        (entmake lst)
+      )
+      ;; 잭 형상 작도
+      (_pline (list (_v 0 150) (_v 15 150) (_v 15 -150) (_v 0 -150)) T)
+      (_pline (list (_v 568 150) (_v 583 150) (_v 583 -150) (_v 568 -150)) T)
+      (_pline (list (_v 15 150) (_v 160 85)) nil)
+      (_pline (list (_v 15 -150) (_v 160 -85)) nil)
+      (_pline (list (_v 15 85) (_v 375 85)) nil)
+      (_pline (list (_v 15 -85) (_v 375 -85)) nil)
+      (_pline (list (_v 375 85) (_v 375 -85)) nil)
+      (_pline (list (_v 15 7) (_v 160 7)) nil)
+      (_pline (list (_v 15 -7) (_v 160 -7)) nil)
+      (_pline (list (_v 160 7) (_v 160 -7)) nil)
+      (_pline (list (_v 446 55) (append (_v 496 55) '(0.102)) (_v 568 70)) nil)
+      (_pline (list (_v 568 150) (_v 446 55)) nil)
+      (_pline (list (_v 446 -55) (append (_v 496 -55) '(-0.102)) (_v 568 -70)) nil)
+      (_pline (list (_v 568 -150) (_v 446 -55)) nil)
+      (_pline (list (_v 446 7) (_v 568 7)) nil)
+      (_pline (list (_v 445 -7) (_v 568 -7)) nil)
+      (_pline (list (_v 400 75) (_v 400 95) (_v 420 95) (_v 420 75)) nil)
+      (_pline (list (_v 400 10) (_v 420 10) (_v 420 -10) (_v 400 -10)) T)
+      (_pline (list (_v 400 -75) (_v 400 -95) (_v 420 -95) (_v 420 -75)) nil)
+      (_pline (list (_v 375 75) (_v 446 75)) nil)
+      (_pline (list (_v 375 -75) (_v 446 -75)) nil)
+      (_pline (list (_v 446 75) (_v 446 -75)) nil)
+      ;; 기준점 및 끝점 포인트 (디버깅용, 필요 시 삭제 가능)
+      (entmake (list '(0 . "POINT") (cons 8 layer-name) (cons 10 '(0 0 0))))
+      (entmake (list '(0 . "POINT") (cons 8 layer-name) (cons 10 '(583 0 0))))
+      (entmake (list '(0 . "ENDBLK"))) ;; 블록 정의 종료
+    )
+  )
+  block-name ;; 블록 이름 반환
+)
+
+;;;;==========================================================================
+;;;; defun create-strut-screw-jack-block : 스크류잭 형상을 블록으로 정의
+;;;;==========================================================================
+(defun create-strut-screw-jack-block (/ block-name layer-name _v _pline)
+  (setq block-name "스크류잭")
+  (setq layer-name "_스크류잭")
+  ;; 1. 레이어 생성 (노란색: 2번)
+  (create-layer-if-not-exists layer-name "2")
+  ;; 2. 블록 정의 (없는 경우에만 생성)
+  (if (not (tblsearch "BLOCK" block-name))
+    (progn
+      (entmake (list '(0 . "BLOCK") (cons 2 block-name) '(70 . 0) '(10 0.0 0.0 0.0)))
+      ;; [좌표 보정 함수]
+      ;; 원본은 중심(0) 기준 -291.5 ~ +291.5 이므로,
+      ;; 시작점을 0으로 맞추기 위해 X에 291.5를 더해줍니다.
+
+      (defun _v (dx dy) (list (+ dx 291.5) dy))
+
+;;;;==========================================================================
+;;;; defun _pline : 자동 정리된 함수
+;;;;==========================================================================
+      (defun _pline (pts closed / lst)
+        (setq lst (list '(0 . "LWPOLYLINE")
+                        '(100 . "AcDbEntity")
+                        '(100 . "AcDbPolyline")
+                        (cons 8 layer-name)
+                        (cons 62 256)
+                        (cons 90 (length pts))
+                        (cons 70 (if closed 1 0))))
+        (foreach p pts (setq lst (append lst (list (cons 10 p)))))
+        (entmake lst)
+      )
+      ;; --- 스크류잭 형상 (사용자 정의 + 좌표보정) ---
+      (entmake (list '(0 . "CIRCLE") (cons 8 layer-name) (cons 62 256) (cons 10 (_v 0 0)) (cons 40 7.0)))
+      (_pline (list (_v -22.5 50) (_v 22.5 50) (_v 22.5 -50) (_v -22.5 -50)) T)
+      (_pline (list (_v -7 50) (_v -7 100) (_v 7 100) (_v 7 50)) nil)
+      (_pline (list (_v -7 -50) (_v -7 -100) (_v 7 -100) (_v 7 -50)) nil)
+      (_pline (list (_v -57.5 25) (_v -22.5 25)) nil)
+      (_pline (list (_v -57.5 -25) (_v -22.5 -25)) nil)
+      (_pline (list (_v 57.5 25) (_v 22.5 25)) nil)
+      (_pline (list (_v 57.5 -25) (_v 22.5 -25)) nil)
+      (_pline (list (_v -97.5 50) (_v -57.5 50) (_v -57.5 -50) (_v -97.5 -50)) nil)
+      (_pline (list (_v 97.5 50) (_v 57.5 50) (_v 57.5 -50) (_v 97.5 -50)) nil)
+      (_pline (list (_v -277.5 70) (_v -97.5 70) (_v -97.5 -70) (_v -277.5 -70)) nil)
+      (_pline (list (_v 277.5 70) (_v 97.5 70) (_v 97.5 -70) (_v 277.5 -70)) nil)
+      (_pline (list (_v -277.5 7) (_v -132.5 7) (_v -132.5 -7) (_v -277.5 -7)) nil)
+      (_pline (list (_v 277.5 7) (_v 132.5 7) (_v 132.5 -7) (_v 277.5 -7)) nil)
+      (_pline (list (_v -291.5 150) (_v -277.5 150) (_v -277.5 -150) (_v -291.5 -150)) T)
+      (_pline (list (_v 291.5 150) (_v 277.5 150) (_v 277.5 -150) (_v 291.5 -150)) T)
+      (_pline (list (_v -277.5 150) (_v -132.5 95) (_v -132.5 70)) nil)
+      (_pline (list (_v 277.5 150) (_v 132.5 95) (_v 132.5 70)) nil)
+      (_pline (list (_v -277.5 -150) (_v -132.5 -95) (_v -132.5 -70)) nil)
+      (_pline (list (_v 277.5 -150) (_v 132.5 -95) (_v 132.5 -70)) nil)
+      (entmake (list '(0 . "POINT") (cons 8 layer-name) (cons 10 (_v -291.5 0))))
+      (entmake (list '(0 . "ENDBLK")))
+    )
+  )
+  block-name
+)
+
+;;;;==========================================================================
+;;;; defun tsp-load-subzone-to-globals : 선택한 세부 구간(SUB-ZONE)의 벽체/지층/수위/지보재 세트를 전역 변수에 적용
+;;;;==========================================================================
+(defun tsp-load-subzone-to-globals (sz / val)
+  (if (and sz (listp sz))
+    (progn
+      (if (assoc 'WALL-TYPE sz) (setq *tsp-wall-type* (cdr (assoc 'WALL-TYPE sz))))
+      (if (assoc 'WALL-SPEC sz) (setq *tsp-hpile-spec* (cdr (assoc 'WALL-SPEC sz))))
+      (if (assoc 'WALL-CUSTOM sz) (setq *tsp-hpile-custom* (cdr (assoc 'WALL-CUSTOM sz))))
+      (if (assoc 'WALE-SPEC sz) (setq *tsp-wale-spec* (cdr (assoc 'WALE-SPEC sz))))
+      (if (assoc 'WALE-CUSTOM sz) (setq *tsp-wale-custom* (cdr (assoc 'WALE-CUSTOM sz))))
+      (if (assoc 'CTC sz) (setq *tsp-ctc* (cdr (assoc 'CTC sz))))
+      (if (assoc 'TIMBER-THICKNESS sz) (setq *tsp-timber-thickness* (cdr (assoc 'TIMBER-THICKNESS sz))))
+      (if (assoc 'MAX-DEPTH sz) (setq *tsp-max-depth* (cdr (assoc 'MAX-DEPTH sz))))
+      (if (assoc 'EMBED-DEPTH sz) (setq *tsp-embed-depth* (cdr (assoc 'EMBED-DEPTH sz))))
+      (if (assoc 'CIP-HPILE-IDX sz) (setq *tsp-cip-hpile-idx* (cdr (assoc 'CIP-HPILE-IDX sz))))
+      (if (assoc 'CIP-WALE-IDX sz) (setq *tsp-cip-wale-idx* (cdr (assoc 'CIP-WALE-IDX sz))))
+      (if (assoc 'CIP-DIA sz) (setq *tsp-cip-dia* (cdr (assoc 'CIP-DIA sz))))
+      (if (assoc 'CIP-MODE-IDX sz) (setq *tsp-cip-mode-idx* (cdr (assoc 'CIP-MODE-IDX sz))))
+      (if (assoc 'CIP-OVERLAP sz) (setq *tsp-cip-overlap* (cdr (assoc 'CIP-OVERLAP sz))))
+      (if (assoc 'CIP-INTERVAL-IDX sz) (setq *tsp-cip-interval-idx* (cdr (assoc 'CIP-INTERVAL-IDX sz))))
+      (if (assoc 'CIP-ANCHOR-N sz) (setq *tsp-cip-anchor-n* (cdr (assoc 'CIP-ANCHOR-N sz))))
+      (if (assoc 'CIP-GROUTING-IDX sz) (setq *tsp-cip-grouting-idx* (cdr (assoc 'CIP-GROUTING-IDX sz))))
+      (if (assoc 'SOIL-DATA sz) (setq *tsp-soil-layers* (cdr (assoc 'SOIL-DATA sz))))
+      (if (assoc 'N-VALUES sz) (setq *tsp-n-values* (cdr (assoc 'N-VALUES sz))))
+      (if (assoc 'HOLE-NO sz) (setq *tsp-hole-no* (cdr (assoc 'HOLE-NO sz))))
+      (if (assoc 'WATER-CHK sz) (setq *tsp-water-chk* (cdr (assoc 'WATER-CHK sz))))
+      (if (assoc 'WATER-DEPTH sz) (setq *tsp-water-depth* (cdr (assoc 'WATER-DEPTH sz))))
+      (if (assoc 'SUPPORT-LIST sz) (setq *tsp-support-list* (tsp-sanitize-support-list (cdr (assoc 'SUPPORT-LIST sz)))))
+    )
+  )
+)
