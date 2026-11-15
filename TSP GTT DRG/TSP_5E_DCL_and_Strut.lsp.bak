@@ -1,0 +1,578 @@
+;;; ==========================================================================
+;;; 파일명: TSP_5E_DCL_and_Strut.lsp
+;;; 구  분: DCL 다이얼로그 UI, 세그먼트 매니저 및 버팀보/앵커/까치발 수동 작도 (Part E)
+;;; 역  할: 전체 DCL 생성, 세그먼트 매니저/마법사/대시보드, 지반/범례/벽체/사보강재/지보재 콜백, 수동 버팀보/까치발/연속보강재/앵커편심각/중간말뚝 작도 및 제어 [modify-segment-dashboard, format-h-spec-short, get-segment-display-string, reset-globals-to-defaults, update-segment-manager-list 외 6개]
+;;; 포함 함수: modify-segment-dashboard, format-h-spec-short, get-segment-display-string, reset-globals-to-defaults, update-segment-manager-list, sync-globals-to-segment, load-segment-to-globals, tsp-parse-space-string, tsp-join-space-string, tsp-pause-for-measurement, *error*
+;;; --------------------------------------------------------------------------
+;;; [안내] 이 파일은 TSP.lsp(메인 로더)에 의해 자동으로 로드되는 하위 모듈입니다.
+;;;        코드 수정 시 전체 파일을 합칠 필요 없이 이 파일만 단독 패치하면 됩니다.
+;;; ==========================================================================
+
+;;;;==========================================================================
+;;;; defun modify-segment-dashboard : [수정 모드] 통합 메뉴 대시보드 방식
+;;;;==========================================================================
+(defun modify-segment-dashboard (dcl-path idx / seg-data current-draw current-name loop-active menu-status input-name sub-status wall-choice dcl-id brace-data new-brace max-limit limits res cur-idx brace-loop temp-seg-data found-valid search-idx loop-count max-loop check-b)
+  (load-segment-to-globals idx)
+  (setq seg-data (nth idx *segment-list*))
+  (setq current-draw (cdr (assoc 'SECTION-DRAW seg-data)))
+  (if (and (not (cdr (assoc 'IS-DEFINED seg-data)))
+           *tsp-soil-layers*
+           (/= *tsp-soil-layers* '()))
+    (setq current-draw T)
+  )
+  (setq current-name (cdr (assoc 'NAME seg-data)))
+  (setq loop-active T)
+  (while loop-active
+    ;; 강제 자동 줌 코드 제거
+    (setq seg-data (nth idx *segment-list*))
+    (setq dcl-id (load_dialog dcl-path))
+    (if (new_dialog "tsp_edit_menu" dcl-id)
+      (progn
+        (set_tile "menu_title" (strcat current-name " 설정 수정"))
+        (set_tile "seg_name" current-name)
+        (set_tile "chk_section" (if current-draw "1" "0"))
+        (setq brace-data (cdr (assoc 'CORNER-BRACE seg-data)))
+        (if brace-data
+          (mode_tile "btn_brace" 0)
+          (mode_tile "btn_brace" 1)
+        )
+
+        (action_tile "btn_soil"    "(setq current-name (get_tile \"seg_name\")) (setq current-draw (= (get_tile \"chk_section\") \"1\")) (done_dialog 2)")
+        (action_tile "btn_wall"    "(setq current-name (get_tile \"seg_name\")) (setq current-draw (= (get_tile \"chk_section\") \"1\")) (done_dialog 3)")
+        (action_tile "btn_support" "(setq current-name (get_tile \"seg_name\")) (setq current-draw (= (get_tile \"chk_section\") \"1\")) (done_dialog 4)")
+        (action_tile "btn_brace"   "(setq current-name (get_tile \"seg_name\")) (setq current-draw (= (get_tile \"chk_section\") \"1\")) (done_dialog 5)")
+        (action_tile "accept"      "(setq current-name (get_tile \"seg_name\")) (setq current-draw (= (get_tile \"chk_section\") \"1\")) (done_dialog 1)")
+        (action_tile "cancel"      "(done_dialog 0)")
+        (setq menu-status (start_dialog))
+      )
+      (setq menu-status 0)
+    )
+    (unload_dialog dcl-id)
+    (cond
+      ((= menu-status 1) (setq loop-active nil))
+      ((= menu-status 0) (setq loop-active nil) (princ "\n수정이 취소되었습니다."))
+      ((= menu-status 2)
+       (soil-dialog-callback dcl-path)
+       (if (and *tsp-soil-layers* (/= *tsp-soil-layers* '())) (setq current-draw T))
+      )
+      ((= menu-status 3)
+       ;; [8단계] 벽체 수정 진입 시 세그먼트 저장값으로 전역 복원
+       ;; → main-dialog가 현재 세그먼트의 공법(WALL-TYPE)을 기준으로 열림
+       (load-segment-to-globals idx)
+       (setq wall-choice (main-dialog-callback dcl-path))
+       (cond
+         ;; H-Pile 선택 → hpile-dialog 진행
+         ((= wall-choice 1) (hpile-dialog-callback dcl-path))
+         ;; C.I.P 선택 → CIP 다이얼로그 진행
+         ((= wall-choice 11) (tsp-run-cip-dialog))
+         ;; Back(=2) 또는 Cancel(0/-1): 전역 오염 방지를 위해 세그먼트 값 재복원
+         (t (load-segment-to-globals idx))
+       )
+      )
+      ((= menu-status 4) (support-dialog-callback dcl-path))
+      ((= menu-status 5)
+       (setq cur-idx idx)
+       (setq brace-loop T)
+       (while brace-loop
+         (setq temp-seg-data (nth cur-idx *segment-list*))
+         (setq limits (tsp-calculate-brace-limit cur-idx))
+         (setq res (brace-dialog-callback dcl-path temp-seg-data limits 0))
+         (if (and res (listp res))
+           (progn
+             (setq old-b-list (if (and (cdr (assoc 'CORNER-BRACE temp-seg-data)) (cadr (cdr (assoc 'CORNER-BRACE temp-seg-data)))) (cadr (cdr (assoc 'CORNER-BRACE temp-seg-data))) nil))
+             (setq new-b-list (if (and (cadr res) (cadr (cadr res))) (cadr (cadr res)) nil))
+             (setq is-dirty (not (and (equal old-b-list new-b-list) (equal (cdr (assoc 'UPGRADE-WALE temp-seg-data)) (caddr res)))))
+
+             (setq temp-seg-data (subst (cons 'CORNER-BRACE (cadr res)) (assoc 'CORNER-BRACE temp-seg-data) temp-seg-data))
+             (setq temp-seg-data (subst (cons 'UPGRADE-WALE (caddr res)) (assoc 'UPGRADE-WALE temp-seg-data) temp-seg-data))
+             (setq *segment-list* (update-list-item *segment-list* cur-idx temp-seg-data))
+
+             ;; 변경사항이 있을 때만 재생성
+             (if (and is-dirty *tsp-boundary-ent* *tsp-boundary-orient*)
+               (tsp-redraw-realtime-plan *tsp-boundary-ent* *tsp-boundary-orient*)
+             )
+             (if (= (car res) "NEXT")
+               (progn
+                 (setq found-valid nil search-idx cur-idx loop-count 0 max-loop (length *segment-list*))
+                 (while (and (not found-valid) (< loop-count max-loop))
+                   (setq search-idx (1+ search-idx))
+                   (if (>= search-idx max-loop)
+                     (if (is-closed-polyline *tsp-boundary-ent*)
+                       (setq search-idx 0)
+                       (setq search-idx 9999)
+                     )
+                   )
+                   (if (< search-idx max-loop)
+                     (progn
+                       (setq check-b (cdr (assoc 'CORNER-BRACE (nth search-idx *segment-list*))))
+                       (if (not (and check-b (= (car check-b) "N")))
+                         (setq found-valid T)
+                       )
+                     )
+                   )
+                   (setq loop-count (1+ loop-count))
+                 )
+                 (if found-valid
+                   (setq cur-idx search-idx)
+                   (progn
+                     (alert "더 이상 사보강재(Corner Strut)를 수정할 유효한 모서리가 없습니다.\n수정을 완료합니다.")
+                     (setq brace-loop nil)
+                   )
+                 )
+               )
+               (setq brace-loop nil)
+             )
+           )
+           (setq brace-loop nil)
+         )
+       )
+       (setq seg-data (nth idx *segment-list*))
+      )
+    )
+  )
+  (if (= menu-status 1)
+    (progn
+      (setq seg-data (nth idx *segment-list*))
+      (setq seg-data (subst (cons 'NAME current-name) (assoc 'NAME seg-data) seg-data))
+      (setq seg-data (subst (cons 'SECTION-DRAW current-draw) (assoc 'SECTION-DRAW seg-data) seg-data))
+      (setq *segment-list* (update-list-item *segment-list* idx seg-data))
+      (sync-globals-to-segment idx)
+      (setq *tsp-data-dirty* T)
+      (princ "\n설정이 저장되었습니다.")
+    )
+  )
+)
+
+;;;;==========================================================================
+;;;; defun format-h-spec-short : H형강 규격을 폭x높이 형태로 짧게 변환하고 2중 표기 적용 (빈 값 nil 보호 로직 추가)
+;;;;==========================================================================
+(defun format-h-spec-short (spec-val custom-val double-prefix / res parsed)
+  (setq res "")
+  (if (not spec-val) (setq spec-val "미입력")) ; 안전 가드
+  (if (or (= spec-val "User-defined") (= spec-val "Custom"))
+    (if custom-val
+      (setq res (strcat "H " (itoa (nth 0 custom-val)) "x" (itoa (nth 1 custom-val))))
+      (setq res "H 사용자정의")
+    )
+    (progn
+      (if (and spec-val (/= spec-val "미입력"))
+        (progn
+          (setq parsed (parse-h-spec spec-val))
+          (if parsed
+             (setq res (strcat "H " (itoa (nth 0 parsed)) "x" (itoa (nth 1 parsed))))
+             (setq res spec-val)
+          )
+        )
+        (setq res spec-val)
+      )
+    )
+  )
+  (if (and double-prefix (/= res "미입력") (/= res ""))
+    (setq res (strcat "2" res))
+  )
+  res
+)
+
+;;;;==========================================================================
+;;;; defun get-segment-display-string : 세그먼트 데이터를 리스트박스 표시용 문자열로 변환
+;;;;==========================================================================
+(defun get-segment-display-string (idx seg-data / s-id s-name is-defined s-draw s-support wall-str support-str s-brace-data s-brace-str s-spec s-custom wall-short w-spec w-custom wale-short has-anchor-str brace-short b-row-list num-b-rows first-b-row w-type cip-dia cip-hidx-raw cip-hidx-val cip-hidx-safe cip-widx-raw cip-widx-val cip-widx-safe hole-no)
+  (setq s-id (strcat (itoa (1+ idx))))
+  (setq s-name (cdr (assoc 'NAME seg-data)))
+  (setq is-defined (cdr (assoc 'IS-DEFINED seg-data)))
+  (setq s-brace-data (cdr (assoc 'CORNER-BRACE seg-data)))
+  (setq s-brace-str "")
+  (if s-brace-data
+    (if (= (car s-brace-data) "Y")
+      (progn
+        (setq b-row-list (cadr s-brace-data))
+        (setq num-b-rows (length b-row-list))
+        (if (> num-b-rows 0)
+          (progn
+            (setq first-b-row (car b-row-list))
+            (setq brace-short (format-h-spec-short (car first-b-row) (cadr first-b-row) nil))
+            (setq s-brace-str (strcat "Y / " (itoa num-b-rows) "열 (" brace-short ")"))
+          )
+          (setq s-brace-str "Y (미입력)")
+        )
+      )
+      (setq s-brace-str "N")
+    )
+    (setq s-brace-str "-")
+  )
+  (if (and (assoc 'SUB-ZONES seg-data) (cdr (assoc 'SUB-ZONES seg-data)))
+    (progn
+      (setq sub-zones (cdr (assoc 'SUB-ZONES seg-data)))
+      (setq wall-str "")
+      (foreach sz sub-zones
+        (setq z-wt (if (assoc 'WALL-TYPE sz) (cdr (assoc 'WALL-TYPE sz)) "HPILE"))
+        (setq z-sm (rtos (cdr (assoc 'START-M sz)) 2 1))
+        (setq z-em (rtos (cdr (assoc 'END-M sz)) 2 1))
+        (setq z-lbl (strcat "[" z-sm "~" z-em "m:" (if (= z-wt "CIP") (strcat "CIP-D" (cdr (assoc 'CIP-DIA sz))) "H-Pile") "]"))
+        (setq wall-str (if (= wall-str "") z-lbl (strcat wall-str " " z-lbl)))
+      )
+      (setq s-support (cdr (assoc 'SUPPORT-LIST seg-data)))
+      (setq support-str "")
+      (if s-support
+        (foreach item s-support
+          (if (= support-str "")
+            (setq support-str (car item))
+            (if (not (vl-string-search (car item) support-str))
+              (setq support-str (strcat support-str ", " (car item)))
+            )
+          )
+        )
+        (setq support-str "-")
+      )
+      (strcat s-id "\t" s-name "\t" "분할(" (itoa (length sub-zones)) ")" "\t" "복합공법" "\t" wall-str "\t" support-str "\t" s-brace-str)
+    )
+    (if is-defined
+      (progn
+        (if (cdr (assoc 'SECTION-DRAW seg-data))
+        (progn
+          (setq hole-no (cdr (assoc 'HOLE-NO seg-data)))
+          (if (or (null hole-no) (= hole-no "")) (setq hole-no "BH-"))
+          (setq s-draw (strcat "Y(" hole-no ")"))
+        )
+        (setq s-draw "N")
+      )
+      (setq s-support (cdr (assoc 'SUPPORT-LIST seg-data)))
+      (setq support-str "")
+      (setq has-anchor-str nil)
+      (if s-support
+        (foreach item s-support
+          (if (wcmatch (car item) "앵커*") (setq has-anchor-str T))
+          (if (= support-str "")
+            (setq support-str (car item))
+            (if (not (vl-string-search (car item) support-str))
+              (setq support-str (strcat support-str ", " (car item)))
+            )
+          )
+        )
+        (setq support-str "-")
+      )
+      ;; 벽체 타입(WALL-TYPE)에 따라 출력 텍스트 분기
+      (setq w-type (cdr (assoc 'WALL-TYPE seg-data)))
+      (if (not w-type) (setq w-type "HPILE")) ; 과거 데이터 호환성
+      (if (= w-type "CIP")
+        (progn
+          ;; CIP-HPILE-IDX nil 가드 (let* 제거 → setq 순차 방식)
+          (setq cip-hidx-raw (cdr (assoc 'CIP-HPILE-IDX seg-data)))
+          (setq cip-hidx-val (if cip-hidx-raw (atoi cip-hidx-raw) 0))
+          (setq cip-hidx-safe (if (and (>= cip-hidx-val 0) (< cip-hidx-val (length *tsp-std-wall-list*))) cip-hidx-val 0))
+          (setq s-spec (nth cip-hidx-safe *tsp-std-wall-list*))
+          (setq wall-short (format-h-spec-short s-spec nil nil))
+
+          ;; CIP-DIA nil 가드
+          (setq cip-dia (cdr (assoc 'CIP-DIA seg-data)))
+          (if (not cip-dia) (setq cip-dia "450"))
+
+          ;; CIP-WALE-IDX nil 가드 및 지보재 설정 띠장 우선 표시
+          (setq cip-widx-raw (cdr (assoc 'CIP-WALE-IDX seg-data)))
+          (setq cip-widx-val (if cip-widx-raw (atoi cip-widx-raw) 0))
+          (setq cip-widx-safe (if (and (>= cip-widx-val 0) (< cip-widx-val (length *tsp-std-wall-list*))) cip-widx-val 0))
+          (setq w-spec (nth cip-widx-safe *tsp-std-wall-list*))
+          (setq wale-short "")
+          (if s-support
+            (foreach item s-support
+              (setq item-w-short (format-h-spec-short (tsp-get-support-item-wale-spec item w-spec) nil (wcmatch (car item) "앵커*")))
+              (if (= wale-short "")
+                (setq wale-short item-w-short)
+                (if (not (vl-string-search item-w-short wale-short))
+                  (setq wale-short (strcat wale-short "+" item-w-short))
+                )
+              )
+            )
+            (setq wale-short (format-h-spec-short w-spec nil has-anchor-str))
+          )
+          (setq wall-str (strcat "D" cip-dia "(" wall-short ") / " wale-short))
+          (strcat s-id "\t" s-name "\t" s-draw "\t" "C.I.P" "\t" wall-str "\t" support-str "\t" s-brace-str)
+        )
+        (progn ; HPILE
+          (setq s-spec (cdr (assoc 'WALL-SPEC seg-data)))
+          (setq s-custom (cdr (assoc 'WALL-CUSTOM seg-data)))
+          (setq wall-short (format-h-spec-short s-spec s-custom nil))
+          (setq w-spec (cdr (assoc 'WALE-SPEC seg-data)))
+          (setq w-custom (cdr (assoc 'WALE-CUSTOM seg-data)))
+          (setq wale-short "")
+          (if s-support
+            (foreach item s-support
+              (setq item-w-short (format-h-spec-short (tsp-get-support-item-wale-spec item w-spec) w-custom (wcmatch (car item) "앵커*")))
+              (if (= wale-short "")
+                (setq wale-short item-w-short)
+                (if (not (vl-string-search item-w-short wale-short))
+                  (setq wale-short (strcat wale-short "+" item-w-short))
+                )
+              )
+            )
+            (setq wale-short (format-h-spec-short w-spec w-custom has-anchor-str))
+          )
+          (setq wall-str (strcat wall-short " / " wale-short))
+          (strcat s-id "\t" s-name "\t" s-draw "\t" "H-Pile+토류판" "\t" wall-str "\t" support-str "\t" s-brace-str)
+        )
+      )
+    )
+    ;; 미정의 세그먼트
+      (progn
+        (setq w-type (cdr (assoc 'WALL-TYPE seg-data)))
+        (if (not w-type) (setq w-type "HPILE"))
+        (strcat s-id "\t" s-name "\t" "-" "\t" "" "\t" "" "\t" "-" "\t" s-brace-str)
+      )
+    )
+  )
+)
+
+;;;;==========================================================================
+;;;; defun reset-globals-to-defaults : 입력 버튼 클릭 시 전역 변수를 시스템 기본값으로 초기화
+;;;;==========================================================================
+(defun reset-globals-to-defaults ()
+  ;; [1단계 고정] 공법 타입을 항상 HPILE로 초기화
+  ;; C.I.P는 사용자가 다이얼로그에서 최종 OK를 눌렀을 때만 "CIP"로 변경됨
+  (setq *tsp-wall-type* "HPILE")
+  (setq *tsp-hpile-spec* (nth 0 *tsp-std-wall-list*))
+  (setq *tsp-hpile-custom* '(250 250 9 14))
+  (setq *tsp-wale-spec* (nth 1 *tsp-std-wall-list*))
+  (setq *tsp-wale-custom* '(300 300 10 15))
+  (setq *tsp-ctc* 2.0)
+  (setq *tsp-timber-thickness* 60)
+  (setq *tsp-cip-grouting-idx* "0")
+  (setq *tsp-cip-grouting-space-idx* "0")
+  (setq *tsp-cip-grouting-space-custom* "")
+  (setq *tsp-cip-grouting-offset-idx* "0")
+  (setq *tsp-cip-grouting-offset-custom* "")
+
+  ;; [통합된 깊이 변수 초기화]
+  (setq *tsp-max-depth* 10.0)
+  (setq *tsp-embed-depth* 3.0)
+  (setq *tsp-rock-embed* "500") ;; 암반 하부 근입 (기본값 문자열)
+
+  (setq *tsp-soil-layers* '())
+  (setq *tsp-water-chk* "0")
+  (setq *tsp-water-depth* 0.0)
+  (setq *tsp-shotcrete-enable* "1")
+  (setq *tsp-shotcrete-chk* "0")
+  (setq *tsp-shotcrete-layer* "")
+  (setq *tsp-shotcrete-thick* 0.0)
+  (setq *tsp-support-list* '())
+)
+
+;;;;==========================================================================
+;;;; defun update-segment-manager-list : 관리자 리스트박스 갱신
+;;;;==========================================================================
+(defun update-segment-manager-list ()
+  (start_list "seg_list")
+  (setq i 0)
+  (foreach seg *segment-list*
+    (add_list (get-segment-display-string i seg))
+    (setq i (1+ i))
+  )
+  (end_list)
+)
+
+;;;;==========================================================================
+;;;; defun sync-globals-to-segment : 전역 변수(DCL입력값)를 세그먼트 데이터 리스트로 저장
+;;;;==========================================================================
+(defun sync-globals-to-segment (idx / old-data new-data)
+  (setq old-data (nth idx *segment-list*))
+  (setq new-data (list
+    (cons 'ID (cdr (assoc 'ID old-data)))
+    (cons 'NAME (cdr (assoc 'NAME old-data)))
+    (cons 'IS-DEFINED T)
+    (cons 'WALL-TYPE (if *tsp-wall-type* *tsp-wall-type* "HPILE"))
+    (cons 'SECTION-DRAW (cdr (assoc 'SECTION-DRAW old-data)))
+    (cons 'SOIL-DATA *tsp-soil-layers*)
+    (cons 'N-VALUES *tsp-n-values*)
+    (cons 'HOLE-NO *tsp-hole-no*)
+    (cons 'WALL-SPEC *tsp-hpile-spec*)
+    (cons 'WALL-CUSTOM *tsp-hpile-custom*)
+    (cons 'WALE-SPEC *tsp-wale-spec*)
+    (cons 'WALE-CUSTOM *tsp-wale-custom*)
+    (cons 'CTC *tsp-ctc*)
+    (cons 'TIMBER-THICKNESS *tsp-timber-thickness*)
+
+    ;; [통합된 깊이 데이터 저장]
+    (cons 'MAX-DEPTH *tsp-max-depth*)
+    (cons 'EMBED-DEPTH *tsp-embed-depth*)
+    (cons 'ROCK-EMBED *tsp-rock-embed*)
+
+    ;; === [6단계] C.I.P 전용 데이터 저장 (깊이 관련 제외) ===
+    (cons 'CIP-HPILE-IDX *tsp-cip-hpile-idx*)
+    (cons 'CIP-WALE-IDX *tsp-cip-wale-idx*)
+    (cons 'CIP-DIA *tsp-cip-dia*)
+    (cons 'CIP-MODE-IDX *tsp-cip-mode-idx*)
+    (cons 'CIP-OVERLAP *tsp-cip-overlap*)
+    (cons 'CIP-EQUAL-DIVIDE *tsp-cip-equal-divide*)
+    (cons 'CIP-INTERVAL-IDX *tsp-cip-interval-idx*)
+    (cons 'CIP-ANCHOR-N *tsp-cip-anchor-n*)
+    (cons 'CIP-GROUTING-IDX *tsp-cip-grouting-idx*)
+    (cons 'CIP-GROUTING-SPACE-IDX *tsp-cip-grouting-space-idx*)
+    (cons 'CIP-GROUTING-SPACE-CUSTOM *tsp-cip-grouting-space-custom*)
+    (cons 'CIP-GROUTING-OFFSET-IDX *tsp-cip-grouting-offset-idx*)
+    (cons 'CIP-GROUTING-OFFSET-CUSTOM *tsp-cip-grouting-offset-custom*)
+
+    (cons 'WATER-CHK *tsp-water-chk*)
+    (cons 'WATER-DEPTH *tsp-water-depth*)
+    (cons 'SHOTCRETE-ENABLE *tsp-shotcrete-enable*)
+    (cons 'SHOTCRETE-CHK *tsp-shotcrete-chk*)
+    (cons 'SHOTCRETE-LAYER *tsp-shotcrete-layer*)
+    (cons 'SHOTCRETE-THICK *tsp-shotcrete-thick*)
+    (cons 'SUPPORT-LIST *tsp-support-list*)
+    (cons 'CORNER-BRACE (cdr (assoc 'CORNER-BRACE old-data)))
+    (cons 'UPGRADE-WALE (cdr (assoc 'UPGRADE-WALE old-data)))
+    (cons 'SUB-ZONES (if (assoc 'SUB-ZONES old-data) (cdr (assoc 'SUB-ZONES old-data)) nil))
+    (cons 'V-START (cdr (assoc 'V-START old-data)))
+    (cons 'V-END (cdr (assoc 'V-END old-data)))
+    (cons 'ANGLE (cdr (assoc 'ANGLE old-data)))
+    (cons 'LENGTH (cdr (assoc 'LENGTH old-data)))
+  ))
+  (setq *segment-list* (update-list-item *segment-list* idx new-data))
+)
+
+;;;;==========================================================================
+;;;; defun load-segment-to-globals : 세그먼트 데이터를 전역 변수로 복원
+;;;;==========================================================================
+(defun load-segment-to-globals (idx / seg-data val old-val)
+  (setq seg-data (nth idx *segment-list*))
+  (setq *tsp-current-seg-idx* idx)
+
+  (if (cdr (assoc 'IS-DEFINED seg-data))
+    (progn
+      (setq val (cdr (assoc 'WALL-TYPE seg-data)))
+      (setq *tsp-wall-type* (if val val "HPILE"))
+      (setq *tsp-soil-layers* (cdr (assoc 'SOIL-DATA seg-data)))
+      (setq val (cdr (assoc 'N-VALUES seg-data)))
+      (setq *tsp-n-values* (if val val '()))
+      (setq val (cdr (assoc 'HOLE-NO seg-data)))
+      (setq *tsp-hole-no* (if val val "BH-"))
+      (setq *tsp-hpile-spec* (cdr (assoc 'WALL-SPEC seg-data)))
+      (setq *tsp-hpile-custom* (cdr (assoc 'WALL-CUSTOM seg-data)))
+      (setq *tsp-wale-spec* (cdr (assoc 'WALE-SPEC seg-data)))
+      (setq *tsp-wale-custom* (cdr (assoc 'WALE-CUSTOM seg-data)))
+      (setq *tsp-ctc* (cdr (assoc 'CTC seg-data)))
+      (setq *tsp-support-list* (cdr (assoc 'SUPPORT-LIST seg-data)))
+      (setq val (cdr (assoc 'TIMBER-THICKNESS seg-data)))
+      (setq *tsp-timber-thickness* (if val val 60))
+
+      ;; [통합 깊이 변수 복원 및 구버전 데이터 호환 로직]
+      (setq val (cdr (assoc 'MAX-DEPTH seg-data)))
+      (setq old-val (cdr (assoc 'CIP-MAX-DEPTH seg-data)))
+      (setq *tsp-max-depth* (cond (val val) (old-val (atof old-val)) (T 10.0)))
+
+      (setq val (cdr (assoc 'EMBED-DEPTH seg-data)))
+      (setq old-val (cdr (assoc 'CIP-EMBED-DEPTH seg-data)))
+      (setq *tsp-embed-depth* (cond (val val) (old-val (atof old-val)) (T 3.0)))
+
+      (setq val (cdr (assoc 'ROCK-EMBED seg-data)))
+      (setq old-val (cdr (assoc 'CIP-ROCK-EMBED seg-data)))
+      (setq *tsp-rock-embed* (cond (val val) (old-val old-val) (T "500")))
+
+      ;; === [6단계] C.I.P 전용 데이터 복원 ===
+      (setq val (cdr (assoc 'CIP-HPILE-IDX seg-data)))
+      (setq *tsp-cip-hpile-idx* (if val val "2"))
+      (setq val (cdr (assoc 'CIP-WALE-IDX seg-data)))
+      (setq *tsp-cip-wale-idx* (if val val "0"))
+      (setq val (cdr (assoc 'CIP-DIA seg-data)))
+      (setq *tsp-cip-dia* (if val val "500"))
+      (setq val (cdr (assoc 'CIP-MODE-IDX seg-data)))
+      (setq *tsp-cip-mode-idx* (if val val "0"))
+      (setq val (cdr (assoc 'CIP-OVERLAP seg-data)))
+      (setq *tsp-cip-overlap* (if val val "0"))
+      (setq val (cdr (assoc 'CIP-INTERVAL-IDX seg-data)))
+      (setq *tsp-cip-interval-idx* (if val val "2"))
+      (setq val (cdr (assoc 'CIP-ANCHOR-N seg-data)))
+      (setq *tsp-cip-anchor-n*
+        (if val
+          val
+          (itoa (1+ (atoi *tsp-cip-interval-idx*))) ; 데이터 누락 시 H-Pile 인덱스를 참조하여 자동 할당
+        )
+      )
+      (setq val (cdr (assoc 'CIP-GROUTING-IDX seg-data)))
+      (setq *tsp-cip-grouting-idx* (if val val "0"))
+      (setq val (cdr (assoc 'CIP-GROUTING-SPACE-IDX seg-data)))
+      (setq *tsp-cip-grouting-space-idx* (if val val "0"))
+      (setq val (cdr (assoc 'CIP-GROUTING-SPACE-CUSTOM seg-data)))
+      (setq *tsp-cip-grouting-space-custom* (if val val ""))
+      (setq val (cdr (assoc 'CIP-GROUTING-OFFSET-IDX seg-data)))
+      (setq *tsp-cip-grouting-offset-idx* (if val val "0"))
+      (setq val (cdr (assoc 'CIP-GROUTING-OFFSET-CUSTOM seg-data)))
+      (setq *tsp-cip-grouting-offset-custom* (if val val ""))
+
+      ;; === 수위 및 숏크리트 복원 ===
+      (setq val (cdr (assoc 'WATER-CHK seg-data)))
+      (setq *tsp-water-chk* (if val val "0"))
+      (setq val (cdr (assoc 'WATER-DEPTH seg-data)))
+      (setq *tsp-water-depth* (if val val 0.0))
+      (setq val (cdr (assoc 'SHOTCRETE-CHK seg-data)))
+      (setq *tsp-shotcrete-chk* (if val val "0"))
+      (setq val (cdr (assoc 'SHOTCRETE-LAYER seg-data)))
+      (setq *tsp-shotcrete-layer* (if val val ""))
+      (setq val (cdr (assoc 'SHOTCRETE-THICK seg-data)))
+      (setq *tsp-shotcrete-thick* (if val val 0.0))
+      (setq val (cdr (assoc 'SHOTCRETE-ENABLE seg-data)))
+      (setq *tsp-shotcrete-enable* (if val val "1"))
+    )
+  )
+)
+
+;;;;==========================================================================
+;;;; defun tsp-parse-space-string : 띄어쓰기로 구분된 문자열을 정수 리스트로 변환 (다중 선택 처리용)
+;;;;==========================================================================
+(defun tsp-parse-space-string (str / lst pos)
+  (setq lst '())
+  (while (setq pos (vl-string-search " " str))
+    (setq lst (append lst (list (atoi (substr str 1 pos)))))
+    (setq str (substr str (+ pos 2)))
+  )
+  (if (> (strlen str) 0)
+    (setq lst (append lst (list (atoi str))))
+  )
+  lst
+)
+
+;;;;==========================================================================
+;;;; defun tsp-join-space-string : 정수 리스트를 띄어쓰기로 구분된 문자열로 변환 (다중 선택 UI 복원용)
+;;;;==========================================================================
+(defun tsp-join-space-string (lst / str)
+  (setq str "")
+  (foreach x lst
+    (if (= str "")
+      (setq str (itoa x))
+      (setq str (strcat str " " (itoa x)))
+    )
+  )
+  str
+)
+
+;;;;==========================================================================
+;;;; defun tsp-pause-for-measurement : DCL 창을 임시로 숨기고 도면을 제어/측정할 수 있게 해주는 기능
+;;;;==========================================================================
+(defun tsp-pause-for-measurement (/ dist old-err)
+  (princ "\n==================================================")
+  (princ "\n[도면 확인 모드] 마우스 휠로 줌(Zoom) / 초점이동(Pan)이 가능합니다.")
+  (princ "\n거리를 측정하려면 두 점을 클릭하시고, 확인만 하려면 ESC 또는 Enter를 누르세요.")
+  (princ "\n==================================================")
+
+  ;; 에러 처리 (사용자가 ESC를 누를 경우 명령이 완전히 종료되지 않고 DCL로 안전하게 복귀하도록 보호)
+  (setq old-err *error*)
+  (defun *error* (msg)
+    (princ "\n측정이 취소되었습니다. 설정창으로 복귀합니다...")
+    (setq *error* old-err)
+    (princ)
+  )
+
+  ;; 오토캐드 기본 거리 측정 기능 실행
+  (setq dist (vl-catch-all-apply 'getdist '("\n측정할 첫 번째 점을 클릭하세요 (측정종료 및 복귀: ESC 또는 Enter): ")))
+
+  ;; 결과 출력
+  (if (and dist (not (vl-catch-all-error-p dist)))
+    (progn
+      (princ (strcat "\n▶ 측정된 거리: " (rtos dist 2 3) " (화면을 충분히 확인하셨으면 DCL창이 다시 뜹니다)"))
+    )
+    (princ "\n▶ 도면 확인 종료. 설정창으로 복귀합니다...")
+  )
+
+ (setq *error* old-err)
+
+  (setvar "cmdecho" 1)
+  (princ)
+)
