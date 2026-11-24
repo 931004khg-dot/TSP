@@ -1,0 +1,619 @@
+;;; ==========================================================================
+;;; 파일명: TSP_6C_Main_and_CSV.lsp
+;;; 구  분: 메인 명령어(C:TSP), 실시간 리드로우, CSV 입출력 및 파이썬 연동 (Part C)
+;;; 역  할: C:TSP 메인 상태 머신, 실시간 평면 갱신(tsp-redraw-realtime-plan), 도면 N치 드래그 추출, CSV 내보내기/불러오기/매칭, 파이썬(GeoX) 다이렉트 연동, SUB-ZONES 전개 [tsp-import-from-csv, tsp-select-project-for-load, tsp-import-from-drawing]
+;;; 포함 함수: tsp-import-from-csv, tsp-select-project-for-load, tsp-import-from-drawing
+;;; --------------------------------------------------------------------------
+;;; [안내] 이 파일은 TSP.lsp(메인 로더)에 의해 자동으로 로드되는 하위 모듈입니다.
+;;;        코드 수정 시 전체 파일을 합칠 필요 없이 이 파일만 단독 패치하면 됩니다.
+;;; ==========================================================================
+
+;;;;==========================================================================
+;;;; defun tsp-import-from-csv : CSV 데이터를 읽어 도면 및 딕셔너리에 복원
+;;;;==========================================================================
+(defun tsp-import-from-csv (/ file-path new-seg-list new-boundary new-orient ins-opt ins-pt base-pt delta-x delta-y shifted-seg-list old-start old-end new-start new-end name-opt new-name pt new-pt rec sel bnd-ent bnd-orient vertices poly-orient user-start-pt start-idx dist-start dist-end curr-len csv-len i merged-list curr-seg csv-seg bnd-data idx val old-upg old-upg-pts new-upg-pts old-support new-support s-item s-manual-pts new-manual-pts new-s-item new-global-support mapping map-idx bnd-restore-verts ldata-orient seg-verts)
+  (setq file-path (getfiled "EXCEL(CSV)에서 불러오기" "" "csv" 0))
+  (if file-path
+    (progn
+      (setq new-seg-list (tsp-parse-csv-file-data file-path))
+      (setq *tsp-realtime-entities* nil)
+      (setq *tsp-section-only-mode* nil)
+
+      ;; 프로젝트명 중복 시 덮어쓰기 또는 새 이름 지정
+      (if (vlax-ldata-get "TSP_DATA_DICT" *tsp-current-project-name*)
+        (progn
+          (initget "Overwrite New")
+          (setq name-opt (getkword (strcat "\n프로젝트 [" *tsp-current-project-name* "] 가 이미 도면 내에 존재합니다. 덮어쓰시겠습니까? [덮어쓰기(O)/새이름(N)] <N>: ")))
+          (if (or (not name-opt) (= name-opt "New"))
+            (progn
+              (setq new-name (getstring T "\n새로운 프로젝트 이름을 입력하세요 (빈칸 입력시 자동생성): "))
+              (if (or (not new-name) (= new-name ""))
+                (setq *tsp-current-project-name* (tsp-generate-default-project-name))
+                (setq *tsp-current-project-name* (tsp-sanitize-project-name new-name))
+              )
+            )
+          )
+        )
+      )
+
+      (if (tsp-has-real-boundary-coords-p new-seg-list)
+        (progn
+          (initget "Origin New")
+          (setq ins-opt (getkword "\n불러올 도면의 삽입 방식을 선택하세요 [원래위치(O)/새위치(N)] <N>: "))
+          (if (not ins-opt) (setq ins-opt "New"))
+        )
+        (progn
+          (initget "Boundary Section")
+          (setq ins-opt (getkword "\n경계선 좌표가 없는 데이터입니다. 불러올 방식을 선택하세요 [기존경계선적용(B)/단면도전용(S)] <B>: "))
+          (if (not ins-opt) (setq ins-opt "Boundary"))
+        )
+      )
+
+      (cond
+        ;; [모드 1] 단면도 전용 (평면 경계선 생성 없이 바로 세그먼트 설정창 진입)
+        ((= ins-opt "Section")
+         (setq *segment-list* new-seg-list)
+         (tsp-save-project-data *tsp-current-project-name*)
+         (setq *tsp-imported-ent* nil)
+         (setq *tsp-imported-orient* nil)
+         (setq *tsp-section-only-mode* T)
+         (setq *is-imported-data* T)
+         (alert (strcat "[단면도 전용 모드] CSV 데이터가 로드되었습니다.\n프로젝트명: " *tsp-current-project-name* "\n확인을 누르시면 즉시 [세그먼트 설정창]으로 진입합니다."))
+        )
+
+        ;; [모드 2] 도면에 그려진 기존 경계선(Polyline)에 CSV 단면 데이터 입히기
+        ((= ins-opt "Boundary")
+         (setq bnd-ent nil)
+         (while (not bnd-ent)
+           (initget "Exit")
+           (setq sel (entsel "\n단면 데이터를 적용할 도면의 경계선(Polyline)을 선택하세요 [취소(Exit)]: "))
+           (cond
+             ((= sel "Exit") (setq bnd-ent "CANCEL"))
+             ((/= sel nil) (setq bnd-ent (car sel)))
+             (t (princ "\n다시 선택해주세요."))
+           )
+         )
+         (if (= bnd-ent "CANCEL")
+           (setq *is-imported-data* nil)
+           (progn
+             (tsp-fix-mirrored-polyline bnd-ent)
+             (setq bnd-orient (determine-boundary-orientation bnd-ent))
+             (setq vertices (extract-vertices bnd-ent))
+             (setq user-start-pt (getpoint "\n세그먼트 시작점(No.1)이 될 위치를 클릭하세요: "))
+             (if user-start-pt
+               (progn
+                 (setq user-start-pt (trans user-start-pt 1 0))
+                 (vlax-ldata-put bnd-ent "TSP_START_PT" user-start-pt)
+               )
+             )
+             (if (is-closed-polyline bnd-ent)
+               (progn
+                 (setq poly-orient (get-polygon-orientation vertices))
+                 (if (= poly-orient 1)
+                   (setq vertices (reverse vertices) bnd-orient (- bnd-orient))
+                 )
+                 (if user-start-pt
+                   (progn
+                     (setq start-idx (tsp-get-closest-vertex-index vertices user-start-pt))
+                     (setq vertices (tsp-shift-vertex-list vertices start-idx))
+                     (vlax-ldata-put bnd-ent "TSP_START_IDX" start-idx)
+                   )
+                 )
+               )
+               (if user-start-pt
+                 (progn
+                   (setq dist-start (distance (car vertices) user-start-pt))
+                   (setq dist-end (distance (last vertices) user-start-pt))
+                   (if (< dist-end dist-start)
+                     (setq vertices (reverse vertices) bnd-orient (- bnd-orient))
+                   )
+                 )
+               )
+             )
+             (setq *segment-list* nil)
+              (init-segment-data bnd-ent bnd-orient vertices)
+
+              (setq mapping (tsp-csv-mapping-dialog (strcat (getvar "TEMPPREFIX") "tsp.dcl") *segment-list* new-seg-list))
+              (if mapping
+                (progn
+                  (setq curr-len (length *segment-list*))
+                  (setq merged-list '() i 0)
+                  (while (< i curr-len)
+                    (setq curr-seg (nth i *segment-list*))
+                    (setq map-idx (nth i mapping))
+                    (if map-idx
+                      (progn
+                        (setq csv-seg (nth map-idx new-seg-list))
+                        (setq merged-list (append merged-list (list (tsp-merge-csv-seg-into-curr curr-seg csv-seg))))
+                      )
+                      (setq merged-list (append merged-list (list curr-seg)))
+                    )
+                    (setq i (1+ i))
+                  )
+                                    (setq *segment-list* merged-list)
+                  ;; [방법 1] 폴리라인의 TSP_ORIENT는 항상 '원본 폴리라인(extract-vertices) 순서 기준'으로 저장
+                  ;; (시작점이 끝점 쪽이어서 vertices가 reverse된 경우 bnd-orient를 다시 반전해 원본 기준으로 환산)
+                  (setq ldata-orient
+                    (if (and (not (is-closed-polyline bnd-ent)) user-start-pt (< dist-end dist-start))
+                      (- bnd-orient)
+                      bnd-orient
+                    )
+                  )
+                  (vlax-ldata-put bnd-ent "TSP_ORIENT" ldata-orient)
+                  (setq *tsp-boundary-ent* bnd-ent)
+                  (setq *tsp-boundary-orient* bnd-orient)
+                  (tsp-save-project-data *tsp-current-project-name*)
+                  (tsp-pm-tag-boundary bnd-ent *tsp-current-project-name*)
+                  (tsp-redraw-realtime-plan bnd-ent bnd-orient)
+                  (setq *tsp-imported-ent* bnd-ent)
+                  (setq *tsp-imported-orient* bnd-orient)
+                  (setq *is-imported-data* T)
+                  (alert (strcat "선택한 경계선에 CSV 단면 데이터가 지정한 매칭에 따라 성공적으로 적용되었습니다!\n프로젝트명: " *tsp-current-project-name*))
+                )
+                (princ "\n[취소] CSV 데이터 매칭 작업이 취소되었습니다.")
+              )
+            )
+          )
+        )
+
+        ;; [모드 3 & 4] 기존 Origin / New (CSV 좌표로 폴리라인 자동 생성)
+        (t
+         (if (= ins-opt "New")
+           (progn
+             (setq ins-pt (getpoint "\n1번 세그먼트의 시작점이 될 위치를 클릭하세요: "))
+             (if ins-pt
+               (progn
+                 (setq ins-pt (trans ins-pt 1 0))
+                 (setq base-pt (cdr (assoc 'V-START (nth 0 new-seg-list))))
+                 (setq delta-x (- (car ins-pt) (car base-pt)))
+                 (setq delta-y (- (cadr ins-pt) (cadr base-pt)))
+                 (setq shifted-seg-list nil)
+                 (foreach seg new-seg-list
+                   (setq old-start (cdr (assoc 'V-START seg)))
+                   (setq old-end (cdr (assoc 'V-END seg)))
+                   (setq new-start (list (+ (car old-start) delta-x) (+ (cadr old-start) delta-y) (caddr old-start)))
+                   (setq new-end (list (+ (car old-end) delta-x) (+ (cadr old-end) delta-y) (caddr old-end)))
+                   (setq seg (subst (cons 'V-START new-start) (assoc 'V-START seg) seg))
+                   (setq seg (subst (cons 'V-END new-end) (assoc 'V-END seg) seg))
+                   (setq old-upg (cdr (assoc 'UPGRADE-WALE seg)))
+                   (if (and old-upg (> (length old-upg) 2))
+                     (progn
+                       (setq old-upg-pts (nth 2 old-upg))
+                       (if old-upg-pts
+                         (progn
+                           (setq new-upg-pts (mapcar '(lambda (pt-data)
+                                                        (list (car pt-data)
+                                                              (list (+ (car (cadr pt-data)) delta-x)
+                                                                    (+ (cadr (cadr pt-data)) delta-y)
+                                                                    (if (caddr (cadr pt-data)) (caddr (cadr pt-data)) 0.0))))
+                                                     old-upg-pts))
+                           (setq seg (subst (list (nth 0 old-upg) (nth 1 old-upg) new-upg-pts) (assoc 'UPGRADE-WALE seg) seg))
+                         )
+                       )
+                     )
+                   )
+                   (setq old-support (cdr (assoc 'SUPPORT-LIST seg)))
+                   (if old-support
+                     (progn
+                       (setq new-support nil)
+                       (foreach s-item old-support
+                         (if (wcmatch (car s-item) "버팀보*")
+                           (progn
+                             (setq s-manual-pts (if (> (length s-item) 8) (nth 8 s-item) nil))
+                             (if s-manual-pts
+                               (progn
+                                 (setq new-manual-pts (mapcar '(lambda (pt) (list (+ (car pt) delta-x) (+ (cadr pt) delta-y) (caddr pt))) s-manual-pts))
+                                 (setq new-s-item '() idx 0)
+                                 (foreach val s-item
+                                   (if (= idx 8)
+                                     (setq new-s-item (append new-s-item (list new-manual-pts)))
+                                     (setq new-s-item (append new-s-item (list val)))
+                                   )
+                                   (setq idx (1+ idx))
+                                 )
+                                 (setq s-item new-s-item)
+                               )
+                             )
+                           )
+                         )
+                         (setq new-support (append new-support (list s-item)))
+                       )
+                       (setq seg (subst (cons 'SUPPORT-LIST new-support) (assoc 'SUPPORT-LIST seg) seg))
+                     )
+                   )
+                   (setq shifted-seg-list (append shifted-seg-list (list seg)))
+                 )
+                 (setq new-seg-list shifted-seg-list)
+                 (setq new-seg-list (tsp-shift-anchor-angles-in-segs new-seg-list delta-x delta-y))
+                 (if *tsp-support-list* (setq *tsp-support-list* (tsp-shift-anchor-angles *tsp-support-list* delta-x delta-y)))
+                 (if *tsp-support-list*
+                   (progn
+                     (setq new-global-support nil)
+                     (foreach s-item *tsp-support-list*
+                       (if (wcmatch (car s-item) "버팀보*")
+                         (progn
+                           (setq s-manual-pts (if (> (length s-item) 8) (nth 8 s-item) nil))
+                           (if s-manual-pts
+                             (progn
+                               (setq new-manual-pts (mapcar '(lambda (pt) (list (+ (car pt) delta-x) (+ (cadr pt) delta-y) (caddr pt))) s-manual-pts))
+                               (setq new-s-item '() idx 0)
+                               (foreach val s-item
+                                 (if (= idx 8)
+                                   (setq new-s-item (append new-s-item (list new-manual-pts)))
+                                   (setq new-s-item (append new-s-item (list val)))
+                                 )
+                                 (setq idx (1+ idx))
+                               )
+                               (setq s-item new-s-item)
+                             )
+                           )
+                         )
+                       )
+                       (setq new-global-support (append new-global-support (list s-item)))
+                     )
+                     (setq *tsp-support-list* new-global-support)
+                   )
+                 )
+                 (tsp-shift-deleted-corbels delta-x delta-y)
+                 (if *tsp-deleted-post-points*
+                   (setq *tsp-deleted-post-points* (mapcar '(lambda (pt) (list (+ (car pt) delta-x) (+ (cadr pt) delta-y) 0.0)) *tsp-deleted-post-points*))
+                 )
+                 (if *tsp-added-post-points*
+                   (setq *tsp-added-post-points* (mapcar '(lambda (rec) (cons (list (+ (car (car rec)) delta-x) (+ (cadr (car rec)) delta-y) 0.0) (cdr rec))) *tsp-added-post-points*))
+                 )
+                 (vlax-ldata-put "TSP_DICT" "DELETED_POSTS" *tsp-deleted-post-points*)
+                 (vlax-ldata-put "TSP_DICT" "ADDED_POSTS" *tsp-added-post-points*)
+               )
+               (princ "\n[알림] 삽입점이 지정되지 않아 원래 위치에 생성합니다.")
+             )
+           )
+         )
+         (setq *segment-list* new-seg-list)
+                  (setq new-boundary
+           ;; [A안] CSV에 #BOUNDARY(원본 경계선 정점)가 있으면 그 정점으로 폴리라인을
+           ;; 재생성하여 자동삭제된 180도 근접 모서리(꺾임)를 보존한다.
+           ;; 레코드가 없는 구버전 CSV는 기존 tsp-rebuild-boundary(현 기반)로 폴백.
+           (if (and (boundp '*tsp-csv-boundary-data*) *tsp-csv-boundary-data*
+                    (nth 1 *tsp-csv-boundary-data*) (> (length (nth 1 *tsp-csv-boundary-data*)) 1))
+             (progn
+               (setq bnd-restore-verts
+                 (mapcar '(lambda (pt) (list (car pt) (cadr pt) 0.0)) (nth 1 *tsp-csv-boundary-data*)))
+               ;; [새위치(N)] 모드에서는 세그먼트와 동일한 이동량을 경계선에도 적용
+               (if (and (= ins-opt "New") ins-pt delta-x delta-y)
+                 (setq bnd-restore-verts
+                   (mapcar '(lambda (pt) (list (+ (car pt) delta-x) (+ (cadr pt) delta-y) 0.0)) bnd-restore-verts))
+               )
+               (entmake
+                 (append
+                   (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(100 . "AcDbPolyline")
+                         (cons 90 (length bnd-restore-verts))
+                         (cons 70 (if (= (nth 0 *tsp-csv-boundary-data*) 1) 1 0)))
+                   (mapcar '(lambda (pt) (list 10 (car pt) (cadr pt))) bnd-restore-verts))
+               )
+               (entlast)
+             )
+             (tsp-rebuild-boundary)
+           )
+         )
+         (setq new-orient (determine-boundary-orientation new-boundary))
+         (if (not (tblsearch "LAYER" "_경계선(Boundary)"))
+           (entmake (list (cons 0 "LAYER") (cons 100 "AcDbSymbolTableRecord") (cons 100 "AcDbLayerTableRecord") (cons 2 "_경계선(Boundary)") (cons 70 0) (cons 62 4)))
+         )
+         (setq bnd-data (entget new-boundary))
+         (setq bnd-data (subst (cons 8 "_경계선(Boundary)") (assoc 8 bnd-data) bnd-data))
+         (if (assoc 62 bnd-data)
+           (setq bnd-data (subst (cons 62 4) (assoc 62 bnd-data) bnd-data))
+           (setq bnd-data (append bnd-data (list (cons 62 4))))
+         )
+         (entmod bnd-data)
+                  (vlax-ldata-put new-boundary "TSP_START_PT" (cdr (assoc 'V-START (nth 0 new-seg-list))))
+         ;; [방법 1] CSV에서 읽은 new-orient는 '세그먼트 진행 방향(new-seg-list) 기준'이므로,
+         ;; #BOUNDARY로 생성된 개방형 폴리라인의 원본 정점 순서가 1번 세그먼트 시작점과 역방향이면
+         ;; 폴리라인에 각인할 TSP_ORIENT는 부호를 반전하여 '원본 폴리라인 기준'으로 통일한다.
+         (setq vertices (extract-vertices new-boundary))
+         (setq user-start-pt (cdr (assoc 'V-START (nth 0 new-seg-list))))
+         (setq ldata-orient
+           (if (and (not (is-closed-polyline new-boundary))
+                    (> (length vertices) 1)
+                    user-start-pt
+                    (< (distance (last vertices) user-start-pt)
+                       (distance (car vertices) user-start-pt)))
+             (- new-orient)
+             new-orient
+           )
+         )
+         (vlax-ldata-put new-boundary "TSP_ORIENT" ldata-orient)
+         ;; 세그먼트 정점 구성(모서리 자동삭제/편집 결과)도 경계선에 함께 저장하여 재실행 시 정합성 유지
+         (if new-seg-list
+           (progn
+             (setq seg-verts (mapcar '(lambda (s) (cdr (assoc 'V-START s))) new-seg-list))
+             (if (not (is-closed-polyline new-boundary))
+               (setq seg-verts (append seg-verts (list (cdr (assoc 'V-END (last new-seg-list))))))
+             )
+             (tsp-save-custom-vertices-ldata new-boundary seg-verts)
+           )
+         )
+         (setq *tsp-boundary-ent* new-boundary)
+         (setq *tsp-boundary-orient* new-orient)
+         (tsp-save-project-data *tsp-current-project-name*)
+         (tsp-pm-tag-boundary new-boundary *tsp-current-project-name*)
+         (tsp-redraw-realtime-plan new-boundary new-orient)
+         (setq *tsp-imported-ent* new-boundary)
+         (setq *tsp-imported-orient* new-orient)
+         (setq *is-imported-data* T)
+         (alert (strcat "데이터 복원이 완료되었습니다.\n프로젝트명: " *tsp-current-project-name* "\n확인을 누르시면 즉시 [세그먼트 설정창]으로 진입합니다."))
+        )
+      )
+    )
+    (setq *is-imported-data* nil)
+  )
+  *is-imported-data*
+)
+
+;;;;==========================================================================
+;;;; defun tsp-select-project-for-load : 불러올 프로젝트를 DCL에서 선택 (도면 내부용)
+;;;;==========================================================================
+(defun tsp-select-project-for-load (/ dict proj-list dcl-id dcl-path dcl-file selected-proj idx item)
+  (setq dict (dictsearch (namedobjdict) "TSP_DATA_DICT"))
+  ;; 예외 처리: 도면에 딕셔너리가 아예 없는 경우
+  (if (not dict)
+    (progn (alert "현재 도면에 저장된 프로젝트 데이터가 없습니다.\n(저장된 이력이 없습니다.)") nil)
+    (progn
+      (setq proj-list nil)
+      (foreach item dict
+        (if (= (car item) 3)
+          (setq proj-list (append proj-list (list (cdr item))))
+        )
+      )
+      ;; 예외 처리: 딕셔너리는 있으나 내용물이 비어있는 경우
+      (if (= (length proj-list) 0)
+        (progn (alert "도면 내에 저장된 프로젝트가 없습니다.") nil)
+        (progn
+          (setq dcl-path (strcat (getvar "TEMPPREFIX") "tsp_load_dwg.dcl"))
+          (setq dcl-file (open dcl-path "w"))
+          (write-line "tsp_load_dwg_dlg : dialog { label = \"도면 내 프로젝트 불러오기\";" dcl-file)
+          (write-line "  : list_box { key = \"proj_list\"; height = 10; width = 40; }" dcl-file)
+          (write-line "  : row { : button { key = \"accept\"; label = \"불러오기(Load)\"; is_default = true; } : button { key = \"cancel\"; label = \"취소\"; is_cancel = true; } }" dcl-file)
+          (write-line "}" dcl-file)
+          (close dcl-file)
+
+          (setq dcl-id (load_dialog dcl-path))
+          (if (new_dialog "tsp_load_dwg_dlg" dcl-id)
+            (progn
+              (start_list "proj_list")
+              (mapcar 'add_list proj-list)
+              (end_list)
+              (setq selected-proj nil)
+              (action_tile "proj_list" "(setq idx (atoi $value))")
+              (action_tile "accept" "(if idx (setq selected-proj (nth idx proj-list))) (done_dialog 1)")
+              (action_tile "cancel" "(done_dialog 0)")
+              (start_dialog)
+              (unload_dialog dcl-id)
+              selected-proj
+            )
+            (progn (alert "DCL 로드 실패") nil)
+          )
+        )
+      )
+    )
+  )
+)
+
+;;;;==========================================================================
+;;;; defun tsp-import-from-drawing : 도면 내부 딕셔너리에서 데이터를 읽어 복원
+;;;;==========================================================================
+(defun tsp-import-from-drawing (/ proj-name data-pack new-seg-list ins-opt ins-pt base-pt delta-x delta-y shifted-seg-list old-start old-end new-start new-end new-boundary new-orient bnd-data s-item s-manual-pts new-manual-pts new-s-item idx new-support old-support new-global-support seg val pt rec)
+  (setq proj-name (tsp-select-project-for-load))
+  (if proj-name
+    (progn
+      (setq data-pack (vlax-ldata-get "TSP_DATA_DICT" proj-name))
+      (if (not data-pack)
+        (progn (alert "선택한 프로젝트 데이터를 읽을 수 없습니다.") nil)
+        (progn
+          ;; 1. 전역 변수로 데이터 언패킹 (깊은 복사)
+          (setq *tsp-current-project-name* proj-name)
+          (setq new-seg-list (nth 0 data-pack))
+          (setq *tsp-hpile-spec* (nth 1 data-pack))
+          (setq *tsp-hpile-custom* (nth 2 data-pack))
+          (setq *tsp-wale-spec* (nth 3 data-pack))
+          (setq *tsp-wale-custom* (nth 4 data-pack))
+          (setq *tsp-ctc* (nth 5 data-pack))
+          (setq *tsp-timber-thickness* (nth 6 data-pack))
+          (setq *tsp-max-excavation-depth* (nth 7 data-pack))
+          (setq *tsp-embedment-depth* (nth 8 data-pack))
+          (setq *tsp-soil-layers* (nth 9 data-pack))
+          (setq *tsp-water-chk* (nth 10 data-pack))
+          (setq *tsp-water-depth* (nth 11 data-pack))
+          (setq *tsp-support-list* (tsp-sanitize-support-list (nth 12 data-pack)))
+          (setq *tsp-scale-section* (nth 13 data-pack))
+          (setq *tsp-scale-plan* (nth 14 data-pack))
+
+          ;; 하위 버전 호환성 방어 로직 (15, 16 인덱스 존재 여부 파악)
+          (if (> (length data-pack) 15)
+            (progn
+              (setq *tsp-deleted-post-points* (nth 15 data-pack))
+              (setq *tsp-added-post-points* (nth 16 data-pack))
+              ;; [까치발 삭제] 삭제 목록 복원 (구버전 프로젝트는 빈 목록)
+              (vlax-ldata-put "TSP_DICT" "DELETED_CORBELS" (if (> (length data-pack) 18) (nth 18 data-pack) '()))
+            )
+            (progn
+              (setq *tsp-deleted-post-points* '())
+              (setq *tsp-added-post-points* '())
+            )
+          )
+
+          (if (> (length data-pack) 17)
+            (setq *tsp-saved-orient* (nth 17 data-pack))
+            (setq *tsp-saved-orient* nil)
+          )
+
+          ;; 2. 삽입점 지정 및 좌표 보정 방식 선택 (완성된 프로젝트이므로 원래위치/새위치 2가지만 표시, 기본값 <N>)
+          (setq *tsp-section-only-mode* nil)
+          (initget "Origin New")
+          (setq ins-opt (getkword "\n불러올 도면의 삽입 방식을 선택하세요 [원래위치(O)/새위치(N)] <N>: "))
+          (if (not ins-opt) (setq ins-opt "New"))
+
+          (if (= ins-opt "New")
+            (progn
+              (setq ins-pt (getpoint "\n1번 세그먼트의 시작점이 될 위치를 클릭하세요: "))
+              (if ins-pt
+                (progn
+                  (setq ins-pt (trans ins-pt 1 0)) ;; WCS 변환
+                  (setq base-pt (cdr (assoc 'V-START (nth 0 new-seg-list))))
+                  (setq delta-x (- (car ins-pt) (car base-pt)))
+                  (setq delta-y (- (cadr ins-pt) (cadr base-pt)))
+
+                  ;; 2-1. 세그먼트 양 끝단 좌표 및 수동 버팀보 Shift 일괄 적용
+                  (setq shifted-seg-list nil)
+                  (foreach seg new-seg-list
+                    (setq old-start (cdr (assoc 'V-START seg)))
+                    (setq old-end (cdr (assoc 'V-END seg)))
+                    (setq new-start (list (+ (car old-start) delta-x) (+ (cadr old-start) delta-y) (if (caddr old-start) (caddr old-start) 0.0)))
+                    (setq new-end (list (+ (car old-end) delta-x) (+ (cadr old-end) delta-y) (if (caddr old-end) (caddr old-end) 0.0)))
+
+                    (setq seg (subst (cons 'V-START new-start) (assoc 'V-START seg) seg))
+                    (setq seg (subst (cons 'V-END new-end) (assoc 'V-END seg) seg))
+
+                    ;; UPGRADE-WALE 내의 띠장 상향 수동 범위 절대좌표(user-upg-pts) 변위 보정
+                    (setq old-upg (cdr (assoc 'UPGRADE-WALE seg)))
+                    (if (and old-upg (> (length old-upg) 2))
+                      (progn
+                        (setq old-upg-pts (nth 2 old-upg))
+                        (if old-upg-pts
+                          (progn
+                            (setq new-upg-pts (mapcar '(lambda (pt-data)
+                                                         (list (car pt-data)
+                                                               (list (+ (car (cadr pt-data)) delta-x)
+                                                                     (+ (cadr (cadr pt-data)) delta-y)
+                                                                     (if (caddr (cadr pt-data)) (caddr (cadr pt-data)) 0.0))))
+                                                      old-upg-pts))
+                            (setq seg (subst (list (nth 0 old-upg) (nth 1 old-upg) new-upg-pts) (assoc 'UPGRADE-WALE seg) seg))
+                          )
+                        )
+                      )
+                    )
+
+                    ;; 세그먼트 내 버팀보 좌표 보정
+                    (setq old-support (tsp-sanitize-support-list (cdr (assoc 'SUPPORT-LIST seg))))
+                    (if old-support
+                      (progn
+                        (setq new-support nil)
+                        (foreach s-item old-support
+                          (if (wcmatch (car s-item) "버팀보*")
+                            (progn
+                              (setq s-manual-pts (if (> (length s-item) 8) (nth 8 s-item) nil))
+                              (if s-manual-pts
+                                (progn
+                                  (setq new-manual-pts (mapcar '(lambda (pt) (list (+ (car pt) delta-x) (+ (cadr pt) delta-y) (if (caddr pt) (caddr pt) 0.0))) s-manual-pts))
+                                  (setq new-s-item '())
+                                  (setq idx 0)
+                                  (foreach val s-item
+                                    (if (= idx 8)
+                                      (setq new-s-item (append new-s-item (list new-manual-pts)))
+                                      (setq new-s-item (append new-s-item (list val)))
+                                    )
+                                    (setq idx (1+ idx))
+                                  )
+                                  (setq s-item new-s-item)
+                                )
+                              )
+                            )
+                          )
+                          (setq new-support (append new-support (list s-item)))
+                        )
+                        (setq seg (subst (cons 'SUPPORT-LIST new-support) (assoc 'SUPPORT-LIST seg) seg))
+                      )
+                    )
+                    (setq shifted-seg-list (append shifted-seg-list (list seg)))
+                  )
+                  (setq new-seg-list shifted-seg-list)
+                  ;; 앵커 평면각 기록(기준점 절대좌표)도 동일 이동량으로 보정
+                  (setq new-seg-list (tsp-shift-anchor-angles-in-segs new-seg-list delta-x delta-y))
+                  (if *tsp-support-list* (setq *tsp-support-list* (tsp-shift-anchor-angles *tsp-support-list* delta-x delta-y)))
+
+                  ;; 2-2. 글로벌 버팀보 좌표 Shift 적용
+                  (if *tsp-support-list*
+                    (progn
+                      (setq new-global-support nil)
+                      (foreach s-item *tsp-support-list*
+                        (if (wcmatch (car s-item) "버팀보*")
+                          (progn
+                            (setq s-manual-pts (if (> (length s-item) 8) (nth 8 s-item) nil))
+                            (if s-manual-pts
+                              (progn
+                                (setq new-manual-pts (mapcar '(lambda (pt) (list (+ (car pt) delta-x) (+ (cadr pt) delta-y) (if (caddr pt) (caddr pt) 0.0))) s-manual-pts))
+                                (setq new-s-item '())
+                                (setq idx 0)
+                                (foreach val s-item
+                                  (if (= idx 8)
+                                    (setq new-s-item (append new-s-item (list new-manual-pts)))
+                                    (setq new-s-item (append new-s-item (list val)))
+                                  )
+                                  (setq idx (1+ idx))
+                                )
+                                (setq s-item new-s-item)
+                              )
+                            )
+                          )
+                        )
+                        (setq new-global-support (append new-global-support (list s-item)))
+                      )
+                      (setq *tsp-support-list* new-global-support)
+                    )
+                  )
+
+                  ;; 2-3. 삭제/추가된 말뚝 좌표 Shift 일괄 보정
+                  (tsp-shift-deleted-corbels delta-x delta-y) ;; [까치발 삭제] 삭제 목록 좌표 보정
+                  (if *tsp-deleted-post-points*
+                    (setq *tsp-deleted-post-points* (mapcar '(lambda (pt) (list (+ (car pt) delta-x) (+ (cadr pt) delta-y) 0.0)) *tsp-deleted-post-points*))
+                  )
+                  (if *tsp-added-post-points*
+                    (setq *tsp-added-post-points* (mapcar '(lambda (rec) (cons (list (+ (car (car rec)) delta-x) (+ (cadr (car rec)) delta-y) 0.0) (cdr rec))) *tsp-added-post-points*))
+                  )
+                  (vlax-ldata-put "TSP_DICT" "DELETED_POSTS" *tsp-deleted-post-points*)
+                  (vlax-ldata-put "TSP_DICT" "ADDED_POSTS" *tsp-added-post-points*)
+                )
+                (princ "\n[알림] 삽입점이 지정되지 않아 기존 절대좌표 원래 위치에 생성합니다.")
+              )
+            )
+          )
+
+          ;; 3. 전역 리스트 복원 및 딕셔너리 안전장치 저장
+          (setq *segment-list* new-seg-list)
+          (vlax-ldata-put "TSP_DICT" "DELETED_POSTS" *tsp-deleted-post-points*)
+          (vlax-ldata-put "TSP_DICT" "ADDED_POSTS" *tsp-added-post-points*)
+
+          ;; 4. 폴리라인 재작도 (백그라운드 복원)
+          (setq new-boundary (tsp-rebuild-boundary))
+          (setq new-orient (determine-boundary-orientation new-boundary))
+
+          ;; 레이어 생성 및 색상 강제 지정
+          (if (not (tblsearch "LAYER" "_경계선(Boundary)"))
+            (entmake (list (cons 0 "LAYER") (cons 100 "AcDbSymbolTableRecord") (cons 100 "AcDbLayerTableRecord") (cons 2 "_경계선(Boundary)") (cons 70 0) (cons 62 4)))
+          )
+          (setq bnd-data (entget new-boundary))
+          (setq bnd-data (subst (cons 8 "_경계선(Boundary)") (assoc 8 bnd-data) bnd-data))
+          (if (assoc 62 bnd-data)
+            (setq bnd-data (subst (cons 62 4) (assoc 62 bnd-data) bnd-data))
+            (setq bnd-data (append bnd-data (list (cons 62 4))))
+          )
+          (entmod bnd-data)
+
+          (vlax-ldata-put new-boundary "TSP_START_PT" (cdr (assoc 'V-START (nth 0 new-seg-list))))
+          (vlax-ldata-put new-boundary "TSP_ORIENT" new-orient)
+
+          ;; [프로젝트 자동매칭] 새로 생성된 경계선에 프로젝트명 각인
+          (tsp-pm-tag-boundary new-boundary proj-name)
+          ;; RUN 상태 진입을 위한 플래그 처리
+          (setq *tsp-imported-ent* new-boundary)
+          (setq *tsp-imported-orient* new-orient)
+          (setq *is-imported-data* T)
+
+          (alert (strcat "프로젝트 [" proj-name "] 복원이 완료되었습니다.\n확인을 누르시면 즉시 [세그먼트 설정창]으로 진입합니다."))
+        )
+      )
+    )
+    (setq *is-imported-data* nil) ; 취소 시 안전하게 nil 반환
+  )
+  *is-imported-data* ; T를 반환하면 메인 메뉴에서 RUN 상태로 전환됨
+)
